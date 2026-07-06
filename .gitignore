@@ -1,0 +1,60 @@
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.Python
+build/
+dist/
+site/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs and runtime files
+*.log
+logs/
+*.pid
+*.seed
+
+# Tooling / package managers
+.python-version
+pip-wheel-metadata/
+poetry.lock
+Pipfile.lock
+
+# Local data and caches
+tmp/
+temp/
+.cache/
+.ipynb_checkpoints/
+
+# Project-specific generated files
+app/**/__pycache__/
+app/coreAgents/data/cache/
+app/coreAgents/data/outputs/
+app/coreAgents/data/embeddings/

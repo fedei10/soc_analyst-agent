@@ -1,0 +1,17 @@
+fastapi
+python-dotenv
+redis
+psycopg2-binary
+elasticsearch
+sqlalchemy
+asyncpg
+openai
+anthropic
+jinja2
+pydantic
+uvicorn
+pytest
+pytest-asyncio
+langchain
+langchain-groq
+requests
