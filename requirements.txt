@@ -9,9 +9,15 @@ openai
 anthropic
 jinja2
 pydantic
+pydantic-settings
 uvicorn
 pytest
 pytest-asyncio
 langchain
+langchain-core
 langchain-groq
+langsmith
 requests
+opensearch-py
+httpx
+httpx2

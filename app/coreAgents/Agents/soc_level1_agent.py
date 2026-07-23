@@ -4,14 +4,8 @@ from pathlib import Path
 import yaml
 
 from app.coreAgents.llm.groq import llm
+from app.coreAgents.tools.wazuh.tool_registry import get_soc_l1_tools
 from langchain.agents import create_agent
-
-
-
-
-
-
-
 
 
 #prompt path 
@@ -38,6 +32,6 @@ def load_prompt_template(template_name: str) -> str:
 
 agent = create_agent(
     model=llm,
-    tools=[],
+    tools=get_soc_l1_tools(),
     system_prompt=load_prompt_template("soc_level1_agent_system_prompt")
 )
