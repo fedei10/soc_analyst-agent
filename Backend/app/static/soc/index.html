@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TSAGE SOC Console</title>
+  <link rel="stylesheet" href="/static/soc/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">TS</span>
+        <div>
+          <strong>TSAGE</strong>
+          <span>SOC Console</span>
+        </div>
+      </div>
+
+      <nav class="nav" aria-label="Workspace">
+        <button class="nav-item active" data-view="chat">Agent chat</button>
+        <button class="nav-item" data-view="investigations">Investigations</button>
+      </nav>
+
+      <section class="connection-panel">
+        <div class="section-label">API connection</div>
+        <label for="read-token">Read token</label>
+        <input id="read-token" type="password" autocomplete="off" placeholder="SOC_READ_API_KEY">
+        <label for="write-token">Write token</label>
+        <input id="write-token" type="password" autocomplete="off" placeholder="SOC_WRITE_API_KEY">
+        <button id="save-connection" class="button secondary">Connect</button>
+      </section>
+
+      <div class="service-state">
+        <span id="wazuh-dot" class="status-dot unknown"></span>
+        <div>
+          <strong id="wazuh-label">Wazuh unchecked</strong>
+          <span id="wazuh-detail">Indexer and manager API</span>
+        </div>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <div>
+          <h1 id="page-title">Agent chat</h1>
+          <p id="page-subtitle">Read-only investigation workspace</p>
+        </div>
+        <div class="topbar-actions">
+          <span id="connection-badge" class="badge neutral">Disconnected</span>
+          <button id="refresh-data" class="button secondary" title="Refresh service data">Refresh</button>
+        </div>
+      </header>
+
+      <section id="chat-view" class="view active">
+        <div class="chat-layout">
+          <section class="chat-surface">
+            <div class="agent-switch" role="tablist" aria-label="SOC agent tier">
+              <button class="tier-button active" data-tier="l1">L1 Triage</button>
+              <button class="tier-button" data-tier="l2">L2 Investigation</button>
+              <button class="tier-button" data-tier="l3">L3 Analysis</button>
+            </div>
+
+            <div id="chat-log" class="chat-log" aria-live="polite">
+              <div class="empty-state">
+                <strong>Start an investigation query</strong>
+                <span>Selected agent: SOC L1</span>
+              </div>
+            </div>
+
+            <form id="chat-form" class="composer">
+              <textarea id="chat-input" rows="3" placeholder="Ask the selected agent about Wazuh alerts, agents, authentication activity, or detection evidence." required></textarea>
+              <div class="composer-footer">
+                <span id="chat-state">Ready</span>
+                <button class="button primary" type="submit">Send query</button>
+              </div>
+            </form>
+          </section>
+
+          <aside class="context-rail">
+            <section class="panel">
+              <div class="panel-header">
+                <h2>Alert activity</h2>
+                <span>24h</span>
+              </div>
+              <div id="alert-total" class="metric">-</div>
+              <div class="metric-label">Wazuh alerts</div>
+              <div id="severity-chart" class="severity-chart"></div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-header">
+                <h2>Tool activity</h2>
+              </div>
+              <div id="tool-activity" class="tool-list">
+                <span class="muted">No tools called</span>
+              </div>
+            </section>
+          </aside>
+        </div>
+      </section>
+
+      <section id="investigations-view" class="view">
+        <div class="investigation-layout">
+          <section class="panel create-panel">
+            <div class="panel-header">
+              <h2>New investigation</h2>
+            </div>
+            <form id="investigation-form" class="form-grid">
+              <label for="alert-id">Wazuh alert ID</label>
+              <input id="alert-id" required placeholder="Alert document ID">
+              <label for="agent-id">Agent ID</label>
+              <input id="agent-id" pattern="[0-9]+" placeholder="001">
+              <button class="button primary" type="submit">Start investigation</button>
+            </form>
+          </section>
+
+          <section class="investigation-main">
+            <div class="investigation-header">
+              <div>
+                <span class="section-label">Current investigation</span>
+                <h2 id="investigation-id">None selected</h2>
+              </div>
+              <button id="refresh-investigation" class="button secondary" disabled>Refresh</button>
+            </div>
+
+            <div id="investigation-summary" class="summary-strip">
+              <div><span>Status</span><strong>-</strong></div>
+              <div><span>Stage</span><strong>-</strong></div>
+              <div><span>Severity</span><strong>-</strong></div>
+              <div><span>Confidence</span><strong>-</strong></div>
+            </div>
+
+            <div class="investigation-grid">
+              <section class="panel">
+                <div class="panel-header"><h2>Agent results</h2></div>
+                <div id="agent-results" class="result-stack">
+                  <span class="muted">No investigation loaded</span>
+                </div>
+              </section>
+
+              <section class="panel">
+                <div class="panel-header"><h2>Audit trail</h2></div>
+                <div id="audit-trail" class="audit-list">
+                  <span class="muted">No transitions recorded</span>
+                </div>
+              </section>
+            </div>
+
+            <section id="approval-panel" class="panel approval-panel hidden">
+              <div class="panel-header">
+                <h2>Human approval required</h2>
+                <span id="approval-expiry" class="badge warning">Pending</span>
+              </div>
+              <div id="approval-actions" class="action-list"></div>
+              <label for="approver">Approver</label>
+              <input id="approver" placeholder="analyst@example.com">
+              <label for="modified-actions">Modified actions JSON</label>
+              <textarea id="modified-actions" rows="5" spellcheck="false"></textarea>
+              <div class="approval-buttons">
+                <button class="button danger" data-decision="reject">Reject</button>
+                <button class="button secondary" data-decision="modify">Modify</button>
+                <button class="button primary" data-decision="approve">Approve</button>
+              </div>
+            </section>
+
+            <section id="report-panel" class="panel hidden">
+              <div class="panel-header"><h2>Final report</h2></div>
+              <pre id="final-report" class="json-output"></pre>
+            </section>
+          </section>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" role="status"></div>
+  <script src="/static/soc/app.js"></script>
+</body>
+</html>
