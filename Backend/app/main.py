@@ -9,12 +9,10 @@ Every error uses one envelope:
   {"error": {"code": "...", "message": "...", "detail": ...}, "request_id": "..."}
 and every response carries an X-Request-ID header for log correlation.
 """
-import logging
-import uuid
 from contextlib import asynccontextmanager
-from typing import Callable
 
 import httpx
+import structlog
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -43,8 +41,9 @@ from app.services.wazuh.exceptions import (
     WazuhValidationError,
 )
 from app.services.redis.connection import close_redis_connection
+from app.factory import create_app
 
-logger = logging.getLogger("tsage.api")
+logger = structlog.get_logger("tsage.api")
 
 
 @asynccontextmanager
@@ -57,63 +56,7 @@ async def lifespan(_: FastAPI):
     close_database()
     close_redis_connection()
 
-app = FastAPI(
-    title="tsage SOC API",
-    version="1.0.0",
-    docs_url=None,
-    redoc_url=None,
-    openapi_url=None,
-    description=(
-        "Wazuh-backed SOC platform API. Application endpoints require a verified "
-        "Clerk user session."
-    ),
-    lifespan=lifespan,
-)
-
-
-class RequestContextMiddleware:
-    """Attach request IDs and enforce JSON without BaseHTTPMiddleware."""
-
-    def __init__(self, application: Callable) -> None:
-        self.app = application
-
-    async def __call__(self, scope, receive, send) -> None:
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-
-        request = Request(scope, receive=receive)
-        request.state.request_id = uuid.uuid4().hex[:16]
-        if request.method in {"POST", "PUT", "PATCH"}:
-            content_type = request.headers.get("content-type", "")
-            if not content_type.startswith("application/json"):
-                response = error_envelope(
-                    request,
-                    415,
-                    "unsupported_media_type",
-                    "Unsupported Media Type - send JSON.",
-                    f"received Content-Type: '{content_type or 'none'}'",
-                )
-                await response(scope, receive, send)
-                return
-
-        async def send_with_request_id(message):
-            if message["type"] == "http.response.start":
-                headers = [
-                    header
-                    for header in message.get("headers", [])
-                    if header[0].lower() != b"x-request-id"
-                ]
-                headers.append(
-                    (b"x-request-id", request.state.request_id.encode())
-                )
-                message["headers"] = headers
-            await send(message)
-
-        await self.app(scope, receive, send_with_request_id)
-
-
-app.add_middleware(RequestContextMiddleware)
+app = create_app(lifespan=lifespan)
 app.include_router(health_router, prefix="/api/v1")
 app.include_router(wazuh_read_router, prefix="/api/v1")
 app.include_router(wazuh_write_router, prefix="/api/v1")
@@ -181,8 +124,12 @@ async def wazuh_api_error_handler(request: Request, exc: httpx.HTTPStatusError):
         detail = body.get("detail") or body.get("title")
     except Exception:
         detail = None
-    logger.warning("wazuh api error status=%s request_id=%s detail=%s",
-                   upstream, request.state.request_id, detail)
+    logger.warning(
+        "wazuh_request_failed",
+        wazuh_component="server",
+        status_code=upstream,
+        detail=detail,
+    )
     return error_envelope(
         request, 502, "wazuh_api_error", f"Wazuh API returned HTTP {upstream}.", detail
     )
@@ -197,14 +144,20 @@ async def wazuh_unreachable_handler(request: Request, exc: Exception):
         and not isinstance(exc, opensearch_exc.ConnectionError)
         and isinstance(exc.status_code, int)
     ):
-        logger.warning("wazuh indexer error status=%s request_id=%s",
-                       exc.status_code, request.state.request_id)
+        logger.warning(
+            "wazuh_request_failed",
+            wazuh_component="indexer",
+            status_code=exc.status_code,
+        )
         return error_envelope(
             request, 502, "wazuh_api_error",
             f"Wazuh indexer returned HTTP {exc.status_code}.",
         )
-    logger.warning("wazuh unreachable request_id=%s error=%s",
-                   request.state.request_id, type(exc).__name__)
+    logger.warning(
+        "wazuh_request_failed",
+        error_type=type(exc).__name__,
+        failure_reason="unreachable",
+    )
     return error_envelope(
         request, 503, "wazuh_unavailable",
         "Wazuh is unreachable — check /api/v1/health/wazuh for diagnostics.",
@@ -230,7 +183,11 @@ async def wazuh_response_disabled_handler(
 
 @app.exception_handler(WazuhAuthError)
 async def wazuh_auth_error_handler(request: Request, exc: WazuhAuthError):
-    logger.warning("wazuh auth failed request_id=%s", request.state.request_id)
+    logger.warning(
+        "wazuh_request_failed",
+        wazuh_component="server",
+        failure_reason="authentication",
+    )
     return error_envelope(
         request, 502, "wazuh_auth_failed", "Wazuh rejected the configured service credentials."
     )
@@ -248,7 +205,9 @@ async def normalized_wazuh_error_handler(request: Request, exc: WazuhAPIError):
             "Wazuh is unreachable — check /api/v1/health/wazuh for diagnostics.",
         )
     logger.warning(
-        "wazuh api error status=%s request_id=%s", exc.status_code, request.state.request_id
+        "wazuh_request_failed",
+        wazuh_component="server",
+        status_code=exc.status_code,
     )
     return error_envelope(
         request,
@@ -262,8 +221,9 @@ async def normalized_wazuh_error_handler(request: Request, exc: WazuhAPIError):
 async def unhandled_error_handler(request: Request, exc: Exception):
     # full traceback goes to the server log, keyed by request_id — never to the client
     logger.exception(
-        "unhandled error request_id=%s %s %s",
-        getattr(request.state, "request_id", "-"), request.method, request.url.path,
+        "http_request_failed",
+        error_type=type(exc).__name__,
+        status_code=500,
     )
     return error_envelope(
         request, 500, "internal_error",

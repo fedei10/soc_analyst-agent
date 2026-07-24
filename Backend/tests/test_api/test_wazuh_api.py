@@ -103,6 +103,25 @@ def test_read_token_lists_normalized_alerts(client, gateway):
     assert response.headers["X-Request-ID"]
 
 
+def test_valid_incoming_request_id_is_preserved(client):
+    response = client.get(
+        "/health",
+        headers={"X-Request-ID": "frontend-request-123"},
+    )
+
+    assert response.headers["X-Request-ID"] == "frontend-request-123"
+
+
+def test_invalid_incoming_request_id_is_replaced(client):
+    response = client.get(
+        "/health",
+        headers={"X-Request-ID": "invalid request id"},
+    )
+
+    assert response.headers["X-Request-ID"] != "invalid request id"
+    assert len(response.headers["X-Request-ID"]) == 32
+
+
 def test_limit_above_max_is_422(client):
     response = client.get("/api/v1/alerts?limit=1000", headers=READ)
     assert response.status_code == 422

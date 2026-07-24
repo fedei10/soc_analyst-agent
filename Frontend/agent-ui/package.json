@@ -6,12 +6,12 @@
     "dev": "next dev -p 3000",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint",
-    "lint:fix": "next lint --fix",
+    "lint": "eslint . --max-warnings=0",
+    "lint:fix": "eslint . --fix",
     "format": "prettier --check \"**/*.{ts,tsx,mdx}\" --cache",
     "format:fix": "prettier --write \"**/*.{ts,tsx,mdx}\" --cache",
     "typecheck": "tsc --noEmit",
-    "validate": "pnpm run lint && pnpm run format && pnpm run typecheck"
+    "validate": "eslint . --max-warnings=0 && prettier --check \"**/*.{ts,tsx,mdx}\" --cache && tsc --noEmit"
   },
   "dependencies": {
     "@clerk/nextjs": "^7.5.22",

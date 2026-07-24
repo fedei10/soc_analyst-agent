@@ -11,14 +11,34 @@ logger = logging.getLogger("tsage.config")
 
 
 class Settings(BaseSettings):
+    # Application observability. Payload/content logging is opt-in because SOC
+    # data commonly contains credentials, commands, and personal information.
+    ENVIRONMENT: str = "development"
+    SERVICE_NAME: str = "tsage-soc-api"
+    SERVICE_VERSION: str = "1.0.0"
+    LOG_LEVEL: str = "INFO"
+    LOG_FORMAT: str = "json"
+    LOG_INCLUDE_CALLSITE: bool = False
+    LOG_REQUEST_BODY: bool = False
+    LOG_RESPONSE_BODY: bool = False
+    LOG_TOOL_PAYLOADS: bool = False
+    LOG_MODEL_CONTENT: bool = False
+    OTEL_ENABLED: bool = False
+    OTEL_EXPORTER_OTLP_ENDPOINT: str = "http://localhost:4317"
+    OTEL_EXPORTER_OTLP_INSECURE: bool = True
+    OTEL_TRACE_SAMPLE_RATIO: float = 1.0
+    SLOW_REQUEST_THRESHOLD_MS: int = 1000
+    SLOW_TOOL_THRESHOLD_MS: int = 2000
+    SLOW_MODEL_THRESHOLD_MS: int = 10000
+
     # API Keys
     GROQ_API_KEY: SecretStr = SecretStr("")
     GROQ_AGENT_MODEL: str = "openai/gpt-oss-20b"
     GROQ_STRUCTURED_MODEL: str = "openai/gpt-oss-20b"
     OXYY_API_KEY: SecretStr = SecretStr("")
     OXYY_BASE_URL: str = "https://api.oxyy.ai/v1"
-    OXYY_AGENT_MODEL: str = "codestral-2508"
-    OXYY_STRUCTURED_MODEL: str = "gemma-4-31b-it"
+    OXYY_AGENT_MODEL: str = "gpt-oss-120b"
+    OXYY_STRUCTURED_MODEL: str = "gpt-oss-120b"
     CEREBRAS_API_KEY: SecretStr = SecretStr("")
     CEREBRAS_AGENT_MODEL: str = "gpt-oss-120b"
     CEREBRAS_STRUCTURED_MODEL: str = "gpt-oss-120b"
@@ -41,6 +61,11 @@ class Settings(BaseSettings):
     LANGSMITH_TRACING: bool = False
     LANGSMITH_PROJECT: str = "tsage"
     LANGSMITH_ENDPOINT: str | None = None
+    LANGSMITH_HIDE_INPUTS: bool = True
+    LANGSMITH_HIDE_OUTPUTS: bool = True
+    LANGSMITH_INCLUDE_RAW_ALERTS: bool = False
+    LANGSMITH_INCLUDE_FULL_LOG: bool = False
+    REVISION_ID: str = "development"
 
     # Wazuh (reached through SSH tunnel to PC1, so localhost)
     WAZUH_INDEXER_HOST: str = "127.0.0.1"
@@ -62,6 +87,16 @@ class Settings(BaseSettings):
     # Safety rails: reads only by default; active-response needs BOTH flags flipped.
     WAZUH_READ_ONLY: bool = True
     WAZUH_ALLOW_DANGEROUS_TOOLS: bool = False
+    WAZUH_AGENT_RESPONSE_MODE: str = "compact"
+    WAZUH_NORMALIZATION_ENABLED: bool = True
+    WAZUH_RAW_EVIDENCE_ENABLED: bool = True
+    ALERT_AGGREGATION_WINDOW_SECONDS: int = 300
+    AUTH_AGGREGATION_WINDOW_SECONDS: int = 600
+    VULNERABILITY_AGGREGATION_WINDOW_SECONDS: int = 86400
+    COMPLIANCE_AGGREGATION_WINDOW_SECONDS: int = 86400
+    MAX_FINDINGS_PER_AGENT_RESPONSE: int = 10
+    MAX_EVIDENCE_REFS_PER_FINDING: int = 20
+    MAX_NORMALIZED_ALERTS_PER_RESPONSE: int = 50
 
     # Durable investigations and LangGraph checkpoints. Leave empty for the
     # in-memory development fallback.

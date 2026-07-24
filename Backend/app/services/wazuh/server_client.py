@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 
 from app.config import settings
+from app.core.observability.wazuh import observe_wazuh_call
 from app.services.wazuh.exceptions import (
     WazuhAPIError,
     WazuhAuthError,
@@ -68,8 +69,10 @@ class _AuthenticatedWazuhTransport:
         password: str,
         verify: bool | str,
         timeout: httpx.Timeout | float | None = None,
+        component: str = "server",
     ) -> None:
         self.base_url = base_url.rstrip("/")
+        self.component = component
         self._username = username
         self._password = password
         self._client = httpx.Client(
@@ -87,27 +90,39 @@ class _AuthenticatedWazuhTransport:
         self._token_expires_at = 0.0
 
     def authenticate(self) -> str:
-        try:
-            response = self._client.post(
+        with observe_wazuh_call(
+            operation="authenticate",
+            component=self.component,
+        ):
+            try:
+                response = self._client.post(
+                    "/security/user/authenticate",
+                    params={"raw": "true"},
+                    auth=(self._username, self._password),
+                )
+            except httpx.HTTPError as exc:
+                raise WazuhAPIError(
+                    f"Cannot reach Wazuh API at {self.base_url}: "
+                    f"{exc.__class__.__name__}"
+                ) from exc
+
+            if response.status_code in {401, 403}:
+                raise WazuhAuthError(
+                    "Wazuh authentication failed: check the configured "
+                    "credentials."
+                )
+            self._raise_for_http_status(
+                response,
+                "POST",
                 "/security/user/authenticate",
-                params={"raw": "true"},
-                auth=(self._username, self._password),
             )
-        except httpx.HTTPError as exc:
-            raise WazuhAPIError(
-                f"Cannot reach Wazuh API at {self.base_url}: {exc.__class__.__name__}"
-            ) from exc
 
-        if response.status_code in {401, 403}:
-            raise WazuhAuthError("Wazuh authentication failed: check the configured credentials.")
-        self._raise_for_http_status(response, "POST", "/security/user/authenticate")
-
-        token = response.text.strip().strip('"')
-        if not token:
-            raise WazuhAuthError("Wazuh API returned an empty token.")
-        self._token = token
-        self._token_expires_at = time.time() + TOKEN_LIFETIME_SECONDS
-        return token
+            token = response.text.strip().strip('"')
+            if not token:
+                raise WazuhAuthError("Wazuh API returned an empty token.")
+            self._token = token
+            self._token_expires_at = time.time() + TOKEN_LIFETIME_SECONDS
+            return token
 
     def request(
         self,
@@ -120,13 +135,27 @@ class _AuthenticatedWazuhTransport:
     ) -> httpx.Response:
         method = method.upper()
         path = "/" + path.lstrip("/")
-        token = self._get_token()
-        response = self._send(method, path, params, json, token)
-        if response.status_code == 401:
-            response = self._send(method, path, params, json, self._get_token(force_refresh=True))
-        self._raise_for_http_status(response, method, path)
-        _validate_wazuh_envelope(response, allow_partial=allow_partial)
-        return response
+        resource = path.strip("/").split("/", 1)[0] or "root"
+        with observe_wazuh_call(
+            operation=f"{method.lower()}_{resource}",
+            component=self.component,
+        ):
+            token = self._get_token()
+            response = self._send(method, path, params, json, token)
+            if response.status_code == 401:
+                response = self._send(
+                    method,
+                    path,
+                    params,
+                    json,
+                    self._get_token(force_refresh=True),
+                )
+            self._raise_for_http_status(response, method, path)
+            _validate_wazuh_envelope(
+                response,
+                allow_partial=allow_partial,
+            )
+            return response
 
     def close(self) -> None:
         self._client.close()

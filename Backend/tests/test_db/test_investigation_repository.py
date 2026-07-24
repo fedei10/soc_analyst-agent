@@ -9,6 +9,7 @@ from app.db.repositories.investigations import (
     ResponseExecutionConflictError,
     SQLAlchemyInvestigationRepository,
 )
+from app.db.models.investigation import AuditEventRecord
 import pytest
 
 
@@ -143,6 +144,12 @@ def test_repository_persists_runs_report_actions_and_audit_history():
         "INV-PERSIST-001",
         organization_id="org-test",
     )) == 4
+    tier_reports = store.list_tier_reports(
+        "INV-PERSIST-001",
+        organization_id="org-test",
+    )
+    assert [item["tier"] for item in tier_reports] == ["l1", "l2", "l3"]
+    assert tier_reports[0]["triage"]["severity"] == "high"
     approvals = store.list_approvals(
         "INV-PERSIST-001",
         organization_id="org-test",
@@ -164,6 +171,17 @@ def test_audit_events_are_append_only_and_idempotent():
     )
     assert len(events) == 4
     assert len({item["event_id"] for item in events}) == 4
+
+    with store._session_factory() as session:
+        records = (
+            session.query(AuditEventRecord)
+            .order_by(AuditEventRecord.id if hasattr(AuditEventRecord, "id") else AuditEventRecord.occurred_at)
+            .all()
+        )
+    hashes = [record.event_hash for record in records]
+    assert all(hashes)
+    assert len(set(hashes)) == 4
+    assert sum(record.previous_hash is None for record in records) == 1
 
 
 def test_repository_isolates_organization_queries():

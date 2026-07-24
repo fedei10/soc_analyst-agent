@@ -21,8 +21,11 @@ from app.db.models.investigation import (
     InvestigationRecord,
     InvestigationReportRecord,
     ResponseActionRecord,
+    TierReportRecord,
     ToolExecutionRecord,
 )
+from app.coreAgents.orchestration.reporting import build_tier_report
+from app.coreAgents.orchestration.schemas import AgentTier
 from app.db.sanitization import bounded_excerpt, sanitize_for_storage
 from app.db.session import (
     DatabaseNotConfiguredError,
@@ -111,6 +114,20 @@ class InvestigationRepository(Protocol):
         organization_id: str,
     ) -> dict[str, Any] | None: ...
 
+    def save_tier_report(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        tier: AgentTier,
+    ) -> dict[str, Any]: ...
+
+    def list_tier_reports(
+        self,
+        investigation_id: str,
+        *,
+        organization_id: str,
+    ) -> list[dict[str, Any]]: ...
+
     def list_agent_runs(
         self,
         investigation_id: str,
@@ -162,6 +179,7 @@ class InMemoryInvestigationRepository:
     def __init__(self) -> None:
         self._snapshots: dict[tuple[str, str], dict[str, Any]] = {}
         self._claims: dict[tuple[str, str], dict[str, Any]] = {}
+        self._tier_reports: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._lock = RLock()
 
     def save_snapshot(self, snapshot: dict[str, Any]) -> None:
@@ -171,6 +189,17 @@ class InMemoryInvestigationRepository:
         with self._lock:
             key = (organization_id, snapshot["investigation_id"])
             self._snapshots[key] = deepcopy(snapshot)
+            for tier in ("l1", "l2", "l3"):
+                if isinstance(snapshot.get(f"{tier}_result"), dict):
+                    report = build_tier_report(snapshot, tier)
+                    self._tier_reports.setdefault(
+                        (
+                            organization_id,
+                            snapshot["investigation_id"],
+                            tier,
+                        ),
+                        report,
+                    )
 
     def get_snapshot(
         self,
@@ -215,6 +244,47 @@ class InMemoryInvestigationRepository:
             return None
         report = snapshot.get("final_report")
         return deepcopy(report) if isinstance(report, dict) else None
+
+    def save_tier_report(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        tier: AgentTier,
+    ) -> dict[str, Any]:
+        organization_id = str(snapshot.get("organization_id") or "").strip()
+        investigation_id = str(snapshot.get("investigation_id") or "").strip()
+        if not organization_id or not investigation_id:
+            raise ValueError(
+                "organization_id and investigation_id are required."
+            )
+        report = build_tier_report(snapshot, tier)
+        with self._lock:
+            if (
+                organization_id,
+                investigation_id,
+            ) not in self._snapshots:
+                raise ValueError("Investigation must be persisted first.")
+            self._tier_reports[
+                (organization_id, investigation_id, tier)
+            ] = deepcopy(report)
+        return report
+
+    def list_tier_reports(
+        self,
+        investigation_id: str,
+        *,
+        organization_id: str,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            return deepcopy(
+                [
+                    report
+                    for (org_id, case_id, _), report
+                    in self._tier_reports.items()
+                    if org_id == organization_id
+                    and case_id == investigation_id
+                ]
+            )
 
     def count_snapshots(
         self,
@@ -403,7 +473,11 @@ class SQLAlchemyInvestigationRepository:
         now = datetime.now(UTC)
 
         with self._session_factory.begin() as session:
-            record = session.get(InvestigationRecord, investigation_id)
+            record = session.get(
+                InvestigationRecord,
+                investigation_id,
+                with_for_update=True,
+            )
             if record is None:
                 record = InvestigationRecord(
                     investigation_id=investigation_id,
@@ -456,6 +530,7 @@ class SQLAlchemyInvestigationRepository:
             self._save_tool_executions(session, data)
             self._save_evidence(session, data)
             self._save_report(session, data)
+            self._save_tier_reports(session, data)
             self._save_audit_events(session, data)
             self._save_approval(session, data)
             self._save_actions(session, data)
@@ -808,11 +883,99 @@ class SQLAlchemyInvestigationRepository:
             record.generated_at = generated_at
 
     @staticmethod
+    def _upsert_tier_report(
+        session: Session,
+        snapshot: dict[str, Any],
+        tier: AgentTier,
+        *,
+        overwrite: bool = True,
+    ) -> dict[str, Any]:
+        report = build_tier_report(snapshot, tier)
+        report_id = str(report["report_id"])
+        record = session.get(TierReportRecord, report_id)
+        generated_at = _parse_datetime(report.get("generated_at"))
+        if record is None:
+            session.add(
+                TierReportRecord(
+                    report_id=report_id,
+                    investigation_id=snapshot["investigation_id"],
+                    organization_id=snapshot["organization_id"],
+                    tier=tier,
+                    report=report,
+                    generated_at=generated_at,
+                    updated_at=datetime.now(UTC),
+                )
+            )
+        elif overwrite:
+            record.report = report
+            record.generated_at = generated_at
+            record.updated_at = datetime.now(UTC)
+        return deepcopy(record.report) if record is not None else report
+
+    @classmethod
+    def _save_tier_reports(
+        cls,
+        session: Session,
+        snapshot: dict[str, Any],
+    ) -> None:
+        for tier in ("l1", "l2", "l3"):
+            if isinstance(snapshot.get(f"{tier}_result"), dict):
+                cls._upsert_tier_report(
+                    session,
+                    snapshot,
+                    tier,
+                    overwrite=False,
+                )
+
+    def save_tier_report(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        tier: AgentTier,
+    ) -> dict[str, Any]:
+        organization_id = str(snapshot.get("organization_id") or "").strip()
+        investigation_id = str(snapshot.get("investigation_id") or "").strip()
+        if not organization_id or not investigation_id:
+            raise ValueError(
+                "organization_id and investigation_id are required."
+            )
+        data = _json_value(snapshot)
+        with self._session_factory.begin() as session:
+            investigation = session.scalar(
+                select(InvestigationRecord).where(
+                    InvestigationRecord.investigation_id
+                    == investigation_id,
+                    InvestigationRecord.organization_id
+                    == organization_id,
+                )
+            )
+            if investigation is None:
+                raise ValueError("Investigation must be persisted first.")
+            return self._upsert_tier_report(
+                session,
+                data,
+                tier,
+                overwrite=True,
+            )
+
+    @staticmethod
     def _save_audit_events(
         session: Session,
         snapshot: dict[str, Any],
     ) -> None:
         investigation_id = snapshot["investigation_id"]
+        previous_hash = session.scalar(
+            select(AuditEventRecord.event_hash)
+            .where(
+                AuditEventRecord.investigation_id == investigation_id,
+                AuditEventRecord.event_hash.is_not(None),
+            )
+            .order_by(
+                AuditEventRecord.occurred_at.desc(),
+                AuditEventRecord.event_id.desc(),
+            )
+            .limit(1)
+        )
         for event in snapshot.get("audit_events", []):
             if not isinstance(event, dict):
                 continue
@@ -826,19 +989,89 @@ class SQLAlchemyInvestigationRepository:
             )
             if session.get(AuditEventRecord, event_id) is not None:
                 continue
+            payload = _json_value(event)
+            actor_id = (
+                event.get("actor_id")
+                or event.get("actor_user_id")
+                or snapshot.get("owner_user_id")
+            )
+            actor_type = str(
+                event.get("actor_type")
+                or ("user" if actor_id else "system")
+            )
+            metadata = {
+                key: value
+                for key, value in payload.items()
+                if key not in {
+                    "event",
+                    "stage",
+                    "timestamp",
+                    "investigation_id",
+                    "organization_id",
+                    "actor_type",
+                    "actor_id",
+                    "actor_user_id",
+                    "request_id",
+                    "trace_id",
+                    "conversation_id",
+                    "target_type",
+                    "target_id",
+                    "outcome",
+                    "reason_code",
+                }
+            }
+            hash_material = {
+                "event_id": event_id,
+                "investigation_id": investigation_id,
+                "organization_id": snapshot["organization_id"],
+                "event": str(event.get("event") or "unknown"),
+                "stage": str(event.get("stage") or "unknown"),
+                "occurred_at": _parse_datetime(
+                    event.get("timestamp")
+                ).isoformat(),
+                "actor_type": actor_type,
+                "actor_id": actor_id,
+                "request_id": event.get("request_id"),
+                "trace_id": event.get("trace_id"),
+                "conversation_id": event.get("conversation_id"),
+                "target_type": event.get("target_type"),
+                "target_id": event.get("target_id"),
+                "outcome": event.get("outcome"),
+                "reason_code": event.get("reason_code"),
+                "metadata": metadata,
+                "previous_hash": previous_hash,
+            }
+            event_hash = hashlib.sha256(
+                json.dumps(
+                    hash_material,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()
             session.add(AuditEventRecord(
                 event_id=event_id,
                 investigation_id=investigation_id,
                 organization_id=snapshot["organization_id"],
-                actor_user_id=(
-                    event.get("actor_user_id")
-                    or snapshot.get("owner_user_id")
-                ),
+                actor_user_id=actor_id,
+                actor_type=actor_type,
+                actor_id=actor_id,
+                request_id=event.get("request_id"),
+                trace_id=event.get("trace_id"),
+                conversation_id=event.get("conversation_id"),
+                target_type=event.get("target_type"),
+                target_id=event.get("target_id"),
+                outcome=event.get("outcome"),
+                reason_code=event.get("reason_code"),
                 stage=str(event.get("stage") or "unknown"),
                 event=str(event.get("event") or "unknown"),
                 occurred_at=_parse_datetime(event.get("timestamp")),
-                payload=event,
+                metadata_json=metadata,
+                previous_hash=previous_hash,
+                event_hash=event_hash,
+                payload=payload,
             ))
+            previous_hash = event_hash
 
     @staticmethod
     def _save_approval(
@@ -1096,6 +1329,26 @@ class SQLAlchemyInvestigationRepository:
                 )
             )
             return deepcopy(record.report) if record else None
+
+    def list_tier_reports(
+        self,
+        investigation_id: str,
+        *,
+        organization_id: str,
+    ) -> list[dict[str, Any]]:
+        statement = (
+            select(TierReportRecord)
+            .where(
+                TierReportRecord.investigation_id == investigation_id,
+                TierReportRecord.organization_id == organization_id,
+            )
+            .order_by(TierReportRecord.generated_at, TierReportRecord.tier)
+        )
+        with self._session_factory() as session:
+            return [
+                deepcopy(record.report)
+                for record in session.scalars(statement).all()
+            ]
 
     def count_snapshots(
         self,

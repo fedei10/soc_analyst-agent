@@ -14,6 +14,18 @@ def configure_langsmith(settings: Any) -> bool:
     # Keep the older flag in sync for LangChain versions that still read it.
     os.environ["LANGCHAIN_TRACING_V2"] = "true"
     os.environ["LANGSMITH_PROJECT"] = settings.LANGSMITH_PROJECT
+    os.environ["LANGSMITH_HIDE_INPUTS"] = str(
+        settings.LANGSMITH_HIDE_INPUTS
+    ).lower()
+    os.environ["LANGSMITH_HIDE_OUTPUTS"] = str(
+        settings.LANGSMITH_HIDE_OUTPUTS
+    ).lower()
+    os.environ["LANGSMITH_INCLUDE_RAW_ALERTS"] = str(
+        getattr(settings, "LANGSMITH_INCLUDE_RAW_ALERTS", False)
+    ).lower()
+    os.environ["LANGSMITH_INCLUDE_FULL_LOG"] = str(
+        getattr(settings, "LANGSMITH_INCLUDE_FULL_LOG", False)
+    ).lower()
 
     if settings.LANGSMITH_ENDPOINT:
         os.environ["LANGSMITH_ENDPOINT"] = settings.LANGSMITH_ENDPOINT

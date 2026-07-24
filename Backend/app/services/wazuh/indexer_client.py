@@ -8,6 +8,7 @@ from typing import Any
 from opensearchpy import OpenSearch
 
 from app.config import settings
+from app.core.observability.wazuh import observe_wazuh_call
 from app.services.wazuh.models import (
     AlertEvidence,
     AlertSearchResult,
@@ -134,7 +135,29 @@ class WazuhIndexerClient:
         self._alert_cache_lock = Lock()
 
     def health(self) -> dict[str, Any]:
-        return self._client.cluster.health()
+        with observe_wazuh_call(
+            operation="cluster_health",
+            component="indexer",
+        ):
+            return self._client.cluster.health()
+
+    def _search(
+        self,
+        *,
+        index: str,
+        body: dict[str, Any],
+        operation: str,
+        **options: Any,
+    ) -> dict[str, Any]:
+        with observe_wazuh_call(
+            operation=operation,
+            component="indexer",
+        ):
+            return self._client.search(
+                index=index,
+                body=body,
+                **options,
+            )
 
     def search_alerts(
         self,
@@ -237,7 +260,7 @@ class WazuhIndexerClient:
             ]
             query["bool"]["minimum_should_match"] = 1
 
-        response = self._client.search(index=self.ALERT_INDEX, body={
+        response = self._search(index=self.ALERT_INDEX, operation="search_alerts", body={
             "size": limit,
             "sort": [{"@timestamp": "asc" if oldest_first else "desc"}],
             "track_total_hits": True,
@@ -252,7 +275,7 @@ class WazuhIndexerClient:
         return result
 
     def get_alert_by_id(self, alert_id: str) -> AlertEvidence | None:
-        response = self._client.search(index=self.ALERT_INDEX, body={
+        response = self._search(index=self.ALERT_INDEX, operation="get_alert", body={
             "size": 1,
             "query": {"ids": {"values": [alert_id]}},
         })
@@ -260,7 +283,7 @@ class WazuhIndexerClient:
         return self._normalize_alert(hits[0]) if hits else None
 
     def get_raw_alert_by_id(self, alert_id: str) -> RawAlertDocument | None:
-        response = self._client.search(index=self.ALERT_INDEX, body={
+        response = self._search(index=self.ALERT_INDEX, operation="get_raw_alert", body={
             "size": 1,
             "query": {"ids": {"values": [alert_id]}},
         })
@@ -329,8 +352,9 @@ class WazuhIndexerClient:
         if agent_id:
             must.append({"term": {"agent.id": agent_id}})
 
-        response = self._client.search(
+        response = self._search(
             index=self.ARCHIVE_INDEX,
+            operation="search_archived_logs",
             body={
                 "size": limit,
                 "sort": [
@@ -376,8 +400,9 @@ class WazuhIndexerClient:
 
     def archive_summary(self, hours: int = 24) -> dict[str, Any]:
         self._validate_window(hours, 1)
-        response = self._client.search(
+        response = self._search(
             index=self.ARCHIVE_INDEX,
+            operation="archive_statistics",
             body={
                 "size": 0,
                 "track_total_hits": True,
@@ -411,7 +436,7 @@ class WazuhIndexerClient:
 
     def alert_summary(self, hours: int = 24) -> dict[str, Any]:
         self._validate_window(hours, 1)
-        response = self._client.search(index=self.ALERT_INDEX, body={
+        response = self._search(index=self.ALERT_INDEX, operation="rule_context", body={
             "size": 0,
             "track_total_hits": True,
             "query": {"range": {"@timestamp": {"gte": f"now-{hours}h"}}},
@@ -443,7 +468,7 @@ class WazuhIndexerClient:
             must.append({"term": {"vulnerability.severity": severity}})
         if agent_id:
             must.append({"term": {"agent.id": agent_id}})
-        response = self._client.search(index=self.VULNERABILITY_INDEX, body={
+        response = self._search(index=self.VULNERABILITY_INDEX, operation="endpoint_vulnerabilities", body={
             "size": limit,
             "track_total_hits": True,
             "query": {"bool": {"must": must}} if must else {"match_all": {}},
@@ -452,7 +477,7 @@ class WazuhIndexerClient:
         return [item.get("_source", {}) for item in hits], self._total(response)
 
     def vulnerability_summary(self) -> dict[str, Any]:
-        response = self._client.search(index=self.VULNERABILITY_INDEX, body={
+        response = self._search(index=self.VULNERABILITY_INDEX, operation="vulnerability_inventory", body={
             "size": 0,
             "track_total_hits": True,
             "aggs": {"by_severity": {"terms": {"field": "vulnerability.severity", "size": 10}}},

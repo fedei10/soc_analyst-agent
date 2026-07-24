@@ -1,6 +1,8 @@
 """Strict input schemas for the allowlisted SOC agent tools."""
 
 from datetime import datetime
+import ipaddress
+import re
 from typing import Literal
 
 from pydantic import (
@@ -9,6 +11,7 @@ from pydantic import (
     Field,
     IPvAnyAddress,
     model_validator,
+    field_validator,
 )
 
 
@@ -116,6 +119,45 @@ class EndpointInventoryInput(ToolInput):
     ]
     limit: int = Field(default=20, ge=1, le=100)
     text: str | None = Field(default=None, min_length=2, max_length=128)
+
+
+class EndpointForensicsInput(ToolInput):
+    agent_id: str = Field(pattern=r"^\d+$", max_length=16)
+    limit: int = Field(default=10, ge=1, le=10)
+
+
+class IOCHuntInput(ToolInput):
+    indicator_type: Literal[
+        "ip",
+        "domain",
+        "hash",
+        "process",
+        "user",
+        "path",
+        "other",
+    ]
+    indicator: str = Field(min_length=2, max_length=256)
+    hours: int = Field(default=24, ge=1, le=168)
+    limit: int = Field(default=10, ge=1, le=20)
+    agent_id: str | None = Field(
+        default=None,
+        pattern=r"^\d+$",
+        max_length=16,
+    )
+
+    @field_validator("indicator")
+    @classmethod
+    def validate_indicator(cls, value: str, info):
+        indicator = value.strip()
+        indicator_type = info.data.get("indicator_type")
+        if indicator_type == "ip":
+            ipaddress.ip_address(indicator)
+        elif indicator_type == "hash" and not re.fullmatch(
+            r"[A-Fa-f0-9]{32}|[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64}|[A-Fa-f0-9]{128}",
+            indicator,
+        ):
+            raise ValueError("hash must be a supported hexadecimal digest.")
+        return indicator
 
 
 class VulnerabilitySearchInput(ToolInput):

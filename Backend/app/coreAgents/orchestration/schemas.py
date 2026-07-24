@@ -39,6 +39,12 @@ AttributionStatus = Literal[
     "not_identified",
     "insufficient_telemetry",
 ]
+IncidentStatus = Literal[
+    "confirmed",
+    "likely",
+    "undetermined",
+    "false_positive",
+]
 
 
 class Severity(str, Enum):
@@ -113,6 +119,14 @@ class L2CorrelationFindings(StrictModel):
     attack_chain: list[str] = Field(default_factory=list)
     supporting_evidence: list[dict[str, Any]] = Field(default_factory=list)
     contradictory_evidence: list[dict[str, Any]] = Field(default_factory=list)
+    threat_hunt_findings: list[dict[str, Any]] = Field(default_factory=list)
+    indicators: list[str] = Field(default_factory=list)
+    archived_log_coverage: Literal[
+        "available",
+        "unavailable",
+        "partial",
+        "unknown",
+    ] = "unknown"
     missing_evidence: list[str] = Field(default_factory=list)
 
 
@@ -121,6 +135,18 @@ class L2AssetInvestigationFindings(StrictModel):
     affected_assets: list[str] = Field(default_factory=list)
     compromise_indicators: list[str] = Field(default_factory=list)
     benign_indicators: list[str] = Field(default_factory=list)
+    root_cause_hypothesis: str | None = None
+    process_findings: list[dict[str, Any]] = Field(default_factory=list)
+    network_findings: list[dict[str, Any]] = Field(default_factory=list)
+    persistence_findings: list[dict[str, Any]] = Field(default_factory=list)
+    vulnerability_findings: list[dict[str, Any]] = Field(default_factory=list)
+    containment_recommendations: list["ProposedAction"] = Field(
+        default_factory=list
+    )
+    detection_tuning_recommendations: list[dict[str, Any]] = Field(
+        default_factory=list
+    )
+    post_incident_lessons: list[str] = Field(default_factory=list)
     detection_gap: bool = False
     evidence: list[dict[str, Any]] = Field(default_factory=list)
     missing_evidence: list[str] = Field(default_factory=list)
@@ -129,18 +155,42 @@ class L2AssetInvestigationFindings(StrictModel):
 class L3DetectionEngineeringFindings(StrictModel):
     summary: str = Field(min_length=1)
     root_cause: str | None = None
+    threat_hunt_findings: list[dict[str, Any]] = Field(default_factory=list)
+    ioc_assessments: list[dict[str, Any]] = Field(default_factory=list)
+    ttp_analysis: list[dict[str, Any]] = Field(default_factory=list)
+    forensic_assessment: dict[str, Any] = Field(default_factory=dict)
+    malware_analysis: dict[str, Any] = Field(default_factory=dict)
     detection_gaps: list[str] = Field(default_factory=list)
     rule_recommendations: list[dict[str, Any]] = Field(default_factory=list)
+    systemic_weaknesses: list[str] = Field(default_factory=list)
+    architecture_recommendations: list[dict[str, Any]] = Field(
+        default_factory=list
+    )
+    playbook_recommendations: list[dict[str, Any]] = Field(
+        default_factory=list
+    )
     supporting_evidence: list[dict[str, Any]] = Field(default_factory=list)
     missing_evidence: list[str] = Field(default_factory=list)
 
 
 class L3ResponsePlanningFindings(StrictModel):
     summary: str = Field(min_length=1)
+    incident_command_plan: dict[str, Any] = Field(default_factory=dict)
+    containment_strategy: list[str] = Field(default_factory=list)
     remediation_steps: list[str] = Field(default_factory=list)
+    eradication_steps: list[str] = Field(default_factory=list)
+    recovery_steps: list[str] = Field(default_factory=list)
     proposed_actions: list["ProposedAction"] = Field(default_factory=list)
     validation_steps: list[str] = Field(default_factory=list)
     rollback_considerations: list[str] = Field(default_factory=list)
+    crisis_coordination: list[dict[str, Any]] = Field(default_factory=list)
+    playbook_recommendations: list[dict[str, Any]] = Field(
+        default_factory=list
+    )
+    automation_opportunities: list[dict[str, Any]] = Field(
+        default_factory=list
+    )
+    evidence: list[dict[str, Any]] = Field(default_factory=list)
     missing_evidence: list[str] = Field(default_factory=list)
 
 
@@ -175,18 +225,46 @@ class L1Result(StrictModel):
 
 class L2Result(StrictModel):
     summary: str = Field(min_length=1)
+    incident_status: IncidentStatus = "undetermined"
     severity: Severity
     confidence: float = Field(ge=0.0, le=1.0)
+    root_cause: str | None = None
+    scope_summary: str | None = None
     timeline: list[dict[str, Any]] = Field(default_factory=list)
     affected_assets: list[str] = Field(default_factory=list)
     related_alert_ids: list[str] = Field(default_factory=list)
     attack_chain: list[str] = Field(default_factory=list)
+    compromise_indicators: list[str] = Field(default_factory=list)
+    threat_hunt_findings: list[dict[str, Any]] = Field(default_factory=list)
+    containment_recommendations: list["ProposedAction"] = Field(
+        default_factory=list
+    )
+    detection_tuning_recommendations: list[dict[str, Any]] = Field(
+        default_factory=list
+    )
+    post_incident_review: dict[str, Any] = Field(default_factory=dict)
+    evidence: list[dict[str, Any]] = Field(default_factory=list)
     false_positive_confirmed: bool = False
     detection_gap: bool = False
     requires_l3: bool = False
     escalation_reason: str | None = None
     recommended_next_steps: list[str] = Field(default_factory=list)
     evidence_refs: list[str] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_containment_routing(self):
+        if self.false_positive_confirmed and any(
+            action.requires_approval
+            for action in self.containment_recommendations
+        ):
+            raise ValueError(
+                "A confirmed false positive cannot propose containment."
+            )
+        if self.containment_recommendations and not self.requires_l3:
+            raise ValueError(
+                "L2 containment recommendations require L3 validation."
+            )
+        return self
 
 
 class ProposedAction(StrictModel):
@@ -225,11 +303,52 @@ class ProposedAction(StrictModel):
 class L3Result(StrictModel):
     summary: str = Field(min_length=1)
     root_cause: str | None = None
+    threat_assessment: dict[str, Any] = Field(default_factory=dict)
+    threat_hunt_findings: list[dict[str, Any]] = Field(default_factory=list)
+    ioc_assessments: list[dict[str, Any]] = Field(default_factory=list)
+    ttp_analysis: list[dict[str, Any]] = Field(default_factory=list)
+    forensic_assessment: dict[str, Any] = Field(default_factory=dict)
+    malware_analysis: dict[str, Any] = Field(default_factory=dict)
     detection_gaps: list[str] = Field(default_factory=list)
     rule_recommendations: list[dict[str, Any]] = Field(default_factory=list)
+    systemic_weaknesses: list[str] = Field(default_factory=list)
+    incident_command_plan: dict[str, Any] = Field(default_factory=dict)
+    containment_strategy: list[str] = Field(default_factory=list)
     remediation_steps: list[str] = Field(default_factory=list)
+    eradication_steps: list[str] = Field(default_factory=list)
+    recovery_steps: list[str] = Field(default_factory=list)
+    playbook_recommendations: list[dict[str, Any]] = Field(
+        default_factory=list
+    )
+    automation_opportunities: list[dict[str, Any]] = Field(
+        default_factory=list
+    )
+    architecture_recommendations: list[dict[str, Any]] = Field(
+        default_factory=list
+    )
     proposed_actions: list[ProposedAction] = Field(default_factory=list)
+    evidence: list[dict[str, Any]] = Field(default_factory=list)
     evidence_refs: list[str] = Field(min_length=1)
+
+
+class TierReport(StrictModel):
+    report_id: str = Field(min_length=1, max_length=100)
+    investigation_id: str = Field(min_length=1, max_length=64)
+    tier: AgentTier
+    status: Literal["completed"]
+    summary: str = Field(min_length=1)
+    generated_at: datetime
+    alert_context: dict[str, Any] = Field(default_factory=dict)
+    triage: dict[str, Any] = Field(default_factory=dict)
+    initial_investigation: dict[str, Any] = Field(default_factory=dict)
+    advanced_analysis: dict[str, Any] = Field(default_factory=dict)
+    containment: dict[str, Any] = Field(default_factory=dict)
+    detection_engineering: dict[str, Any] = Field(default_factory=dict)
+    post_incident_review: dict[str, Any] = Field(default_factory=dict)
+    escalation: dict[str, Any] = Field(default_factory=dict)
+    analyst_activity: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    result: dict[str, Any] = Field(default_factory=dict)
 
 
 class OrchestratorDecision(StrictModel):

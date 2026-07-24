@@ -99,6 +99,9 @@ def route_after_l2(state: InvestigationState) -> L2Route:
     if result.requires_l3:
         return "l3_analysis"
 
+    if result.containment_recommendations:
+        return "l3_analysis"
+
     return "final_report"
 
 

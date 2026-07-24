@@ -46,6 +46,7 @@ def test_investigation_and_chat_routes_are_registered():
     assert "/api/v1/investigations/{investigation_id}/approval" in paths
     assert "/api/v1/investigations/{investigation_id}/execute" in paths
     assert "/api/v1/investigations/{investigation_id}/report" in paths
+    assert "/api/v1/investigations/{investigation_id}/tier-reports" in paths
     assert "/api/v1/investigations/{investigation_id}/agent-runs" in paths
     assert "/api/v1/investigations/{investigation_id}/audit" in paths
     assert "/api/v1/investigations/{investigation_id}/approvals" in paths

@@ -39,6 +39,11 @@ Make no more than four tool calls and never repeat an identical tool call.
 Do not delegate, execute commands, change a system, approve an action, or access
 responder credentials. Never invent evidence. Clearly record missing evidence.
 Every evidence item must include an evidence_ref such as alert:<alert_id>.
+Separate observed facts from hypotheses. An internal source address, a
+vulnerability count, an inventory entry, or a FIM/SCA total is context, not
+proof of compromise without a supporting event. Treat truncated or unavailable
+telemetry as uncertainty. Recommend containment only when cited evidence
+supports the target and explain its operational blast radius.
 Return only the required structured result.
 """.strip()
 
@@ -85,13 +90,15 @@ SPECIALIST_SPECS: dict[SpecialistRole, SpecialistSpec] = {
         role="l2_correlation",
         tier="l2",
         purpose=(
-            "correlate related alerts and authentication activity into a "
-            "fact-based timeline and attack-chain hypothesis"
+            "correlate related alerts, authentication activity, and archived "
+            "logs into a fact-based timeline; proactively hunt indicators and "
+            "record competing attack-chain hypotheses"
         ),
         tool_names=(
             "get_related_alerts",
             "build_authentication_timeline",
             "check_successful_login_after_failures",
+            "hunt_archived_security_logs",
         ),
         result_model=L2CorrelationFindings,
     ),
@@ -99,13 +106,15 @@ SPECIALIST_SPECS: dict[SpecialistRole, SpecialistSpec] = {
         role="l2_asset_investigation",
         tier="l2",
         purpose=(
-            "inspect affected asset context, compromise indicators, benign "
-            "indicators, and telemetry gaps"
+            "inspect affected endpoint processes, ports, network context, "
+            "FIM, configuration, rootcheck, and vulnerabilities; assess scope "
+            "and root cause; propose evidence-backed containment, detection "
+            "tuning, and post-incident lessons without executing changes"
         ),
         tool_names=(
             "get_agent_summary",
             "get_alert_by_id",
-            "collect_host_diagnostic",
+            "get_endpoint_forensics",
         ),
         result_model=L2AssetInvestigationFindings,
     ),
@@ -113,23 +122,33 @@ SPECIALIST_SPECS: dict[SpecialistRole, SpecialistSpec] = {
         role="l3_detection_engineering",
         tier="l3",
         purpose=(
-            "validate root cause, detection coverage, rule context, and "
-            "evidence-based detection improvements"
+            "hunt supported indicators across local telemetry; analyze TTPs, "
+            "root cause, endpoint forensic context, malware-analysis gaps, "
+            "detection coverage, systemic weaknesses, playbook improvements, "
+            "and strategic defense controls"
         ),
-        tool_names=("get_rule_and_mitre_context", "get_detection_evidence"),
+        tool_names=(
+            "get_rule_and_mitre_context",
+            "get_detection_evidence",
+            "hunt_ioc_across_telemetry",
+            "get_endpoint_forensics",
+        ),
         result_model=L3DetectionEngineeringFindings,
     ),
     "l3_response_planning": SpecialistSpec(
         role="l3_response_planning",
         tier="l3",
         purpose=(
-            "prepare bounded remediation and response proposals for later "
-            "server-side policy validation and human approval"
+            "lead the evidence-based response design for a major incident: "
+            "prepare containment, eradication, recovery, validation, crisis "
+            "coordination, playbook, and automation plans plus bounded action "
+            "proposals for later policy validation and human approval"
         ),
         tool_names=(
             "get_agent_summary",
-            "collect_host_diagnostic",
-            "get_detection_evidence",
+            "get_endpoint_forensics",
+            "get_related_alerts",
+            "hunt_ioc_across_telemetry",
         ),
         result_model=L3ResponsePlanningFindings,
     ),
@@ -153,17 +172,37 @@ SUPERVISOR_PROMPTS: dict[SocTier, str] = {
     ),
     "l2": (
         "You are the no-tool L2 supervisor. Validate the L1 result against the "
-        "specialist findings and return the required L2Result. Preserve factual "
-        "and contradictory evidence and require L3 when advanced response or "
-        "detection engineering is needed. Set evidence_refs only to supplied "
-        "available_evidence_refs list."
+        "specialist findings and return the required L2Result. Determine the "
+        "incident status, root-cause hypothesis, affected scope, threat-hunt "
+        "findings, and contradictory evidence. Preserve only supported "
+        "containment and detection-tuning recommendations. Containment remains "
+        "a proposal: never execute it, and set requires_l3=true whenever any "
+        "containment recommendation exists. Set all result and action "
+        "evidence_refs only to the supplied available_evidence_refs list. "
+        "Carry every newly cited specialist evidence item into the result's "
+        "bounded evidence list so it can be persisted for L3 and reporting. "
+        "Do not convert hypotheses, vulnerability totals, or incomplete FIM/SCA "
+        "counts into confirmed compromise. Mark the post-incident review as "
+        "preliminary until containment and verification are complete."
     ),
     "l3": (
         "You are the no-tool L3 supervisor. Synthesize only supported findings "
-        "into the required L3Result. Proposed actions must use the approved "
-        "action catalog and remain proposals for policy validation and human "
-        "approval. Every proposed action and the result must cite supplied "
-        "available_evidence_refs. Never generate or execute commands."
+        "into the required L3Result. Distinguish observed TTPs from hypotheses. "
+        "If external intelligence, endpoint memory, packet capture, or malware "
+        "binaries were unavailable, record the acquisition gap and do not "
+        "claim reputation, memory analysis, reverse engineering, or zero-day "
+        "attribution. Proposed actions must use the approved action catalog and "
+        "remain proposals for policy validation and human approval. Other "
+        "cross-team tasks belong in the incident command plan, not the action "
+        "catalog. Review supported L2 containment recommendations rather than "
+        "blindly copying them. Carry each newly cited specialist evidence item "
+        "into the bounded evidence list for persistence. Every action and the "
+        "result must cite supplied available_evidence_refs. Playbooks and "
+        "automation items are reviewable drafts, never executable code. Limit "
+        "automation to read-only enrichment, triage, evidence collection, and "
+        "approval queueing. Never recommend an automatic write response that "
+        "bypasses policy validation or human approval. Never generate or "
+        "execute commands."
     ),
 }
 

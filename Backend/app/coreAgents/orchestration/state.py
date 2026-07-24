@@ -48,6 +48,9 @@ class InvestigationState(TypedDict, total=False):
     l1_result: NotRequired[dict[str, Any] | None]
     l2_result: NotRequired[dict[str, Any] | None]
     l3_result: NotRequired[dict[str, Any] | None]
+    l1_report: NotRequired[dict[str, Any] | None]
+    l2_report: NotRequired[dict[str, Any] | None]
+    l3_report: NotRequired[dict[str, Any] | None]
     specialist_runs: Annotated[list[dict[str, Any]], operator.add]
 
     evidence: NotRequired[list[dict[str, Any]]]

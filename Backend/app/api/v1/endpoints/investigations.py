@@ -1,11 +1,11 @@
 """Investigation workflow and read-only SOC agent chat endpoints."""
 
 import json
-import logging
 import hashlib
 import uuid
 from typing import Annotated, Any
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -41,7 +41,7 @@ from app.services.redis.ephemeral import EphemeralRedis
 
 read = APIRouter(dependencies=[Depends(require_read)])
 write = APIRouter(dependencies=[Depends(require_approve)])
-logger = logging.getLogger("tsage.orchestration")
+logger = structlog.get_logger("tsage.orchestration")
 ReadPrincipal = Annotated[AuthPrincipal, Depends(require_read)]
 InvestigatorPrincipal = Annotated[
     AuthPrincipal,
@@ -343,6 +343,29 @@ def get_investigation_report(
 
 
 @read.get(
+    "/investigations/{investigation_id}/tier-reports",
+    tags=["investigations"],
+)
+def get_investigation_tier_reports(
+    investigation_id: str,
+    principal: ReadPrincipal,
+):
+    try:
+        items = get_investigation_service().tier_reports(
+            investigation_id,
+            organization_id=principal.scope_id,
+        )
+    except InvestigationNotFoundError:
+        raise HTTPException(404, f"Investigation {investigation_id} not found.")
+    return {
+        "data": {
+            "items": _public_data(items),
+            "count": len(items),
+        }
+    }
+
+
+@read.get(
     "/investigations/{investigation_id}/agent-runs",
     tags=["investigations"],
 )
@@ -629,7 +652,11 @@ def chat_with_soc_orchestrator(
             user_id=principal.user_id,
         )
     except Exception as exc:
-        logger.exception("SOC conversation failed.")
+        logger.exception(
+            "soc_agent_run_failed",
+            agent_role="chat",
+            error_type=type(exc).__name__,
+        )
         raise HTTPException(
             503,
             "SOC conversation is unavailable. Check the LLM and Wazuh connections.",

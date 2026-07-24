@@ -66,6 +66,26 @@ def test_detection_gap_reaches_l3():
     assert route_after_l2(state) == "l3_analysis"
 
 
+def test_containment_recommendation_reaches_l3():
+    state = {
+        "l2_result": l2_result(
+            requires_l3=True,
+            containment_recommendations=[
+                {
+                    "action_type": "block_ip",
+                    "target": "192.0.2.10",
+                    "reason": "Confirmed malicious source",
+                    "risk_level": "medium",
+                    "operational_impact": "May block a shared source",
+                    "evidence_refs": ["alert:alert-1"],
+                }
+            ],
+        )
+    }
+
+    assert route_after_l2(state) == "l3_analysis"
+
+
 def test_resolved_medium_alert_stops_after_l2():
     state = {"l2_result": l2_result()}
 

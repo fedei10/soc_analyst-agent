@@ -8,7 +8,13 @@ import pytest
 from app.services.wazuh.exceptions import WazuhAPIError, WazuhValidationError
 from app.services.wazuh.gateway import WazuhGateway
 from app.services.wazuh.indexer_client import WazuhIndexerClient
-from app.services.wazuh.models import AlertEvidence, AlertSearchResult
+from app.services.wazuh.models import (
+    AgentSummary,
+    AlertEvidence,
+    AlertSearchResult,
+    DetectionEvidence,
+    EndpointInventory,
+)
 from app.services.wazuh.server_client import WazuhServerClient
 
 
@@ -273,6 +279,88 @@ def test_detection_evidence_includes_fim_sca_and_rootcheck():
     assert evidence.sca_total == 1
     assert evidence.rootcheck_total == 1
     assert evidence.rootcheck_findings[0]["status"] == "outstanding"
+
+
+def test_endpoint_forensics_preserves_partial_results_and_limitations(monkeypatch):
+    result = AlertSearchResult(total=0, returned=0, truncated=False, alerts=[])
+    gateway = WazuhGateway(server=FakeServer(), indexer=FakeIndexer(result))
+    monkeypatch.setattr(
+        gateway,
+        "get_agent_summary",
+        lambda agent_id: AgentSummary(agent_id=agent_id, name="server-1"),
+    )
+
+    def inventory(*, agent_id, component, limit):
+        if component == "ports":
+            raise WazuhAPIError("ports unavailable", 503)
+        return EndpointInventory(
+            agent_id=agent_id,
+            component=component,
+            total=1,
+            returned=1,
+            truncated=False,
+            items=[{"component": component}],
+        )
+
+    monkeypatch.setattr(gateway, "get_agent_inventory", inventory)
+    monkeypatch.setattr(
+        gateway,
+        "get_detection_evidence",
+        lambda **kwargs: DetectionEvidence(
+            agent_id=kwargs["agent_id"],
+            fim_findings=[],
+            sca_findings=[],
+            rootcheck_findings=[],
+            fim_total=0,
+            sca_total=0,
+            rootcheck_total=0,
+            truncated=False,
+        ),
+    )
+    monkeypatch.setattr(
+        gateway,
+        "search_vulnerabilities",
+        lambda **kwargs: ([{"id": "CVE-2026-0001"}], 1),
+    )
+
+    forensics = gateway.get_endpoint_forensics(agent_id="001", limit=10)
+
+    assert set(forensics.inventories) == {"processes", "network"}
+    assert forensics.vulnerability_total == 1
+    assert forensics.source_errors == [{
+        "source": "inventory:ports",
+        "code": "SOURCE_UNAVAILABLE",
+    }]
+    assert any(
+        "memory capture" in item.lower()
+        for item in forensics.telemetry_limitations
+    )
+
+
+def test_ioc_hunt_reports_partial_source_coverage():
+    result = AlertSearchResult(
+        total=1,
+        returned=1,
+        truncated=False,
+        alerts=[auth_event("alert-ioc", 10, "failure")],
+    )
+    gateway = WazuhGateway(server=FakeServer(), indexer=FakeIndexer(result))
+
+    hunt = gateway.hunt_ioc_telemetry(
+        indicator="203.0.113.10",
+        indicator_type="ip",
+        hours=24,
+        limit=10,
+    )
+
+    assert hunt.alerts is not None
+    assert hunt.alerts.alerts[0].alert_id == "alert-ioc"
+    assert hunt.archived_logs is None
+    assert hunt.source_errors == [{
+        "source": "wazuh_archives",
+        "code": "SOURCE_UNAVAILABLE",
+    }]
+    assert hunt.external_intelligence_status == "not_configured"
 
 
 def test_archive_search_is_bounded_and_returns_raw_context():

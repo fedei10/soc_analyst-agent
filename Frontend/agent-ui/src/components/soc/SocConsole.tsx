@@ -1081,6 +1081,30 @@ export default function SocConsole() {
                   </Panel>
                 </div>
 
+                {investigation.tier_reports &&
+                  investigation.tier_reports.length > 0 && (
+                    <Panel
+                      title="Analyst handoff reports"
+                      icon={<FileSearch size={17} />}
+                    >
+                      <div className="agent-result-list">
+                        {investigation.tier_reports.map((report) => (
+                          <details key={report.report_id} open>
+                            <summary>
+                              <CheckCircle2 size={15} />
+                              {report.tier.toUpperCase()} incident report
+                            </summary>
+                            <ResultDetails
+                              result={
+                                report as unknown as Record<string, unknown>
+                              }
+                            />
+                          </details>
+                        ))}
+                      </div>
+                    </Panel>
+                  )}
+
                 {investigation.errors.length > 0 && (
                   <Panel
                     title="Workflow errors"

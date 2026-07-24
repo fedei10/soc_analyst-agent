@@ -12,6 +12,8 @@ from app.services.wazuh.models import (
     AuthenticationTimeline,
     DetectionEvidence,
     EndpointInventory,
+    EndpointForensics,
+    IOCHuntResult,
     RawAlertDocument,
     RuleMitreContext,
     SuccessfulLoginAnalysis,
@@ -408,6 +410,157 @@ class WazuhGateway:
                 or sca_total > len(sca_items)
                 or rootcheck_total > len(rootcheck_items)
             ),
+        )
+
+    def get_endpoint_forensics(
+        self,
+        *,
+        agent_id: str,
+        limit: int = 20,
+    ) -> EndpointForensics:
+        """Collect a partial-safe, bounded endpoint evidence snapshot."""
+        if not 1 <= limit <= 25:
+            raise ValueError("limit must be between 1 and 25.")
+
+        errors: list[dict[str, str]] = []
+        agent = None
+        inventories: dict[str, EndpointInventory] = {}
+        detection_evidence = None
+        vulnerabilities: list[dict[str, Any]] = []
+        vulnerability_total = 0
+
+        try:
+            agent = self.get_agent_summary(agent_id)
+        except Exception:
+            errors.append({
+                "source": "agent_summary",
+                "code": "SOURCE_UNAVAILABLE",
+            })
+
+        for component in ("processes", "ports", "network"):
+            try:
+                inventories[component] = self.get_agent_inventory(
+                    agent_id=agent_id,
+                    component=component,
+                    limit=limit,
+                )
+            except Exception:
+                errors.append({
+                    "source": f"inventory:{component}",
+                    "code": "SOURCE_UNAVAILABLE",
+                })
+
+        try:
+            detection_evidence = self.get_detection_evidence(
+                agent_id=agent_id,
+                limit=limit,
+            )
+        except Exception:
+            errors.append({
+                "source": "fim_sca_rootcheck",
+                "code": "SOURCE_UNAVAILABLE",
+            })
+
+        try:
+            vulnerabilities, vulnerability_total = self.search_vulnerabilities(
+                agent_id=agent_id,
+                limit=limit,
+            )
+        except Exception:
+            errors.append({
+                "source": "vulnerabilities",
+                "code": "SOURCE_UNAVAILABLE",
+            })
+
+        return EndpointForensics(
+            agent_id=agent_id,
+            agent=agent,
+            inventories=inventories,
+            detection_evidence=detection_evidence,
+            vulnerabilities=vulnerabilities,
+            vulnerability_total=vulnerability_total,
+            truncated=(
+                any(item.truncated for item in inventories.values())
+                or (
+                    detection_evidence is not None
+                    and detection_evidence.truncated
+                )
+                or vulnerability_total > len(vulnerabilities)
+            ),
+            source_errors=errors,
+            telemetry_limitations=[
+                "Endpoint memory capture is not available through this Wazuh integration.",
+                (
+                    "Process ancestry is limited to PID and parent-PID fields "
+                    "returned by Wazuh syscollector."
+                ),
+                "Packet payload capture is not available through this tool.",
+            ],
+        )
+
+    def hunt_ioc_telemetry(
+        self,
+        *,
+        indicator: str,
+        indicator_type: Literal[
+            "ip",
+            "domain",
+            "hash",
+            "process",
+            "user",
+            "path",
+            "other",
+        ],
+        hours: int = 24,
+        limit: int = 10,
+        agent_id: str | None = None,
+    ) -> IOCHuntResult:
+        """Search bounded local Wazuh telemetry without claiming reputation."""
+        if not 2 <= len(indicator) <= 256:
+            raise ValueError("indicator must be between 2 and 256 characters.")
+        if not 1 <= hours <= 168:
+            raise ValueError("hours must be between 1 and 168.")
+        if not 1 <= limit <= 20:
+            raise ValueError("limit must be between 1 and 20.")
+
+        alerts = None
+        archived_logs = None
+        errors: list[dict[str, str]] = []
+        try:
+            alerts = self.search_alerts(
+                hours=hours,
+                limit=limit,
+                agent_id=agent_id,
+                text=indicator,
+            )
+        except Exception:
+            errors.append({
+                "source": "wazuh_alerts",
+                "code": "SOURCE_UNAVAILABLE",
+            })
+        try:
+            archived_logs = self.search_archived_logs(
+                text=indicator,
+                hours=hours,
+                limit=limit,
+                agent_id=agent_id,
+            )
+        except Exception:
+            errors.append({
+                "source": "wazuh_archives",
+                "code": "SOURCE_UNAVAILABLE",
+            })
+
+        return IOCHuntResult(
+            indicator=indicator,
+            indicator_type=indicator_type,
+            alerts=alerts,
+            archived_logs=archived_logs,
+            source_errors=errors,
+            intelligence_scope=[
+                "local_wazuh_alerts",
+                "local_wazuh_archives",
+            ],
         )
 
     def alert_summary(self, hours: int = 24) -> dict[str, Any]:

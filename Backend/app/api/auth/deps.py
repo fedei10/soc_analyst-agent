@@ -4,16 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-import logging
 from typing import Any
 
+import structlog
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.config import settings
+from app.core.observability.context import bind_context
 
 
-logger = logging.getLogger("tsage.auth")
+logger = structlog.get_logger("tsage.auth")
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -106,9 +107,9 @@ def _sync_principal(principal: AuthPrincipal) -> None:
                 "Identity persistence is unavailable.",
             ) from exc
         logger.warning(
-            "Clerk identity projection skipped user=%s error=%s",
-            principal.user_id,
-            type(exc).__name__,
+            "identity_projection_skipped",
+            user_id=principal.user_id,
+            error_type=type(exc).__name__,
         )
 
 
@@ -133,6 +134,10 @@ async def require_principal(
         raise HTTPException(401, "Clerk session token has no claims.")
     principal = _principal_from_payload(payload)
     request.state.principal = principal
+    bind_context(
+        user_id=principal.user_id,
+        organization_id=principal.scope_id,
+    )
     _sync_principal(principal)
     return principal
 

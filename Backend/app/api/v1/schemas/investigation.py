@@ -21,6 +21,7 @@ from app.coreAgents.orchestration.schemas import (
     ProposedAction,
     Severity,
     StrictModel,
+    TierReport,
     WRITE_ACTIONS,
 )
 from app.coreAgents.orchestration.state import (
@@ -165,5 +166,6 @@ __all__ = [
     "ResponseExecutionInput",
     "Severity",
     "StrictModel",
+    "TierReport",
     "WRITE_ACTIONS",
 ]

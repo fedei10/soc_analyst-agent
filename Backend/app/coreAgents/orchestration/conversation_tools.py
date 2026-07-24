@@ -46,7 +46,17 @@ from app.coreAgents.tools.wazuh.schemas import (
 )
 from app.services.wazuh.dependencies import get_wazuh_gateway
 from app.services.wazuh.gateway import WazuhGateway
-from app.services.wazuh.models import AttributionResult
+from app.services.wazuh.models import (
+    AlertSearchResult,
+    AttributionResult,
+)
+from app.services.wazuh.normalization.registry import normalize_alerts
+from app.services.wazuh.normalization.serializers import (
+    compact_alert_search_result,
+    compact_tool_result,
+    serialize_for_api,
+)
+from app.config import settings
 from app.services.system.diagnostics import get_system_diagnostic_service
 
 
@@ -190,8 +200,11 @@ def _iso_datetime(value: Any) -> datetime | None:
 def _state_result(
     runtime: ToolRuntime[SOCChatContext, SOCChatState],
     payload: dict[str, Any],
+    *,
+    tool_name: str = "unknown",
     **state_updates: Any,
 ) -> Command:
+    compacted = compact_tool_result(tool_name, payload)
     return Command(
         update={
             **{
@@ -201,7 +214,7 @@ def _state_result(
             },
             "messages": [
                 ToolMessage(
-                    content=json.dumps(payload, default=str),
+                    content=json.dumps(compacted, default=str),
                     tool_call_id=runtime.tool_call_id,
                 )
             ],
@@ -223,6 +236,35 @@ def build_soc_chat_tools(
     def current_diagnostics():
         return diagnostic_service or get_system_diagnostic_service()
 
+    def alert_result_for_agent(result: AlertSearchResult) -> dict[str, Any]:
+        if not settings.WAZUH_NORMALIZATION_ENABLED:
+            return result.model_dump(mode="json")
+        if settings.WAZUH_AGENT_RESPONSE_MODE == "normalized":
+            envelopes = normalize_alerts(
+                [item.model_dump(mode="json") for item in result.alerts]
+            )
+            return {
+                "total_raw_alerts": result.total,
+                "normalized_alerts": serialize_for_api(
+                    mode="normalized",
+                    envelopes=envelopes,
+                ),
+                "truncated": result.truncated,
+            }
+        return compact_alert_search_result(result)
+
+    def timeline_for_agent(timeline) -> dict[str, Any]:
+        compact = alert_result_for_agent(
+            AlertSearchResult(
+                total=timeline.total,
+                returned=timeline.returned,
+                truncated=timeline.truncated,
+                alerts=timeline.events,
+            )
+        )
+        compact["timeline_scope"] = "authentication"
+        return compact
+
     @tool("get_recent_wazuh_alerts", args_schema=RecentAlertsInput)
     def get_recent_wazuh_alerts(
         min_level: int = 0,
@@ -234,16 +276,16 @@ def build_soc_chat_tools(
     ) -> dict:
         """Search a bounded recent Wazuh alert window using safe filters."""
         return run(
-            lambda: current_gateway()
-            .search_alerts(
+            lambda: alert_result_for_agent(
+                current_gateway().search_alerts(
                 min_level=min_level,
                 hours=hours,
                 limit=limit,
                 agent_id=agent_id,
                 rule_id=rule_id,
                 text=text,
+                )
             )
-            .model_dump(mode="json")
         )
 
     @tool("get_high_severity_alerts", args_schema=HighSeverityAlertsInput)
@@ -254,13 +296,13 @@ def build_soc_chat_tools(
     ) -> dict:
         """Retrieve bounded high-severity Wazuh alerts for initial triage."""
         return run(
-            lambda: current_gateway()
-            .get_high_severity_alerts(
+            lambda: alert_result_for_agent(
+                current_gateway().get_high_severity_alerts(
                 min_level=min_level,
                 hours=hours,
                 limit=limit,
+                )
             )
-            .model_dump(mode="json")
         )
 
     @tool("search_archived_wazuh_logs", args_schema=ArchivedLogSearchInput)
@@ -277,14 +319,28 @@ def build_soc_chat_tools(
         possible exfiltration. This accepts plain text only, never query DSL.
         """
         return run(
-            lambda: current_gateway()
-            .search_archived_logs(
-                text=text,
-                hours=hours,
-                limit=limit,
-                agent_id=agent_id,
+            lambda: (
+                lambda result: {
+                    "index_pattern": result.index_pattern,
+                    "archive_status": result.archive_status,
+                    "query_scope": result.query_scope,
+                    **alert_result_for_agent(
+                        AlertSearchResult(
+                            total=result.total,
+                            returned=result.returned,
+                            truncated=result.truncated,
+                            alerts=[item.normalized for item in result.events],
+                        )
+                    ),
+                }
+            )(
+                current_gateway().search_archived_logs(
+                    text=text,
+                    hours=hours,
+                    limit=limit,
+                    agent_id=agent_id,
+                )
             )
-            .model_dump(mode="json")
         )
 
     @tool("get_wazuh_log_statistics", args_schema=LogStatisticsInput)
@@ -347,7 +403,12 @@ def build_soc_chat_tools(
                     *runtime.state.get("tool_errors", []),
                     error,
                 ][-20:]
-        return _state_result(runtime, payload, **updates)
+        return _state_result(
+            runtime,
+            payload,
+            tool_name="get_alert_details",
+            **updates,
+        )
 
     @tool("get_raw_alert_document", args_schema=RuntimeAlertByIdInput)
     def get_raw_alert_document(
@@ -407,7 +468,12 @@ def build_soc_chat_tools(
                     *runtime.state.get("tool_errors", []),
                     error,
                 ][-20:]
-        return _state_result(runtime, payload, **updates)
+        return _state_result(
+            runtime,
+            payload,
+            tool_name="get_raw_alert_document",
+            **updates,
+        )
 
     @tool("search_related_alerts", args_schema=RelatedAlertsInput)
     def search_related_alerts(
@@ -417,13 +483,13 @@ def build_soc_chat_tools(
     ) -> dict:
         """Search bounded alerts related to an exact observed alert ID."""
         return run(
-            lambda: current_gateway()
-            .get_related_alerts(
+            lambda: alert_result_for_agent(
+                current_gateway().get_related_alerts(
                 alert_id=alert_id,
                 hours=hours,
                 limit=limit,
+                )
             )
-            .model_dump(mode="json")
         )
 
     @tool(
@@ -443,14 +509,14 @@ def build_soc_chat_tools(
         lower-level events may exist around the same endpoint and timestamp.
         """
         return run(
-            lambda: current_gateway()
-            .search_alerts_by_agent_and_time(
+            lambda: alert_result_for_agent(
+                current_gateway().search_alerts_by_agent_and_time(
                 agent_id=agent_id,
                 center_time=center_time,
                 window_minutes=window_minutes,
                 limit=limit,
+                )
             )
-            .model_dump(mode="json")
         )
 
     @tool(
@@ -468,8 +534,8 @@ def build_soc_chat_tools(
     ) -> dict:
         """Build bounded authentication evidence by source IP or Wazuh agent."""
         return run(
-            lambda: current_gateway()
-            .build_authentication_timeline(
+            lambda: timeline_for_agent(
+                current_gateway().build_authentication_timeline(
                 source_ip=str(source_ip) if source_ip else None,
                 target_user=target_user,
                 agent_id=agent_id,
@@ -477,8 +543,8 @@ def build_soc_chat_tools(
                 limit=limit,
                 center_time=center_time,
                 window_minutes=window_minutes,
+                )
             )
-            .model_dump(mode="json")
         )
 
     @tool(
@@ -965,6 +1031,7 @@ def build_soc_chat_tools(
         return _state_result(
             runtime,
             payload,
+            tool_name="investigate_alert_attribution",
             active_alert_id=alert_id,
             active_agent_id=str(agent_id) if agent_id else None,
             current_severity=_severity_for_level(base_alert.get("rule_level")),
@@ -1008,6 +1075,7 @@ def build_soc_chat_tools(
         return _state_result(
             runtime,
             run(fetch),
+            tool_name="get_endpoint_context",
             active_agent_id=agent_id,
         )
 
@@ -1128,7 +1196,11 @@ def build_soc_chat_tools(
             )
         )
         if not verification.get("ok"):
-            return _state_result(runtime, verification)
+            return _state_result(
+                runtime,
+                verification,
+                tool_name="start_investigation",
+            )
 
         alert = verification.get("data")
         if not isinstance(alert, dict):
@@ -1145,6 +1217,7 @@ def build_soc_chat_tools(
                         "retryable": False,
                     },
                 },
+                tool_name="start_investigation",
             )
 
         try:
@@ -1172,6 +1245,7 @@ def build_soc_chat_tools(
                         "retryable": True,
                     },
                 },
+                tool_name="start_investigation",
                 active_alert_id=alert_id,
                 active_agent_id=(
                     str(alert["agent_id"]) if alert.get("agent_id") else None
@@ -1190,6 +1264,7 @@ def build_soc_chat_tools(
         return _state_result(
             runtime,
             payload,
+            tool_name="start_investigation",
             active_alert_id=alert_id,
             active_investigation_id=snapshot["investigation_id"],
             active_agent_id=snapshot.get("agent_id"),
@@ -1225,6 +1300,7 @@ def build_soc_chat_tools(
             return _state_result(
                 runtime,
                 payload,
+                tool_name="get_investigation_status",
                 active_investigation_id=investigation_id,
                 active_alert_id=snapshot["alert_id"],
                 active_agent_id=snapshot.get("agent_id"),
@@ -1242,6 +1318,7 @@ def build_soc_chat_tools(
                         "retryable": False,
                     },
                 },
+                tool_name="get_investigation_status",
             )
 
     @tool("get_open_investigations", args_schema=OpenInvestigationsInput)
@@ -1253,11 +1330,26 @@ def build_soc_chat_tools(
             if item.get("status")
             in {"created", "running", "awaiting_approval", "approved"}
         ][:limit]
+        compact = [
+            {
+                key: item.get(key)
+                for key in (
+                    "investigation_id",
+                    "alert_id",
+                    "agent_id",
+                    "status",
+                    "current_stage",
+                    "severity",
+                    "confidence",
+                )
+            }
+            for item in investigations
+        ]
         return {
             "ok": True,
             "data": {
-                "investigations": investigations,
-                "count": len(investigations),
+                "investigations": compact,
+                "count": len(compact),
             },
         }
 

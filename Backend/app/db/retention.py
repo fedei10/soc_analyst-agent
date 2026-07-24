@@ -24,6 +24,15 @@ CHECKPOINT_TABLES = (
     "checkpoints",
     "checkpoint_blobs",
 )
+PERMANENT_AUDIT_EVENTS = {
+    "approval_required",
+    "approval_decision_received",
+    "response_execution_authorized",
+    "response_execution_pending",
+    "response_actions_executed",
+    "response_action_failed",
+    "investigation_completed",
+}
 
 
 def apply_retention(*, now: datetime | None = None) -> dict[str, int]:
@@ -63,6 +72,7 @@ def apply_retention(*, now: datetime | None = None) -> dict[str, int]:
         counts["audit_events"] = int(session.execute(
             delete(AuditEventRecord).where(
                 AuditEventRecord.occurred_at <= investigation_cutoff,
+                AuditEventRecord.event.not_in(PERMANENT_AUDIT_EVENTS),
             )
         ).rowcount or 0)
         counts["evidence"] = int(session.execute(

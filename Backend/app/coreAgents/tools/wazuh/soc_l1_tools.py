@@ -10,6 +10,9 @@ from app.coreAgents.tools.wazuh.schemas import (
 )
 from app.services.wazuh.dependencies import get_wazuh_gateway
 from app.services.wazuh.gateway import WazuhGateway
+from app.services.wazuh.normalization.serializers import (
+    compact_alert_search_result,
+)
 
 
 def build_l1_tools(gateway: WazuhGateway | None = None) -> list[StructuredTool]:
@@ -19,9 +22,11 @@ def build_l1_tools(gateway: WazuhGateway | None = None) -> list[StructuredTool]:
     def get_high_severity_alerts(
         min_level: int = 10, hours: int = 24, limit: int = 50
     ) -> dict:
-        return run(lambda: current_gateway().get_high_severity_alerts(
-            min_level=min_level, hours=hours, limit=limit
-        ).model_dump(mode="json"))
+        return run(lambda: compact_alert_search_result(
+            current_gateway().get_high_severity_alerts(
+                min_level=min_level, hours=hours, limit=limit
+            )
+        ))
 
     def get_alert_by_id(alert_id: str) -> dict:
         def fetch() -> dict:

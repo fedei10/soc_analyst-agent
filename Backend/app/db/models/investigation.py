@@ -221,6 +221,41 @@ class InvestigationReportRecord(Base):
     )
 
 
+class TierReportRecord(Base):
+    __tablename__ = "soc_tier_reports"
+
+    report_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    investigation_id: Mapped[str] = mapped_column(
+        ForeignKey("soc_investigations.investigation_id", ondelete="CASCADE"),
+        index=True,
+    )
+    organization_id: Mapped[str] = mapped_column(String(128), index=True)
+    tier: Mapped[str] = mapped_column(String(8), index=True)
+    report: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE)
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        index=True,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "investigation_id",
+            "tier",
+            name="uq_soc_tier_report_investigation_tier",
+        ),
+        Index(
+            "ix_soc_tier_reports_org_investigation",
+            "organization_id",
+            "investigation_id",
+        ),
+    )
+
+
 class AuditEventRecord(Base):
     __tablename__ = "soc_audit_events"
 
@@ -231,10 +266,32 @@ class AuditEventRecord(Base):
     )
     organization_id: Mapped[str] = mapped_column(String(128), index=True)
     actor_user_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    actor_type: Mapped[str | None] = mapped_column(String(32), index=True)
+    actor_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    request_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    trace_id: Mapped[str | None] = mapped_column(String(32), index=True)
+    conversation_id: Mapped[str | None] = mapped_column(
+        String(128),
+        index=True,
+    )
+    target_type: Mapped[str | None] = mapped_column(String(64), index=True)
+    target_id: Mapped[str | None] = mapped_column(String(256), index=True)
+    outcome: Mapped[str | None] = mapped_column(String(32), index=True)
+    reason_code: Mapped[str | None] = mapped_column(String(128), index=True)
     stage: Mapped[str] = mapped_column(String(64), index=True)
     event: Mapped[str] = mapped_column(String(128), index=True)
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
+        index=True,
+    )
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON_VALUE,
+        default=dict,
+    )
+    previous_hash: Mapped[str | None] = mapped_column(String(64))
+    event_hash: Mapped[str | None] = mapped_column(
+        String(64),
+        unique=True,
         index=True,
     )
     payload: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE)

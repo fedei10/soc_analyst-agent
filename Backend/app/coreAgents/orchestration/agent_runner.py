@@ -1,13 +1,28 @@
 """Run a tool-capable agent and validate its final result separately."""
 
 import json
+import inspect
 from typing import Any
 
 from pydantic import BaseModel
 
+from app.core.observability.callbacks import observability_callbacks
+from app.services.wazuh.normalization.serializers import (
+    compact_tool_result,
+    serialize_for_trace,
+)
+
 
 MAX_TOOL_CONTENT_CHARS = 6000
 MAX_COLLECTION_ITEMS = 12
+
+
+class AgentResultValidationError(RuntimeError):
+    """Final transcript exists, but structured normalization failed."""
+
+    def __init__(self, response: dict[str, Any]) -> None:
+        super().__init__("The agent output could not be validated.")
+        self.response = response
 
 
 def _compact_value(value: Any, *, depth: int = 0) -> Any:
@@ -53,17 +68,22 @@ def _bounded_tool_content(content: Any) -> Any:
 
 def _serialize_message(message: Any) -> dict[str, Any]:
     if isinstance(message, dict):
-        return message
+        return serialize_for_trace(message)
 
+    name = getattr(message, "name", None)
     serialized = {
         "type": getattr(message, "type", message.__class__.__name__),
         "content": getattr(message, "content", ""),
     }
     if serialized["type"] == "tool":
-        serialized["content"] = _bounded_tool_content(
-            serialized["content"]
-        )
-    name = getattr(message, "name", None)
+        content = serialized["content"]
+        try:
+            parsed = json.loads(content) if isinstance(content, str) else content
+        except (TypeError, ValueError):
+            parsed = content
+        if isinstance(parsed, dict):
+            parsed = compact_tool_result(name or "unknown", parsed)
+        serialized["content"] = _bounded_tool_content(parsed)
     if name:
         serialized["name"] = name
 
@@ -89,7 +109,47 @@ def invoke_validated_agent(
     role: str | None = None,
 ) -> tuple[dict[str, Any], BaseModel]:
     """Execute tools, then normalize the transcript into a validated result."""
-    response = agent.invoke({"messages": messages})
+    from app.coreAgents.llm.model_pool import (
+        get_agent_model,
+        get_agent_provider,
+    )
+
+    provider = (
+        get_agent_provider(role)
+        if role in {"chat", "l1", "l2", "l3"}
+        else "unknown"
+    )
+    model = (
+        get_agent_model(role)
+        if role in {"chat", "l1", "l2", "l3"}
+        else None
+    )
+    model_name = str(
+        getattr(model, "model_name", None)
+        or getattr(model, "model", None)
+        or "unknown"
+    )
+    config = {
+        "callbacks": observability_callbacks(),
+        "run_name": f"soc-{role or 'agent'}",
+        "metadata": {
+            "agent_role": role or "unknown",
+            "provider": provider,
+            "model": model_name,
+        },
+    }
+    invoke_parameters = inspect.signature(agent.invoke).parameters
+    supports_config = (
+        "config" in invoke_parameters
+        or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in invoke_parameters.values()
+        )
+    )
+    if supports_config:
+        response = agent.invoke({"messages": messages}, config=config)
+    else:
+        response = agent.invoke({"messages": messages})
     if not isinstance(response, dict):
         raise ValueError("Agent response must be a mapping.")
 
@@ -104,7 +164,6 @@ def invoke_validated_agent(
 
     from app.coreAgents.llm.model_pool import (
         FORMATTER_PROVIDER_ORDER,
-        get_agent_provider,
         get_structured_model,
     )
 
@@ -117,21 +176,35 @@ def invoke_validated_agent(
         result_model,
         provider_order,
     )
-    validated = formatter.invoke(
-        [
-            {
-                "role": "system",
-                "content": (
-                    "Convert the completed SOC agent transcript into the final "
-                    "result. Use only facts present in the transcript. Return "
-                    "only the required structured result. Do not infer evidence "
-                    "that the agent did not observe."
-                ),
+    try:
+        formatted = formatter.invoke(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Convert the completed SOC agent transcript into the "
+                        "final result. Use only facts present in the "
+                        "transcript. Return only the required structured "
+                        "result. Do not infer evidence that the agent did not "
+                        "observe."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": _format_transcript(transcript),
+                },
+            ],
+            config={
+                "callbacks": observability_callbacks(),
+                "run_name": f"soc-{role or 'agent'}-formatter",
+                "metadata": {
+                    "agent_role": role or "unknown",
+                    "provider": provider,
+                    "model": model_name,
+                },
             },
-            {
-                "role": "user",
-                "content": _format_transcript(transcript),
-            },
-        ]
-    )
-    return response, result_model.model_validate(validated)
+        )
+        validated = result_model.model_validate(formatted)
+    except Exception as exc:
+        raise AgentResultValidationError(response) from exc
+    return response, validated

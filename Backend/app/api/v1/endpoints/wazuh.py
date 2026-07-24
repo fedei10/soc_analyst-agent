@@ -12,10 +12,10 @@ Response envelope: {"data": ...}. Collections pass Wazuh's own shape through
 ({"affected_items": [...], "total_affected_items": N}); indexer-backed routes
 mirror the same shape. Single resources return the object directly.
 """
-import logging
 from enum import Enum
 from typing import Annotated, Any, Literal
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 
 from app.api.auth.deps import AuthPrincipal, require_read, require_write
@@ -24,7 +24,7 @@ from app.services.wazuh.dependencies import get_wazuh_gateway, get_wazuh_respond
 from app.services.wazuh.gateway import WazuhGateway
 from app.services.wazuh.responder_client import WazuhResponderClient
 
-logger = logging.getLogger("tsage.api")
+logger = structlog.get_logger("tsage.api")
 
 read = APIRouter(dependencies=[Depends(require_read)])
 write = APIRouter(dependencies=[Depends(require_write)], tags=["response"])
@@ -399,9 +399,11 @@ def run_active_response(
     """
     principal: AuthPrincipal = request.state.principal
     logger.info(
-        "active-response command=%s agent=%s approved_by=%s request_id=%s",
-        body.command, agent_id, principal.user_id,
-        getattr(request.state, "request_id", "-"),
+        "response_action_executed",
+        action_type="wazuh_active_response",
+        command_name=body.command,
+        agent_id=agent_id,
+        actor_user_id=principal.user_id,
     )
     responder.run_active_response(
         agent_id=agent_id,
@@ -427,8 +429,10 @@ def restart_agent(
     """Restart the Wazuh agent process on the endpoint."""
     principal: AuthPrincipal = request.state.principal
     logger.info(
-        "agent-restart agent=%s approved_by=%s request_id=%s",
-        agent_id, principal.user_id, getattr(request.state, "request_id", "-"),
+        "response_action_executed",
+        action_type="wazuh_agent_restart",
+        agent_id=agent_id,
+        actor_user_id=principal.user_id,
     )
     responder.restart_agent(agent_id)
     return {

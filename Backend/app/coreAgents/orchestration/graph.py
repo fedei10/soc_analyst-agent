@@ -12,6 +12,7 @@ from app.coreAgents.orchestration.nodes import (
     mark_awaiting_approval,
     mark_response_approved,
     normalize_alert,
+    persist_tier_report,
     prepare_actions,
     request_human_approval,
     request_execution_authorization,
@@ -28,6 +29,7 @@ from app.coreAgents.orchestration.routing import (
 )
 from app.coreAgents.orchestration.state import InvestigationState
 from app.coreAgents.orchestration.verifier import verify_response
+from app.core.observability.langgraph import observed_node, observed_route
 
 
 def create_investigation_graph(
@@ -45,6 +47,7 @@ def create_investigation_graph(
     response_settings=None,
     verification_gateway=None,
     clock=None,
+    tier_report_writer=None,
 ):
     """Compile the read-only investigation graph with checkpoint persistence."""
 
@@ -100,45 +103,141 @@ def create_investigation_graph(
             system_executor=system_executor,
         )
 
+    def l1_report_node(state: InvestigationState) -> dict:
+        return persist_tier_report(
+            state,
+            tier="l1",
+            writer=tier_report_writer,
+        )
+
+    def l2_report_node(state: InvestigationState) -> dict:
+        return persist_tier_report(
+            state,
+            tier="l2",
+            writer=tier_report_writer,
+        )
+
+    def l3_report_node(state: InvestigationState) -> dict:
+        return persist_tier_report(
+            state,
+            tier="l3",
+            writer=tier_report_writer,
+        )
+
     builder = StateGraph(InvestigationState)
-    builder.add_node("initialize", initialize_investigation)
-    builder.add_node("load_alert", load_alert_node)
-    builder.add_node("normalize_alert", normalize_alert)
+    builder.add_node(
+        "initialize",
+        observed_node("initialize")(initialize_investigation),
+    )
+    builder.add_node(
+        "load_alert",
+        observed_node("load_alert")(load_alert_node),
+    )
+    builder.add_node(
+        "normalize_alert",
+        observed_node("normalize_alert")(normalize_alert),
+    )
     builder.add_node("l1_triage", l1_workflow)
+    builder.add_node(
+        "l1_report",
+        observed_node("l1_report", role="l1")(l1_report_node),
+    )
     builder.add_node("l2_investigation", l2_workflow)
+    builder.add_node(
+        "l2_report",
+        observed_node("l2_report", role="l2")(l2_report_node),
+    )
     builder.add_node("l3_analysis", l3_workflow)
-    builder.add_node("prepare_actions", prepare_actions)
-    builder.add_node("awaiting_approval", mark_awaiting_approval)
-    builder.add_node("human_approval", request_human_approval)
-    builder.add_node("response_approved", mark_response_approved)
+    builder.add_node(
+        "l3_report",
+        observed_node("l3_report", role="l3")(l3_report_node),
+    )
+    builder.add_node(
+        "prepare_actions",
+        observed_node("prepare_actions", role="l3")(prepare_actions),
+    )
+    builder.add_node(
+        "awaiting_approval",
+        observed_node("awaiting_approval")(mark_awaiting_approval),
+    )
+    builder.add_node(
+        "human_approval",
+        observed_node("human_approval")(request_human_approval),
+    )
+    builder.add_node(
+        "response_approved",
+        observed_node("response_approved")(mark_response_approved),
+    )
     builder.add_node(
         "execution_authorization",
-        request_execution_authorization,
+        observed_node("execution_authorization")(
+            request_execution_authorization
+        ),
     )
-    builder.add_node("response_executor", response_executor_node)
-    builder.add_node("response_verification", response_verification_node)
-    builder.add_node("final_report", create_final_report)
-    builder.add_node("failed", handle_failure)
+    builder.add_node(
+        "response_executor",
+        observed_node("response_executor")(response_executor_node),
+    )
+    builder.add_node(
+        "response_verification",
+        observed_node("response_verification")(
+            response_verification_node
+        ),
+    )
+    builder.add_node(
+        "final_report",
+        observed_node("final_report")(create_final_report),
+    )
+    builder.add_node(
+        "failed",
+        observed_node("failed")(handle_failure),
+    )
 
     builder.add_edge(START, "initialize")
     builder.add_conditional_edges(
         "initialize",
-        lambda state: route_after_step(state, success_node="load_alert"),
+        observed_route(
+            "initialize",
+            lambda state: route_after_step(
+                state,
+                success_node="load_alert",
+            ),
+        ),
         {"load_alert": "load_alert", "failed": "failed"},
     )
     builder.add_conditional_edges(
         "load_alert",
-        lambda state: route_after_step(state, success_node="normalize_alert"),
+        observed_route(
+            "load_alert",
+            lambda state: route_after_step(
+                state,
+                success_node="normalize_alert",
+            ),
+        ),
         {"normalize_alert": "normalize_alert", "failed": "failed"},
     )
     builder.add_conditional_edges(
         "normalize_alert",
-        lambda state: route_after_step(state, success_node="l1_triage"),
+        observed_route(
+            "normalize_alert",
+            lambda state: route_after_step(
+                state,
+                success_node="l1_triage",
+            ),
+        ),
         {"l1_triage": "l1_triage", "failed": "failed"},
     )
     builder.add_conditional_edges(
         "l1_triage",
-        route_after_l1,
+        lambda state: route_after_step(
+            state,
+            success_node="l1_report",
+        ),
+        {"l1_report": "l1_report", "failed": "failed"},
+    )
+    builder.add_conditional_edges(
+        "l1_report",
+        observed_route("l1_triage", route_after_l1),
         {
             "l2_investigation": "l2_investigation",
             "final_report": "final_report",
@@ -147,17 +246,33 @@ def create_investigation_graph(
     )
     builder.add_conditional_edges(
         "l2_investigation",
-        route_after_l2,
+        lambda state: route_after_step(
+            state,
+            success_node="l2_report",
+        ),
+        {"l2_report": "l2_report", "failed": "failed"},
+    )
+    builder.add_conditional_edges(
+        "l2_report",
+        observed_route("l2_investigation", route_after_l2),
         {
             "l3_analysis": "l3_analysis",
             "final_report": "final_report",
             "failed": "failed",
         },
     )
-    builder.add_edge("l3_analysis", "prepare_actions")
+    builder.add_conditional_edges(
+        "l3_analysis",
+        lambda state: route_after_step(
+            state,
+            success_node="l3_report",
+        ),
+        {"l3_report": "l3_report", "failed": "failed"},
+    )
+    builder.add_edge("l3_report", "prepare_actions")
     builder.add_conditional_edges(
         "prepare_actions",
-        route_after_action_policy,
+        observed_route("prepare_actions", route_after_action_policy),
         {
             "awaiting_approval": "awaiting_approval",
             "final_report": "final_report",
@@ -167,7 +282,7 @@ def create_investigation_graph(
     builder.add_edge("awaiting_approval", "human_approval")
     builder.add_conditional_edges(
         "human_approval",
-        route_after_approval,
+        observed_route("human_approval", route_after_approval),
         {
             "response_approved": "response_approved",
             "prepare_actions": "prepare_actions",
@@ -179,9 +294,12 @@ def create_investigation_graph(
     builder.add_edge("execution_authorization", "response_executor")
     builder.add_conditional_edges(
         "response_executor",
-        lambda state: route_after_step(
-            state,
-            success_node="response_verification",
+        observed_route(
+            "response_executor",
+            lambda state: route_after_step(
+                state,
+                success_node="response_verification",
+            ),
         ),
         {
             "response_verification": "response_verification",
@@ -200,4 +318,11 @@ def create_investigation_graph(
 def investigation_config(investigation_id: str) -> dict:
     if not investigation_id:
         raise ValueError("investigation_id is required.")
-    return {"configurable": {"thread_id": investigation_id}}
+    return {
+        "configurable": {"thread_id": investigation_id},
+        "run_name": "soc-formal-investigation",
+        "metadata": {
+            "investigation_id": investigation_id,
+            "agent_role": "orchestrator",
+        },
+    }

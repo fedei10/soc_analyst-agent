@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+import json
 from types import SimpleNamespace
 
 from langgraph.types import Command
@@ -26,9 +27,11 @@ class FakeAgent:
     def __init__(self, result):
         self.result = result
         self.calls = 0
+        self.last_input = None
 
     def invoke(self, input_data):
         self.calls += 1
+        self.last_input = input_data
         return {"structured_response": self.result}
 
 
@@ -174,6 +177,9 @@ def test_medium_alert_reaches_l2_then_reports():
     assert l1.calls == 1
     assert l2.calls == 1
     assert l3.calls == 0
+    assert result["l1_report"]["tier"] == "l1"
+    l2_payload = json.loads(l2.last_input["messages"][0]["content"])
+    assert l2_payload["l1_report"]["report_id"].endswith("-L1")
 
 
 def test_high_alert_reaches_l3_then_reports():

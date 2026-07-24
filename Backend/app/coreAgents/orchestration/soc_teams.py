@@ -8,13 +8,18 @@ import uuid
 from datetime import UTC, datetime
 from typing import Annotated, Any, TypedDict
 
+import structlog
 from langchain.agents import create_agent
 from langchain.agents.middleware import ToolCallLimitMiddleware, wrap_tool_call
+from langchain.agents.structured_output import ToolStrategy
 from langchain_core.messages import ToolMessage
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
-from app.coreAgents.orchestration.agent_runner import invoke_validated_agent
+from app.coreAgents.orchestration.agent_runner import (
+    AgentResultValidationError,
+    invoke_validated_agent,
+)
 from app.coreAgents.orchestration.evidence import (
     available_evidence_refs,
     validate_result_evidence,
@@ -34,9 +39,11 @@ from app.coreAgents.orchestration.team_registry import (
     get_specialist_tools,
 )
 from app.services.wazuh.gateway import WazuhGateway
+from app.core.observability.context import get_correlation_context
 
 
 SPECIALIST_TOOL_CALL_LIMIT = 4
+logger = structlog.get_logger("tsage.agents")
 
 
 class _StructuredSupervisorAgent:
@@ -61,7 +68,11 @@ class _StructuredSupervisorAgent:
             (self.provider,),
         )
 
-    def invoke(self, input_data: dict[str, Any]) -> dict[str, Any]:
+    def invoke(
+        self,
+        input_data: dict[str, Any],
+        config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         from app.coreAgents.llm.model_pool import _retryable_model_error
 
         messages = [
@@ -70,7 +81,7 @@ class _StructuredSupervisorAgent:
         ]
         for attempt in range(4):
             try:
-                result = self.model.invoke(messages)
+                result = self.model.invoke(messages, config=config)
                 return {
                     "messages": messages,
                     "structured_response": result,
@@ -89,6 +100,8 @@ class TierTeamInput(TypedDict, total=False):
     normalized_alert: dict[str, Any]
     l1_result: dict[str, Any] | None
     l2_result: dict[str, Any] | None
+    l1_report: dict[str, Any] | None
+    l2_report: dict[str, Any] | None
     evidence: list[dict[str, Any]]
     timeline: list[dict[str, Any]]
     affected_assets: list[str]
@@ -207,7 +220,11 @@ def _build_team_agents(
             tools=get_specialist_tools(role, gateway),
             system_prompt=spec.system_prompt,
             middleware=_specialist_middleware(tier),
-            response_format=spec.result_model if tier == "l1" else None,
+            response_format=(
+                ToolStrategy(spec.result_model)
+                if tier in {"l2", "l3"}
+                else spec.result_model if tier == "l1" else None
+            ),
         )
 
     supervisor_role = f"{tier}_supervisor"
@@ -247,10 +264,12 @@ def _team_context(state: TierTeamState, tier: SocTier) -> dict[str, Any]:
     }
     if tier in {"l2", "l3"}:
         context["l1_result"] = state.get("l1_result")
+        context["l1_report"] = state.get("l1_report")
     if tier == "l3":
         context.update(
             {
                 "l2_result": state.get("l2_result"),
+                "l2_report": state.get("l2_report"),
                 "timeline": state.get("timeline", []),
                 "affected_assets": state.get("affected_assets", []),
             }
@@ -410,7 +429,28 @@ def _audit_event(
     event: str,
     timestamp: datetime,
 ) -> dict[str, Any]:
+    log_event = {
+        "subagent_started": "soc_agent_run_started",
+        "subagent_completed": "soc_agent_run_completed",
+        "subagent_failed": "soc_agent_run_failed",
+        "tool_started": "agent_tool_started",
+        "tool_completed": "agent_tool_completed",
+        "tool_failed": "agent_tool_failed",
+    }.get(event, event)
+    log = (
+        logger.error
+        if event in {"subagent_failed", "tool_failed"}
+        else logger.info
+    )
+    log(
+        log_event,
+        investigation_id=state.get("investigation_id", "unknown"),
+        agent_role=role,
+        tier=tier,
+        run_id=run_id,
+    )
     return {
+        **get_correlation_context(),
         "investigation_id": state.get("investigation_id", "unknown"),
         "stage": tier,
         "event": event,
@@ -558,8 +598,13 @@ def _run_record(
 
 
 def _failure_code(role: str, exc: Exception) -> str:
-    name = type(exc).__name__.lower()
-    message = str(exc).lower()
+    errors: list[BaseException] = [exc]
+    cause = exc.__cause__
+    while cause is not None and cause not in errors:
+        errors.append(cause)
+        cause = cause.__cause__
+    name = " ".join(type(error).__name__.lower() for error in errors)
+    message = " ".join(str(error).lower() for error in errors)
     if (
         "ratelimit" in name
         or "429" in message
@@ -572,6 +617,8 @@ def _failure_code(role: str, exc: Exception) -> str:
         category = "TIMEOUT"
     elif "temporarily unavailable" in message or "service unavailable" in message:
         category = "MODEL_UNAVAILABLE"
+    elif isinstance(exc, AgentResultValidationError):
+        category = "OUTPUT_INVALID"
     else:
         category = "FAILED"
     return f"{role.upper()}_{category}"
@@ -602,6 +649,8 @@ def _specialist_node(
                 role=tier,
             )
         except Exception as exc:
+            if isinstance(exc, AgentResultValidationError):
+                response = exc.response
             completed_at = datetime.now(UTC)
             error_code = _failure_code(role, exc)
             run_record = _run_record(
@@ -711,11 +760,18 @@ def _final_result_update(
         return {
             "status": "running",
             "current_stage": "l2_completed",
-            "l2_result": validated.model_dump(mode="json"),
+            "l2_result": validated.model_dump(
+                mode="json",
+                exclude_computed_fields=True,
+            ),
             "severity": validated.severity.value,
             "confidence": validated.confidence,
             "timeline": validated.timeline,
             "affected_assets": validated.affected_assets,
+            "evidence": [
+                *state.get("evidence", []),
+                *validated.evidence,
+            ],
         }
 
     validated = L3Result.model_validate(result)
@@ -730,6 +786,10 @@ def _final_result_update(
         "proposed_actions": [
             action.model_dump(mode="json")
             for action in validated.proposed_actions
+        ],
+        "evidence": [
+            *state.get("evidence", []),
+            *validated.evidence,
         ],
     }
 
@@ -804,6 +864,8 @@ def _supervisor_node(
                 role=tier,
             )
         except Exception as exc:
+            if isinstance(exc, AgentResultValidationError):
+                response = exc.response
             completed_at = datetime.now(UTC)
             error_code = _failure_code(f"{tier}_supervisor", exc)
             return {

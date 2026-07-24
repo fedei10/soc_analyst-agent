@@ -113,6 +113,29 @@ def l2_agents():
                 summary="Agent context reviewed",
                 affected_assets=["agent-001"],
                 compromise_indicators=["Repeated failures"],
+                root_cause_hypothesis="Credential guessing",
+                containment_recommendations=[
+                    {
+                        "action_type": "block_ip",
+                        "target": "192.0.2.10",
+                        "reason": "Repeated malicious authentication",
+                        "risk_level": "medium",
+                        "operational_impact": "May block a shared source",
+                        "evidence_refs": ["alert:alert-1"],
+                    }
+                ],
+                detection_tuning_recommendations=[
+                    {"rule_id": "5712", "change": "Add source aggregation"}
+                ],
+                post_incident_lessons=[
+                    "Review exposed SSH access paths",
+                ],
+                evidence=[
+                    {
+                        "evidence_ref": "endpoint_snapshot:001",
+                        "description": "Bounded endpoint forensic snapshot",
+                    }
+                ],
             ),
             call_order=order,
         ),
@@ -124,8 +147,36 @@ def l2_agents():
                 confidence=0.91,
                 timeline=[{"timestamp": "2026-07-23T10:00:00Z"}],
                 affected_assets=["agent-001"],
+                incident_status="confirmed",
+                root_cause="Credential guessing",
+                scope_summary="One endpoint and one source IP",
+                containment_recommendations=[
+                    {
+                        "action_type": "block_ip",
+                        "target": "192.0.2.10",
+                        "reason": "Repeated malicious authentication",
+                        "risk_level": "medium",
+                        "operational_impact": "May block a shared source",
+                        "evidence_refs": ["alert:alert-1"],
+                    }
+                ],
+                detection_tuning_recommendations=[
+                    {"rule_id": "5712", "change": "Add source aggregation"}
+                ],
+                post_incident_review={
+                    "lessons_learned": ["Review exposed SSH access paths"],
+                },
+                evidence=[
+                    {
+                        "evidence_ref": "endpoint_snapshot:001",
+                        "description": "Bounded endpoint forensic snapshot",
+                    }
+                ],
                 requires_l3=True,
-                evidence_refs=["alert:alert-1"],
+                evidence_refs=[
+                    "alert:alert-1",
+                    "endpoint_snapshot:001",
+                ],
             ),
             call_order=order,
         ),
@@ -141,7 +192,31 @@ def l3_agents():
             L3DetectionEngineeringFindings(
                 summary="Detection coverage reviewed",
                 root_cause="Credential attack",
+                threat_hunt_findings=[
+                    {"indicator": "192.0.2.10", "status": "observed"}
+                ],
+                ttp_analysis=[
+                    {"technique_id": "T1110", "status": "observed"}
+                ],
+                forensic_assessment={
+                    "memory_analysis_status": "not_available",
+                },
+                malware_analysis={
+                    "binary_analysis_status": "not_available",
+                },
                 detection_gaps=["Missing successful-login correlation"],
+                architecture_recommendations=[
+                    {"control": "Network segmentation"}
+                ],
+                playbook_recommendations=[
+                    {"name": "SSH brute-force response"}
+                ],
+                supporting_evidence=[
+                    {
+                        "evidence_ref": "rule:5712",
+                        "description": "Wazuh rule and MITRE context",
+                    }
+                ],
             ),
             call_order=order,
         ),
@@ -149,6 +224,19 @@ def l3_agents():
             "l3_response_planning",
             L3ResponsePlanningFindings(
                 summary="Containment proposal prepared",
+                incident_command_plan={
+                    "incident_commander": "SOC L3",
+                    "status": "draft",
+                },
+                containment_strategy=["Block confirmed malicious source"],
+                eradication_steps=["Remove unauthorized persistence"],
+                recovery_steps=["Restore monitored service"],
+                playbook_recommendations=[
+                    {"name": "SSH brute-force response"}
+                ],
+                automation_opportunities=[
+                    {"workflow": "Evidence collection", "status": "draft"}
+                ],
                 proposed_actions=[
                     {
                         "action_type": "block_ip",
@@ -166,7 +254,33 @@ def l3_agents():
             "l3_supervisor",
             L3Result(
                 summary="Containment requires approval",
-                evidence_refs=["alert:alert-1"],
+                threat_assessment={"status": "confirmed_attack"},
+                ttp_analysis=[
+                    {"technique_id": "T1110", "status": "observed"}
+                ],
+                forensic_assessment={
+                    "memory_analysis_status": "not_available",
+                },
+                incident_command_plan={
+                    "incident_commander": "SOC L3",
+                    "status": "draft",
+                },
+                containment_strategy=["Block confirmed malicious source"],
+                eradication_steps=["Remove unauthorized persistence"],
+                recovery_steps=["Restore monitored service"],
+                playbook_recommendations=[
+                    {"name": "SSH brute-force response"}
+                ],
+                architecture_recommendations=[
+                    {"control": "Network segmentation"}
+                ],
+                evidence=[
+                    {
+                        "evidence_ref": "rule:5712",
+                        "description": "Wazuh rule and MITRE context",
+                    }
+                ],
+                evidence_refs=["alert:alert-1", "rule:5712"],
                 proposed_actions=[
                     {
                         "action_type": "block_ip",
@@ -263,6 +377,12 @@ def test_l2_and_l3_teams_preserve_authoritative_result_contracts():
     ]
     assert L2Result.model_validate(l2_result["l2_result"]).requires_l3 is True
     assert l2_result["affected_assets"] == ["agent-001"]
+    assert l2_result["l2_result"]["incident_status"] == "confirmed"
+    assert (
+        l2_result["l2_result"]["containment_recommendations"][0]["action_type"]
+        == "block_ip"
+    )
+    assert l2_result["evidence"][-1]["evidence_ref"] == "endpoint_snapshot:001"
 
     l3 = l3_agents()
     l3_result = create_l3_team(agents=team_agents(l3)).invoke(
@@ -281,6 +401,14 @@ def test_l2_and_l3_teams_preserve_authoritative_result_contracts():
     ]
     assert L3Result.model_validate(l3_result["l3_result"])
     assert l3_result["proposed_actions"][0]["requires_approval"] is True
+    assert l3_result["l3_result"]["incident_command_plan"]["status"] == "draft"
+    assert (
+        l3_result["l3_result"]["forensic_assessment"][
+            "memory_analysis_status"
+        ]
+        == "not_available"
+    )
+    assert l3_result["evidence"][-1]["evidence_ref"] == "rule:5712"
     assert "executed_actions" not in l3_result
 
 

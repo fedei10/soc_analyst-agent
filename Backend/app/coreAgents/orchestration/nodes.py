@@ -18,8 +18,11 @@ from app.coreAgents.orchestration.schemas import (
 )
 from app.coreAgents.orchestration.routing import requires_approval
 from app.coreAgents.orchestration.evidence import validate_result_evidence
+from app.coreAgents.orchestration.reporting import build_tier_report
+from app.coreAgents.orchestration.schemas import AgentTier
 from app.coreAgents.orchestration.state import InvestigationState
 from app.coreAgents.orchestration.agent_runner import invoke_validated_agent
+from app.core.observability.context import get_correlation_context
 
 
 def audit_event(
@@ -29,6 +32,7 @@ def audit_event(
     event: str,
 ) -> dict:
     return {
+        **get_correlation_context(),
         "investigation_id": state.get("investigation_id", "unknown"),
         "stage": stage,
         "event": event,
@@ -54,6 +58,37 @@ def failed_update(
         ],
         "audit_events": [
             audit_event(state, stage=stage, event="analysis_failed")
+        ],
+    }
+
+
+def persist_tier_report(
+    state: InvestigationState,
+    *,
+    tier: AgentTier,
+    writer=None,
+) -> dict:
+    try:
+        report = (
+            writer(state, tier=tier)
+            if writer is not None
+            else build_tier_report(state, tier)
+        )
+    except Exception:
+        return failed_update(
+            state,
+            stage=f"{tier}_report",
+            code=f"{tier.upper()}_REPORT_PERSISTENCE_FAILED",
+        )
+    return {
+        f"{tier}_report": report,
+        "current_stage": f"{tier}_report_ready",
+        "audit_events": [
+            audit_event(
+                state,
+                stage=tier,
+                event="tier_report_created",
+            )
         ],
     }
 
@@ -255,6 +290,7 @@ def run_l2(state: InvestigationState, *, agent=None) -> dict:
                 "task": "Investigate the alert using the L1 triage result.",
                 "alert": state.get("normalized_alert", {}),
                 "l1_result": state["l1_result"],
+                "l1_report": state.get("l1_report"),
                 "evidence": state.get("evidence", []),
             },
             result_model=L2Result,
@@ -302,7 +338,9 @@ def run_l3(state: InvestigationState, *, agent=None) -> dict:
                 "task": "Perform advanced analysis and propose remediation.",
                 "alert": state.get("normalized_alert", {}),
                 "l1_result": state.get("l1_result"),
+                "l1_report": state.get("l1_report"),
                 "l2_result": state["l2_result"],
+                "l2_report": state.get("l2_report"),
                 "evidence": state.get("evidence", []),
                 "timeline": state.get("timeline", []),
                 "affected_assets": state.get("affected_assets", []),

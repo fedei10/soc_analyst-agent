@@ -158,6 +158,40 @@ class DetectionEvidence(BaseModel):
     truncated: bool
 
 
+class EndpointForensics(BaseModel):
+    """Bounded endpoint evidence bundle for advanced L2 investigation."""
+
+    agent_id: str
+    agent: AgentSummary | None = None
+    inventories: dict[str, EndpointInventory] = Field(default_factory=dict)
+    detection_evidence: DetectionEvidence | None = None
+    vulnerabilities: list[dict[str, Any]] = Field(default_factory=list)
+    vulnerability_total: int = Field(default=0, ge=0)
+    truncated: bool = False
+    source_errors: list[dict[str, str]] = Field(default_factory=list)
+    telemetry_limitations: list[str] = Field(default_factory=list)
+
+
+class IOCHuntResult(BaseModel):
+    """Local Wazuh evidence for one indicator, with explicit source coverage."""
+
+    indicator: str
+    indicator_type: Literal[
+        "ip",
+        "domain",
+        "hash",
+        "process",
+        "user",
+        "path",
+        "other",
+    ]
+    alerts: AlertSearchResult | None = None
+    archived_logs: ArchivedLogSearchResult | None = None
+    source_errors: list[dict[str, str]] = Field(default_factory=list)
+    intelligence_scope: list[str] = Field(default_factory=list)
+    external_intelligence_status: Literal["not_configured"] = "not_configured"
+
+
 class ToolError(BaseModel):
     code: str
     message: str

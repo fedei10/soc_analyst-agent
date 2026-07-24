@@ -3,6 +3,7 @@
 from collections.abc import Sequence
 from typing import Literal
 
+import structlog
 from langchain.agents.middleware import (
     ModelCallLimitMiddleware,
     ModelRetryMiddleware,
@@ -22,6 +23,7 @@ from app.coreAgents.llm.oxy import structured_llm as oxy_structured_llm
 
 ProviderName = Literal["groq", "oxy", "cerebras", "gemini"]
 AgentRole = Literal["chat", "l1", "l2", "l3"]
+logger = structlog.get_logger("tsage.models")
 
 AGENT_MODELS = {
     "groq": groq_llm,
@@ -38,26 +40,36 @@ STRUCTURED_MODELS = {
 }
 
 AGENT_PROVIDER: dict[AgentRole, ProviderName] = {
-    "chat": "gemini",
+    "chat": "oxy",
     "l1": "cerebras",
     "l2": "groq",
     "l3": "oxy",
 }
-ROUTER_PROVIDER_ORDER: tuple[ProviderName, ...] = ("gemini",)
+ROUTER_PROVIDER_ORDER: tuple[ProviderName, ...] = ("oxy",)
 FORMATTER_PROVIDER_ORDER: tuple[ProviderName, ...] = ("gemini",)
 
 
 def _retryable_model_error(exc: Exception) -> bool:
     name = type(exc).__name__.lower()
     message = str(exc).lower()
-    return (
+    retryable = (
         "ratelimit" in name
+        or "internalserver" in name
         or "timeout" in name
         or "429" in message
         or "queue_exceeded" in message
+        or "provider_error" in message
+        or "server_error" in message
+        or "something went wrong" in message
         or "temporarily unavailable" in message
         or "service unavailable" in message
     )
+    if retryable:
+        logger.warning(
+            "llm_retry_scheduled",
+            error_type=type(exc).__name__,
+        )
+    return retryable
 
 
 def get_agent_model(role: AgentRole):
@@ -87,7 +99,14 @@ def get_agent_middleware(role: AgentRole) -> list:
 
 
 def _structured_runnable(model, schema: type[BaseModel]):
-    method = "function_calling" if model is cerebras_structured_llm else "json_schema"
+    method = (
+        "function_calling"
+        if (
+            model is cerebras_structured_llm
+            or model is oxy_structured_llm
+        )
+        else "json_schema"
+    )
     return model.with_structured_output(schema, method=method)
 
 

@@ -1,7 +1,9 @@
 """Invoke and stream the conversational SOC agent without exposing reasoning."""
 
 import json
-import logging
+import hashlib
+import time
+import uuid
 from copy import deepcopy
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -9,9 +11,13 @@ from queue import Empty, Queue
 from threading import Event, Thread
 from typing import Any
 
+import structlog
 from langchain.messages import AIMessage, HumanMessage, ToolMessage
+from opentelemetry import trace
 
 from app.config import settings
+from app.core.observability.callbacks import observability_callbacks
+from app.core.observability.context import bind_context
 from app.coreAgents.orchestration.conversation_agent import (
     get_soc_chat_agent,
     put_curated_soc_memory,
@@ -29,7 +35,7 @@ from app.services.wazuh.dependencies import get_wazuh_gateway
 from app.db.session import database_url
 
 
-logger = logging.getLogger("tsage.orchestration.conversation")
+logger = structlog.get_logger("tsage.orchestration.conversation")
 
 TOOL_ACTIVITY_LABELS = {
     "get_recent_wazuh_alerts": "Checking recent Wazuh alerts",
@@ -184,20 +190,70 @@ def conversation_config(
     conversation_id: str,
     *,
     organization_id: str = "local",
+    user_id: str = "local",
 ) -> dict:
     if not conversation_id:
         raise ValueError("conversation_id is required.")
     if not organization_id:
         raise ValueError("organization_id is required.")
+    run_id = uuid.uuid4().hex
+    thread_id = f"{organization_id}:{conversation_id}"
+    span_context = trace.get_current_span().get_span_context()
+    trace_id = (
+        format(span_context.trace_id, "032x")
+        if span_context.is_valid
+        else None
+    )
+    bind_context(
+        run_id=run_id,
+        thread_id=thread_id,
+        trace_id=trace_id,
+        conversation_id=conversation_id,
+        organization_id=organization_id,
+        user_id=user_id,
+        agent_role="chat",
+    )
+    from app.coreAgents.llm.model_pool import (
+        get_agent_model,
+        get_agent_provider,
+    )
+
+    provider = get_agent_provider("chat")
+    chat_model = get_agent_model("chat")
+    model_name = str(
+        getattr(chat_model, "model_name", None)
+        or getattr(chat_model, "model", None)
+        or "unknown"
+    )
     return {
         "configurable": {
-            "thread_id": f"{organization_id}:{conversation_id}",
+            "thread_id": thread_id,
         },
+        "run_name": "soc-chat-conversation",
+        "tags": ["soc", "chat", settings.ENVIRONMENT],
+        "callbacks": observability_callbacks(),
         "metadata": {
+            "run_id": run_id,
+            "request_id": run_id,
+            "trace_id": trace_id,
             "organization_id": organization_id,
+            "user_id": user_id,
             "conversation_id": conversation_id,
+            "environment": settings.ENVIRONMENT,
+            "service_version": settings.SERVICE_VERSION,
+            "agent_role": "chat",
+            "provider": provider,
+            "model": model_name,
+            "revision_id": settings.REVISION_ID,
+            "investigation_id": None,
+            "alert_id": None,
+            "agent_id": None,
         },
     }
+
+
+def _message_fingerprint(message: str) -> str:
+    return hashlib.sha256(message.encode("utf-8")).hexdigest()[:16]
 
 
 def build_chat_context(
@@ -582,6 +638,7 @@ def run_soc_conversation(
     context: SOCChatContext | None = None,
     investigation_service: InvestigationService | None = None,
 ) -> dict[str, Any]:
+    started = time.perf_counter()
     chat_agent = agent or get_soc_chat_agent()
     repository = _persist_user_message(
         conversation_id=conversation_id,
@@ -589,22 +646,52 @@ def run_soc_conversation(
         user_id=user_id,
         message=message,
     )
-    result = chat_agent.invoke(
-        {"messages": [{"role": "user", "content": message}]},
-        config=conversation_config(
-            conversation_id,
-            organization_id=organization_id,
-        ),
-        context=context or build_chat_context(
-            organization_id=organization_id,
-            user_id=user_id,
-        ),
+    config = conversation_config(
+        conversation_id,
+        organization_id=organization_id,
+        user_id=user_id,
     )
+    run_id = config["metadata"]["run_id"]
+    logger.info(
+        "soc_agent_run_started",
+        run_id=run_id,
+        agent_role="chat",
+        message_length=len(message),
+        message_fingerprint=_message_fingerprint(message),
+    )
+    try:
+        result = chat_agent.invoke(
+            {"messages": [{"role": "user", "content": message}]},
+            config=config,
+            context=context or build_chat_context(
+                organization_id=organization_id,
+                user_id=user_id,
+            ),
+        )
+    except Exception as exc:
+        logger.exception(
+            "soc_agent_run_failed",
+            run_id=run_id,
+            agent_role="chat",
+            error_type=type(exc).__name__,
+            duration_ms=round((time.perf_counter() - started) * 1000, 2),
+        )
+        raise
     serialized = serialize_conversation_result(
         result,
         conversation_id=conversation_id,
         organization_id=organization_id,
         investigation_service=investigation_service,
+    )
+    logger.info(
+        "soc_agent_run_completed",
+        run_id=run_id,
+        agent_role="chat",
+        duration_ms=round((time.perf_counter() - started) * 1000, 2),
+        tool_count=len(serialized.get("tools_used", [])),
+        tools_used=serialized.get("tools_used", []),
+        investigation_id=serialized.get("active_investigation_id"),
+        missing_evidence_count=len(serialized.get("missing_evidence", [])),
     )
     _persist_assistant_result(
         repository,
@@ -636,6 +723,17 @@ def stream_soc_conversation(
     config = conversation_config(
         conversation_id,
         organization_id=organization_id,
+        user_id=user_id,
+    )
+    started = time.perf_counter()
+    run_id = config["metadata"]["run_id"]
+    logger.info(
+        "soc_agent_run_started",
+        run_id=run_id,
+        agent_role="chat",
+        streaming=True,
+        message_length=len(message),
+        message_fingerprint=_message_fingerprint(message),
     )
     runtime_context = context or build_chat_context(
         organization_id=organization_id,
@@ -825,12 +923,25 @@ def stream_soc_conversation(
             user_id=user_id,
             result=serialized,
         )
+        logger.info(
+            "soc_agent_run_completed",
+            run_id=run_id,
+            agent_role="chat",
+            streaming=True,
+            duration_ms=round((time.perf_counter() - started) * 1000, 2),
+            tool_count=len(serialized.get("tools_used", [])),
+            tools_used=serialized.get("tools_used", []),
+            investigation_id=serialized.get("active_investigation_id"),
+        )
         yield ("final", serialized)
     except Exception as exc:
         logger.exception(
-            "SOC conversation stream failed conversation_id=%s error_type=%s",
-            conversation_id,
-            type(exc).__name__,
+            "soc_agent_run_failed",
+            run_id=run_id,
+            agent_role="chat",
+            streaming=True,
+            error_type=type(exc).__name__,
+            duration_ms=round((time.perf_counter() - started) * 1000, 2),
         )
         try:
             state = dict(chat_agent.get_state(config).values)
@@ -852,8 +963,8 @@ def stream_soc_conversation(
                 return
         except Exception:
             logger.exception(
-                "SOC conversation recovery failed conversation_id=%s",
-                conversation_id,
+                "soc_conversation_recovery_failed",
+                run_id=run_id,
             )
         yield ("error", _stream_error_payload(exc))
     finally:

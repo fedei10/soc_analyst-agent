@@ -31,6 +31,7 @@ class WazuhResponderClient:
             username=username,
             password=password,
             verify=verify,
+            component="responder",
         )
 
     def run_active_response(

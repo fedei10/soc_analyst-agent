@@ -34,13 +34,14 @@ class InvestigationService:
         repository: InvestigationRepository | None = None,
     ) -> None:
         self._checkpointer: CheckpointerHandle | None = None
+        self.repository = repository or get_investigation_repository()
         if graph is None:
             self._checkpointer = create_investigation_checkpointer()
             graph = create_investigation_graph(
-                checkpointer=self._checkpointer.saver
+                checkpointer=self._checkpointer.saver,
+                tier_report_writer=self.repository.save_tier_report,
             )
         self.graph = graph
-        self.repository = repository or get_investigation_repository()
         self._lock = RLock()
 
     @staticmethod
@@ -93,6 +94,14 @@ class InvestigationService:
             organization_id=organization_id,
             owner_user_id=owner_user_id,
         )
+        self.repository.save_snapshot(
+            {
+                **state,
+                "pending_nodes": [],
+                "specialist_runs": [],
+                "final_report": None,
+            }
+        )
         self.graph.invoke(
             state,
             config=investigation_config(investigation_id),
@@ -137,6 +146,9 @@ class InvestigationService:
             "l1_result": state.get("l1_result"),
             "l2_result": state.get("l2_result"),
             "l3_result": state.get("l3_result"),
+            "l1_report": state.get("l1_report"),
+            "l2_report": state.get("l2_report"),
+            "l3_report": state.get("l3_report"),
             "proposed_actions": state.get("proposed_actions", []),
             "approval_request": state.get("approval_request"),
             "approval_decision": state.get("approval_decision"),
@@ -149,6 +161,10 @@ class InvestigationService:
         }
         with self._lock:
             self.repository.save_snapshot(result)
+            result["tier_reports"] = self.repository.list_tier_reports(
+                investigation_id,
+                organization_id=state_organization,
+            )
         return result
 
     def resume(
@@ -278,6 +294,21 @@ class InvestigationService:
             investigation_id,
             organization_id=organization_id,
         ).get("final_report")
+
+    def tier_reports(
+        self,
+        investigation_id: str,
+        *,
+        organization_id: str = "local",
+    ) -> list[dict[str, Any]]:
+        self.snapshot(
+            investigation_id,
+            organization_id=organization_id,
+        )
+        return self.repository.list_tier_reports(
+            investigation_id,
+            organization_id=organization_id,
+        )
 
     def agent_runs(
         self,

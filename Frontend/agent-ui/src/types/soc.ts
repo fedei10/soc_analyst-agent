@@ -93,6 +93,26 @@ export interface AuditEvent {
   timestamp: string
 }
 
+export interface TierReport {
+  report_id: string
+  investigation_id: string
+  tier: 'l1' | 'l2' | 'l3'
+  status: 'completed'
+  summary: string
+  generated_at: string
+  alert_context: Record<string, unknown>
+  triage: Record<string, unknown>
+  initial_investigation: Record<string, unknown>
+  advanced_analysis: Record<string, unknown>
+  containment: Record<string, unknown>
+  detection_engineering: Record<string, unknown>
+  post_incident_review: Record<string, unknown>
+  escalation: Record<string, unknown>
+  analyst_activity: Array<Record<string, unknown>>
+  evidence_refs: string[]
+  result: Record<string, unknown>
+}
+
 export interface Investigation {
   investigation_id: string
   alert_id?: string
@@ -110,6 +130,7 @@ export interface Investigation {
   executed_actions: Record<string, unknown>[]
   verification_results?: Record<string, unknown>[]
   final_report?: Record<string, unknown> | null
+  tier_reports?: TierReport[]
   errors: Array<Record<string, unknown>>
   audit_events: AuditEvent[]
   pending_nodes: string[]
