@@ -147,6 +147,29 @@ def test_successful_login_after_failures_is_calculated_deterministically():
     assert analysis.successful_login_timestamp == events[-1].timestamp
     assert analysis.evidence_alert_ids == ["failure-1", "failure-2", "success-1"]
     assert analysis.confidence == 1.0
+    assert analysis.successful_login_search_completed is True
+    assert analysis.successful_login_observed is True
+    assert analysis.returned_authentication_events == 3
+    assert analysis.search_scope["source"] == "wazuh-alerts-*"
+
+
+def test_success_between_failures_is_not_missed():
+    events = [
+        auth_event("failure-1", 10, "failure"),
+        auth_event("success-1", 11, "success"),
+        auth_event("failure-2", 12, "failure"),
+    ]
+    result = AlertSearchResult(total=3, returned=3, truncated=False, alerts=events)
+    gateway = WazuhGateway(server=FakeServer(), indexer=FakeIndexer(result))
+
+    analysis = gateway.check_successful_login_after_failures(
+        source_ip="203.0.113.10",
+        agent_id="001",
+    )
+
+    assert analysis.successful_login_found is True
+    assert analysis.successful_login_timestamp == events[1].timestamp
+    assert analysis.conclusion == "successful_login_observed"
 
 
 def test_alert_normalization_reads_nested_wazuh_aliases():
@@ -189,6 +212,67 @@ def test_authentication_timeline_can_use_agent_without_source_ip():
     timeline = gateway.build_authentication_timeline(agent_id="001")
 
     assert timeline.returned == 0
+
+
+def test_agent_inventory_uses_only_the_allowlisted_syscollector_path():
+    class RecordingServer(FakeServer):
+        def __init__(self):
+            self.calls = []
+
+        def get(self, path, params=None):
+            self.calls.append((path, params))
+            return {
+                "data": {
+                    "affected_items": [{"name": "eth0"}],
+                    "total_affected_items": 1,
+                }
+            }
+
+    result = AlertSearchResult(total=0, returned=0, truncated=False, alerts=[])
+    server = RecordingServer()
+    gateway = WazuhGateway(server=server, indexer=FakeIndexer(result))
+
+    inventory = gateway.get_agent_inventory(
+        agent_id="001",
+        component="network",
+        limit=10,
+        text="eth",
+    )
+
+    assert server.calls == [
+        ("/syscollector/001/netiface", {"limit": 10, "search": "eth"})
+    ]
+    assert inventory.returned == 1
+    assert inventory.items[0]["name"] == "eth0"
+
+
+def test_detection_evidence_includes_fim_sca_and_rootcheck():
+    class EvidenceServer(FakeServer):
+        def get(self, path, params=None):
+            findings = {
+                "/syscheck/001": [{"file": "/etc/passwd"}],
+                "/sca/001": [{"policy_id": "cis"}],
+                "/rootcheck/001": [{"status": "outstanding"}],
+            }[path]
+            return {
+                "data": {
+                    "affected_items": findings,
+                    "total_affected_items": len(findings),
+                }
+            }
+
+    result = AlertSearchResult(total=0, returned=0, truncated=False, alerts=[])
+    gateway = WazuhGateway(
+        server=EvidenceServer(),
+        indexer=FakeIndexer(result),
+    )
+
+    evidence = gateway.get_detection_evidence(agent_id="001", limit=25)
+
+    assert evidence.fim_total == 1
+    assert evidence.sca_total == 1
+    assert evidence.rootcheck_total == 1
+    assert evidence.rootcheck_findings[0]["status"] == "outstanding"
 
 
 def test_archive_search_is_bounded_and_returns_raw_context():
@@ -237,6 +321,34 @@ def test_archive_search_is_bounded_and_returns_raw_context():
 
     assert result.total == 1
     assert result.events[0].normalized.source_ip == "192.0.2.60"
+    assert result.archive_status == "available"
+    assert result.query_scope["agent_id"] == "001"
+    assert result.query_scope["hours"] == 24
     assert client.calls[0]["index"] == "wazuh-archives-*"
     assert client.calls[0]["body"]["size"] == 10
     assert client.calls[0]["ignore_unavailable"] is True
+
+
+def test_archive_search_reports_unavailable_index_without_claiming_no_activity():
+    class MissingArchiveOpenSearch:
+        def search(self, **kwargs):
+            return {
+                "_shards": {
+                    "total": 0,
+                    "successful": 0,
+                    "skipped": 0,
+                    "failed": 0,
+                },
+                "hits": {"total": {"value": 0}, "hits": []},
+            }
+
+        def close(self):
+            pass
+
+    result = WazuhIndexerClient(
+        client=MissingArchiveOpenSearch()
+    ).search_archived_logs(text="failed password", hours=24)
+
+    assert result.total == 0
+    assert result.archive_status == "unavailable"
+    assert result.query_scope["text"] == "failed password"

@@ -26,11 +26,13 @@ class Settings(BaseSettings):
     GEMINI_AGENT_MODEL: str = "gemini-2.5-flash"
     GEMINI_STRUCTURED_MODEL: str = "gemini-2.5-flash"
 
-    # Bearer tokens for THIS API, comma-separated. Same model as the Wazuh MCP
-    # server: read tokens go to SOC L1/L2 agents, write tokens stay human-held
-    # (L3 response actions). Empty = endpoints answer 503 until configured.
-    SOC_READ_API_KEYS: SecretStr = SecretStr("")
-    SOC_WRITE_API_KEYS: SecretStr = SecretStr("")
+    # Clerk authenticates every application API request. The secret and
+    # optional PEM JWT key are server-only and must never be exposed through a
+    # NEXT_PUBLIC_* variable.
+    CLERK_SECRET_KEY: SecretStr = SecretStr("")
+    CLERK_JWT_KEY: SecretStr = SecretStr("")
+    CLERK_AUTHORIZED_PARTIES: str = "http://localhost:3000"
+    CLERK_REQUIRE_ORGANIZATION: bool = True
 
     # LangSmith tracing
     LANGSMITH_API_KEY: SecretStr = SecretStr("")
@@ -59,20 +61,40 @@ class Settings(BaseSettings):
     WAZUH_READ_ONLY: bool = True
     WAZUH_ALLOW_DANGEROUS_TOOLS: bool = False
 
-    # Redis example
-    #REDIS_HOST: str = "localhost"
-    #REDIS_PORT: int = 6379
-    #REDIS_PASSWORD: SecretStr | None = None
+    # Durable investigations and LangGraph checkpoints. Leave empty for the
+    # in-memory development fallback.
+    DATABASE_URL: SecretStr = SecretStr("")
+    DATABASE_AUTO_CREATE: bool = False
+    DATABASE_REQUIRED: bool = False
 
-    # PostgreSQL example
-    #POSTGRES_HOST: str = "localhost"
-    #POSTGRES_PORT: int = 5432
-    #POSTGRES_USER: str | None = None
-    #POSTGRES_PASSWORD: SecretStr | None = None
-    #POSTGRES_DB: str | None = None
+    # Redis is deliberately ephemeral. PostgreSQL remains the source of truth
+    # for conversations, graph checkpoints, reports, approvals, and audits.
+    REDIS_URL: SecretStr = SecretStr("")
+    REDIS_REQUIRED: bool = False
+    REDIS_CONTEXT_TTL_SECONDS: int = 300
+    REDIS_TOOL_TTL_SECONDS: int = 30
+    REDIS_ACTIVITY_TTL_SECONDS: int = 86400
+    REDIS_LOCK_TTL_SECONDS: int = 60
+    REDIS_IDEMPOTENCY_TTL_SECONDS: int = 86400
+    REDIS_ACTIVITY_MAX_EVENTS: int = 1000
+
+    # Durable retention. Reports, approvals, actions, and curated memories are
+    # intentionally excluded from automated deletion.
+    RETENTION_MESSAGES_DAYS: int = 90
+    RETENTION_TOOL_PAYLOAD_DAYS: int = 30
+    RETENTION_CHECKPOINT_DAYS: int = 30
+    RETENTION_INVESTIGATION_DAYS: int = 365
+
+    # Local API-host diagnostics and self-healing. Diagnostics are read-only
+    # named commands. Remediation still requires the response flags above,
+    # explicit human approval, and an allowlisted target.
+    SYSTEM_DIAGNOSTICS_ENABLED: bool = False
+    SELF_HEALING_ENABLED: bool = False
+    SELF_HEALING_SERVICE_ALLOWLIST: str = ""
+    SYSTEM_COMMAND_TIMEOUT: int = 10
 
     model_config = SettingsConfigDict(
-        env_file=".env",          
+        env_file=(".env", ".env.local"),
         env_file_encoding="utf-8",
         extra="ignore"
     )

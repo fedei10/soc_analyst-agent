@@ -38,6 +38,8 @@ class InvestigationState(TypedDict, total=False):
 
     alert_id: Required[str]
     agent_id: NotRequired[str | None]
+    organization_id: NotRequired[str | None]
+    owner_user_id: NotRequired[str | None]
     initiated_by: NotRequired[str | None]
     initiation_reason: NotRequired[str | None]
 
@@ -46,6 +48,7 @@ class InvestigationState(TypedDict, total=False):
     l1_result: NotRequired[dict[str, Any] | None]
     l2_result: NotRequired[dict[str, Any] | None]
     l3_result: NotRequired[dict[str, Any] | None]
+    specialist_runs: Annotated[list[dict[str, Any]], operator.add]
 
     evidence: NotRequired[list[dict[str, Any]]]
     timeline: NotRequired[list[dict[str, Any]]]

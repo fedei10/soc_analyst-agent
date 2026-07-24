@@ -48,8 +48,8 @@ def test_tiers_are_cumulative_and_bounded(gateway):
     l2 = get_soc_l2_tools(gateway)
     l3 = get_soc_l3_tools(gateway)
     assert len(l1) == 3
-    assert len(l2) == 6
-    assert len(l3) == 8
+    assert len(l2) == 7
+    assert len(l3) == 9
     assert names(l1) < names(l2) < names(l3)
 
 
@@ -61,6 +61,7 @@ def test_exact_agent_tool_surface(gateway):
         "get_related_alerts",
         "build_authentication_timeline",
         "check_successful_login_after_failures",
+        "collect_host_diagnostic",
         "get_rule_and_mitre_context",
         "get_detection_evidence",
     }
@@ -119,12 +120,12 @@ def test_tool_failure_is_structured_and_retryable(gateway):
     "module_name,expected_tools",
     [
         ("soc_level1_agent", 3),
-        ("soc_level2_agent", 6),
-        ("soc_level3_agent", 8),
+        ("soc_level2_agent", 7),
+        ("soc_level3_agent", 9),
     ],
 )
 def test_agents_are_wired_with_their_tier(module_name, expected_tools):
     module = __import__(f"app.coreAgents.Agents.{module_name}", fromlist=["agent"])
     assert module.agent is not None
-    tiers = {3: get_soc_l1_tools, 6: get_soc_l2_tools, 8: get_soc_l3_tools}
+    tiers = {3: get_soc_l1_tools, 7: get_soc_l2_tools, 9: get_soc_l3_tools}
     assert len(tiers[expected_tools]()) == expected_tools

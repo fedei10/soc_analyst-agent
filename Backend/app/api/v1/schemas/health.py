@@ -32,3 +32,19 @@ class WazuhHealthResponse(BaseModel):
 class ServicesHealthResponse(BaseModel):
     status: Literal["healthy", "unhealthy"]
     services: dict[str, ServiceCheck]
+
+
+class DatabaseHealthResponse(BaseModel):
+    service: Literal["postgresql"] = "postgresql"
+    status: Literal["healthy", "unhealthy", "disabled"]
+    durable_investigations: bool
+    detail: str | None = None
+
+
+class StorageHealthResponse(BaseModel):
+    service: Literal["storage"] = "storage"
+    status: Literal["healthy", "degraded", "unhealthy"]
+    postgresql: Literal["healthy", "unhealthy", "disabled"]
+    redis: Literal["healthy", "degraded", "disabled"]
+    durable_memory: bool
+    detail: str | None = None

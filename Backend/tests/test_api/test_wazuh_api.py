@@ -1,11 +1,11 @@
 """Contract tests for auth, dependency boundaries, and API error envelopes."""
 
+import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import httpx
 import pytest
-from fastapi.testclient import TestClient
 
 from app.main import app
 from app.services.wazuh.dependencies import get_wazuh_gateway, get_wazuh_responder
@@ -13,6 +13,31 @@ from app.services.wazuh.models import AlertEvidence, AlertSearchResult
 
 READ = {"Authorization": "Bearer test-read-key"}
 WRITE = {"Authorization": "Bearer test-write-key"}
+
+
+class ASGITestClient:
+    def request(self, method: str, path: str, **kwargs):
+        async def send():
+            transport = httpx.ASGITransport(
+                app=app,
+                raise_app_exceptions=False,
+            )
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+            ) as client:
+                return await client.request(method, path, **kwargs)
+
+        return asyncio.run(send())
+
+    def get(self, path: str, **kwargs):
+        return self.request("GET", path, **kwargs)
+
+    def post(self, path: str, **kwargs):
+        return self.request("POST", path, **kwargs)
+
+    def put(self, path: str, **kwargs):
+        return self.request("PUT", path, **kwargs)
 
 
 @pytest.fixture
@@ -29,8 +54,7 @@ def responder():
 def client(gateway, responder):
     app.dependency_overrides[get_wazuh_gateway] = lambda: gateway
     app.dependency_overrides[get_wazuh_responder] = lambda: responder
-    with TestClient(app, raise_server_exceptions=False) as test_client:
-        yield test_client
+    yield ASGITestClient()
     app.dependency_overrides.clear()
 
 
@@ -94,7 +118,7 @@ def test_missing_alert_is_404(client, gateway):
 
 def test_read_token_cannot_run_response_actions(client):
     response = client.put(
-        "/api/v1/agents/001/restart", headers=READ, json={"approved_by": "fedi"}
+        "/api/v1/agents/001/restart", headers=READ, json={}
     )
     assert response.status_code == 403
     assert response.json()["error"]["code"] == "forbidden"
@@ -111,19 +135,20 @@ def test_write_token_uses_separate_responder(client, responder):
     response = client.post(
         "/api/v1/agents/001/active-response",
         headers=WRITE,
-        json={"command": "firewall-drop", "arguments": ["1.2.3.4"], "approved_by": "fedi"},
+        json={"command": "firewall-drop", "arguments": ["1.2.3.4"]},
     )
     assert response.status_code == 202
     assert response.json()["data"]["status"] == "queued"
     assert calls["agent_id"] == "001"
     assert calls["command"] == "firewall-drop"
+    assert response.json()["data"]["approved_by"] == "user_responder"
 
 
 def test_unknown_command_and_extra_fields_are_rejected(client):
     for body in (
-        {"command": "rm-rf", "approved_by": "fedi"},
-        {"command": "firewall-drop"},
-        {"command": "firewall-drop", "approved_by": "f", "x": 1},
+        {"command": "rm-rf"},
+        {},
+        {"command": "firewall-drop", "x": 1},
     ):
         response = client.post(
             "/api/v1/agents/001/active-response", headers=WRITE, json=body

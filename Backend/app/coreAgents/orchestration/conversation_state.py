@@ -29,3 +29,5 @@ class SOCChatContext:
     permissions: tuple[str, ...]
     allowed_tools: tuple[str, ...]
     active_response_enabled: bool
+    organization_id: str = "local"
+    user_id: str = "local"

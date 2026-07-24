@@ -53,13 +53,20 @@ def test_every_write_action_requires_approval(action_type):
 
 
 def test_model_supplied_policy_value_is_ignored():
-    proposed = {**action("block_ip"), "requires_approval": False}
+    proposed = {
+        **action("block_ip"),
+        "requires_approval": False,
+        "execution_preview": "bash -c unsafe-command",
+    }
     initial = base_state([proposed])
 
     update = prepare_actions(initial)
     state = {**initial, **update}
 
     assert update["proposed_actions"][0]["requires_approval"] is True
+    assert update["proposed_actions"][0]["execution_preview"] == (
+        "Wazuh active response: firewall-drop target=agent-001"
+    )
     assert route_after_action_policy(state) == "awaiting_approval"
 
 

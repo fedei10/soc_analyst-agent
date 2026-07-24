@@ -16,6 +16,25 @@ class FakeResponder:
             raise self.error
         return {"data": {"affected_items": ["001"]}}
 
+    def restart_agent(self, agent_id):
+        self.calls.append({"restart_agent": agent_id})
+        if self.error is not None:
+            raise self.error
+        return {"data": {"affected_items": [agent_id]}}
+
+
+class FakeSystemExecutor:
+    def __init__(self):
+        self.validated = []
+        self.restarted = []
+
+    def validate_service(self, service_name):
+        self.validated.append(service_name)
+
+    def restart_service(self, service_name):
+        self.restarted.append(service_name)
+        return {"status": "completed"}
+
 
 def settings(*, enabled=True):
     return SimpleNamespace(
@@ -143,7 +162,7 @@ def test_changed_action_does_not_match_approval():
     assert update["errors"][0]["code"] == "APPROVED_ACTION_MISMATCH"
 
 
-def test_unsupported_action_fails_closed():
+def test_action_outside_policy_catalog_fails_before_execution():
     state = approved_state(action_type="isolate_agent", target="agent-001")
 
     update = execute_response(
@@ -152,7 +171,7 @@ def test_unsupported_action_fails_closed():
         settings_obj=settings(),
     )
 
-    assert update["errors"][0]["code"] == "UNSUPPORTED_RESPONSE_ACTION"
+    assert update["errors"][0]["code"] == "APPROVED_ACTION_MISMATCH"
 
 
 def test_invalid_ip_target_fails_closed():
@@ -198,6 +217,36 @@ def test_approved_block_ip_uses_allowlisted_responder_command():
             "alert": {"alert_id": "alert-1"},
         }
     ]
+
+
+def test_approved_agent_restart_uses_wazuh_responder():
+    responder = FakeResponder()
+
+    update = execute_response(
+        approved_state(action_type="restart_agent", target="001"),
+        responder=responder,
+        settings_obj=settings(),
+    )
+
+    assert update["executed_actions"][0]["status"] == "queued"
+    assert responder.calls == [{"restart_agent": "001"}]
+
+
+def test_approved_service_restart_uses_allowlisted_system_executor():
+    executor = FakeSystemExecutor()
+
+    update = execute_response(
+        approved_state(
+            action_type="restart_service",
+            target="wazuh-agent.service",
+        ),
+        system_executor=executor,
+        settings_obj=settings(),
+    )
+
+    assert executor.validated == ["wazuh-agent.service"]
+    assert executor.restarted == ["wazuh-agent.service"]
+    assert update["executed_actions"][0]["status"] == "completed"
 
 
 def test_responder_failure_does_not_leak_details():

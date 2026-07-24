@@ -41,8 +41,9 @@ def build_l3_tools(gateway: WazuhGateway | None = None) -> list[StructuredTool]:
             func=get_detection_evidence,
             name="get_detection_evidence",
             description=(
-                "Read-only bounded FIM and SCA detection evidence for one numeric agent ID. "
-                "Use when validating detection coverage or gaps; results may be truncated."
+                "Read-only bounded FIM, SCA, and rootcheck evidence for one numeric agent "
+                "ID. Use when validating endpoint findings or detection gaps; results may "
+                "be truncated."
             ),
             args_schema=DetectionEvidenceInput,
         ),

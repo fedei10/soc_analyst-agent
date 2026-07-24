@@ -1,13 +1,4 @@
-"""
-Service health diagnostics (auth required — see router comment below).
 
-GET /api/v1/health/services -> quick up/down status of every external service
-GET /api/v1/health/wazuh    -> detailed Wazuh check (indexer + server API) with
-                               a human explanation and fix for every error code
-
-Responses are validated against the schemas in app/api/v1/schemas/health.py,
-so /docs always shows the exact shape of both the 200 and 503 cases.
-"""
 import time
 from typing import Annotated, Callable
 
@@ -18,16 +9,20 @@ from opensearchpy import exceptions as opensearch_exc
 
 from app.api.auth.deps import require_read
 from app.api.v1.schemas.health import (
+    DatabaseHealthResponse,
     ServiceCheck,
     ServicesHealthResponse,
+    StorageHealthResponse,
     WazuhHealthResponse,
 )
+from app.db.session import check_database, database_url
 from app.services.cerebras.connection import test_cerebras_connection
 from app.services.groq.connection import test_groq_connection
 from app.services.oxy.connection import oxy_connection
 from app.services.wazuh.dependencies import get_wazuh_gateway
 from app.services.wazuh.exceptions import WazuhAPIError, WazuhAuthError, WazuhPermissionError
 from app.services.wazuh.gateway import WazuhGateway
+from app.services.redis.connection import check_redis
 
 # Diagnostics require auth: the meaning/fix strings below describe internal
 # topology and must not be readable anonymously. Bare liveness is GET /health
@@ -182,6 +177,70 @@ def _build_wazuh_health(gateway: WazuhGateway) -> tuple[WazuhHealthResponse, int
     healthy = all(c.status == "healthy" for c in checks.values())
     code = status.HTTP_200_OK if healthy else status.HTTP_503_SERVICE_UNAVAILABLE
     return WazuhHealthResponse(status="healthy" if healthy else "unhealthy", checks=checks), code
+
+
+@router.get(
+    "/database",
+    response_model=DatabaseHealthResponse,
+    response_model_exclude_none=True,
+    responses={503: {"model": DatabaseHealthResponse}},
+)
+def database_health(response: Response) -> DatabaseHealthResponse:
+    if not database_url():
+        return DatabaseHealthResponse(
+            status="disabled",
+            durable_investigations=False,
+        )
+    try:
+        check_database()
+        return DatabaseHealthResponse(
+            status="healthy",
+            durable_investigations=True,
+        )
+    except Exception:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return DatabaseHealthResponse(
+            status="unhealthy",
+            durable_investigations=False,
+            detail="PostgreSQL is configured but unavailable.",
+        )
+
+
+@router.get(
+    "/storage",
+    response_model=StorageHealthResponse,
+    response_model_exclude_none=True,
+)
+def storage_health(response: Response) -> StorageHealthResponse:
+    redis_status = check_redis()["status"]
+    try:
+        postgres_status = check_database()["status"]
+    except Exception:
+        postgres_status = "unhealthy"
+
+    if postgres_status != "healthy":
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return StorageHealthResponse(
+            status="unhealthy",
+            postgresql=postgres_status,
+            redis=redis_status,
+            durable_memory=False,
+            detail="PostgreSQL is required for durable SOC state.",
+        )
+    if redis_status != "healthy":
+        return StorageHealthResponse(
+            status="degraded",
+            postgresql="healthy",
+            redis=redis_status,
+            durable_memory=True,
+            detail="Redis acceleration is unavailable; PostgreSQL is intact.",
+        )
+    return StorageHealthResponse(
+        status="healthy",
+        postgresql="healthy",
+        redis="healthy",
+        durable_memory=True,
+    )
 
 
 @router.get(

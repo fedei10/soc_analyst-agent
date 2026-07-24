@@ -1,7 +1,8 @@
-export type WorkspaceView = 'chat' | 'investigations'
+export type WorkspaceView = 'chat' | 'alert-triage' | 'investigations'
 export type ApprovalDecision = 'approve' | 'reject' | 'modify'
 
 export interface ChatActivity {
+  id?: string | null
   tool: string | null
   label: string
   status: 'running' | 'completed' | 'failed'
@@ -15,6 +16,7 @@ export interface AgentChatResponse {
   activities: ChatActivity[]
   active_investigation_id?: string | null
   active_alert_id?: string | null
+  active_agent_id?: string | null
   investigation?: Investigation | null
   investigation_progress?: InvestigationProgress | null
   missing_evidence?: string[]
@@ -71,6 +73,7 @@ export interface ProposedAction {
   risk_level: 'low' | 'medium' | 'high' | 'critical'
   operational_impact: string
   requires_approval: boolean
+  execution_preview: string
 }
 
 export interface ApprovalRequest {
@@ -110,9 +113,31 @@ export interface Investigation {
   pending_nodes: string[]
 }
 
+export interface InvestigationHistoryItem {
+  investigation_id: string
+  alert_id: string
+  agent_id?: string | null
+  status: string
+  current_stage: string
+  severity?: string | null
+  confidence?: number | null
+  initiated_by?: string | null
+  initiation_reason?: string | null
+  completed_tiers: Array<'l1' | 'l2' | 'l3'>
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+export interface InvestigationHistory {
+  items: InvestigationHistoryItem[]
+  count: number
+  total: number
+  limit: number
+  offset: number
+}
+
 export interface ApprovalInput {
   decision: ApprovalDecision
-  approved_by: string
   approval_id: string
   modified_actions?: Record<string, unknown>[]
 }

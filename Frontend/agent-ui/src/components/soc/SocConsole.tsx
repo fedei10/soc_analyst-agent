@@ -1,6 +1,12 @@
 'use client'
 
 import {
+  OrganizationSwitcher,
+  Show,
+  UserButton,
+  useOrganization
+} from '@clerk/nextjs'
+import {
   Activity,
   AlertTriangle,
   Bot,
@@ -10,7 +16,6 @@ import {
   CircleGauge,
   Clock3,
   FileSearch,
-  KeyRound,
   ListChecks,
   MessageSquare,
   Plus,
@@ -36,6 +41,7 @@ import {
   createInvestigation,
   getAlertSummary,
   getInvestigation,
+  getInvestigationHistory,
   getLiveness,
   getWazuhHealth,
   streamAgentMessage,
@@ -47,6 +53,7 @@ import type {
   ChatActivity,
   ChatMessage,
   Investigation,
+  InvestigationHistoryItem,
   WorkspaceView,
   WazuhHealth
 } from '@/types/soc'
@@ -214,8 +221,14 @@ function ChatMessageItem({ message }: { message: ChatMessage }) {
             <summary>Investigation activity</summary>
             <div className="trace-list">
               {message.activities.map((activity, index) => (
-                <div key={`${activity.tool || 'agent'}-${index}`}>
-                  <CheckCircle2 size={14} />
+                <div
+                  key={activity.id || `${activity.tool || 'agent'}-${index}`}
+                >
+                  {activity.status === 'failed' ? (
+                    <AlertTriangle size={14} />
+                  ) : (
+                    <CheckCircle2 size={14} />
+                  )}
                   <span>{activity.label}</span>
                 </div>
               ))}
@@ -246,6 +259,7 @@ function Metric({
 }
 
 export default function SocConsole() {
+  const { organization, isLoaded: organizationLoaded } = useOrganization()
   const [view, setView] = useState<WorkspaceView>('chat')
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [chatInput, setChatInput] = useState('')
@@ -253,19 +267,24 @@ export default function SocConsole() {
   const [conversationId, setConversationId] = useState('')
   const [liveActivities, setLiveActivities] = useState<ChatActivity[]>([])
   const [liveAnswer, setLiveAnswer] = useState('')
-  const [readToken, setReadToken] = useState('')
-  const [writeToken, setWriteToken] = useState('')
   const [backendOnline, setBackendOnline] = useState(false)
   const [wazuhHealth, setWazuhHealth] = useState<WazuhHealth | null>(null)
   const [alertSummary, setAlertSummary] = useState<AlertSummary | null>(null)
   const [environmentBusy, setEnvironmentBusy] = useState(false)
-  const [tokensHydrated, setTokensHydrated] = useState(false)
+  const [environmentHydrated, setEnvironmentHydrated] = useState(false)
   const [investigation, setInvestigation] = useState<Investigation | null>(null)
+  const [investigationHistory, setInvestigationHistory] = useState<
+    InvestigationHistoryItem[]
+  >([])
+  const [pendingApprovalTotal, setPendingApprovalTotal] = useState(0)
+  const [historyBusy, setHistoryBusy] = useState(false)
   const [investigationBusy, setInvestigationBusy] = useState(false)
   const [alertId, setAlertId] = useState('')
   const [agentId, setAgentId] = useState('')
-  const [approver, setApprover] = useState('')
   const [modifiedActions, setModifiedActions] = useState('')
+  const organizationId = organization?.id
+  const conversationStorageKey = `tsage_conversation_id:${organizationId || 'none'}`
+  const investigationStorageKey = `tsage_investigation_id:${organizationId || 'none'}`
 
   const activityTrace = useMemo(
     () =>
@@ -273,16 +292,17 @@ export default function SocConsole() {
         .flatMap((message) => message.activities || [])
         .filter(
           (activity, index, all) =>
-            all.findIndex(
-              (candidate) =>
-                candidate.tool === activity.tool &&
-                candidate.label === activity.label
+            all.findIndex((candidate) =>
+              activity.id && candidate.id
+                ? candidate.id === activity.id
+                : candidate.tool === activity.tool &&
+                  candidate.label === activity.label
             ) === index
         ),
     [messages]
   )
 
-  async function refreshEnvironment(token = readToken) {
+  async function refreshEnvironment() {
     setEnvironmentBusy(true)
     try {
       await getLiveness()
@@ -292,19 +312,13 @@ export default function SocConsole() {
       setWazuhHealth(null)
       setAlertSummary(null)
       setEnvironmentBusy(false)
-      return
-    }
-
-    if (!token) {
-      setWazuhHealth(null)
-      setAlertSummary(null)
-      setEnvironmentBusy(false)
+      setEnvironmentHydrated(true)
       return
     }
 
     const [healthResult, summaryResult] = await Promise.allSettled([
-      getWazuhHealth(token),
-      getAlertSummary(token)
+      getWazuhHealth(),
+      getAlertSummary()
     ])
     setWazuhHealth(
       healthResult.status === 'fulfilled' ? healthResult.value : null
@@ -313,35 +327,65 @@ export default function SocConsole() {
       summaryResult.status === 'fulfilled' ? summaryResult.value : null
     )
     setEnvironmentBusy(false)
+    setEnvironmentHydrated(true)
+  }
+
+  async function refreshInvestigationHistory() {
+    setHistoryBusy(true)
+    try {
+      const [history, pending] = await Promise.all([
+        getInvestigationHistory(),
+        getInvestigationHistory(1, 'awaiting_approval')
+      ])
+      setInvestigationHistory(history.items)
+      setPendingApprovalTotal(pending.total)
+    } catch {
+      setInvestigationHistory([])
+      setPendingApprovalTotal(0)
+    } finally {
+      setHistoryBusy(false)
+    }
   }
 
   useEffect(() => {
-    const storedReadToken = sessionStorage.getItem('tsage_read_token') || ''
-    const storedWriteToken = sessionStorage.getItem('tsage_write_token') || ''
-    const storedInvestigation = sessionStorage.getItem('tsage_investigation_id')
+    if (!organizationLoaded || !organizationId) return
+    setMessages([])
+    setInvestigation(null)
+    const storedInvestigation = sessionStorage.getItem(investigationStorageKey)
     const storedConversation =
-      sessionStorage.getItem('tsage_conversation_id') || crypto.randomUUID()
-    setReadToken(storedReadToken)
-    setWriteToken(storedWriteToken)
+      sessionStorage.getItem(conversationStorageKey) || crypto.randomUUID()
     setConversationId(storedConversation)
-    sessionStorage.setItem('tsage_conversation_id', storedConversation)
-    setTokensHydrated(true)
-    void refreshEnvironment(storedReadToken)
+    sessionStorage.setItem(conversationStorageKey, storedConversation)
+    void refreshEnvironment()
+    void refreshInvestigationHistory()
 
-    if (storedReadToken && storedInvestigation) {
-      void getInvestigation(storedReadToken, storedInvestigation)
+    if (storedInvestigation) {
+      void getInvestigation(storedInvestigation)
         .then(setInvestigation)
-        .catch(() => sessionStorage.removeItem('tsage_investigation_id'))
+        .catch(() => sessionStorage.removeItem(investigationStorageKey))
     }
-    // Initial hydration only.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [organizationLoaded, organizationId])
 
-  function saveTokens() {
-    sessionStorage.setItem('tsage_read_token', readToken.trim())
-    sessionStorage.setItem('tsage_write_token', writeToken.trim())
-    toast.success('API tokens saved for this browser session.')
-    void refreshEnvironment(readToken.trim())
+  if (!organizationLoaded) {
+    return <main className="auth-page">Loading organization...</main>
+  }
+
+  if (!organizationId) {
+    return (
+      <main className="auth-page">
+        <div className="organization-required">
+          <Shield size={30} />
+          <h1>Select a SOC organization</h1>
+          <OrganizationSwitcher
+            hidePersonal
+            afterCreateOrganizationUrl="/"
+            afterSelectOrganizationUrl="/"
+          />
+          <UserButton />
+        </div>
+      </main>
+    )
   }
 
   function resetChat() {
@@ -351,17 +395,13 @@ export default function SocConsole() {
     setConversationId(nextConversationId)
     setLiveActivities([])
     setLiveAnswer('')
-    sessionStorage.setItem('tsage_conversation_id', nextConversationId)
+    sessionStorage.setItem(conversationStorageKey, nextConversationId)
   }
 
   async function handleChatSubmit(event?: FormEvent) {
     event?.preventDefault()
     const prompt = chatInput.trim()
     if (!prompt || chatBusy) return
-    if (!readToken.trim()) {
-      toast.error('Add a SOC read token before contacting an agent.')
-      return
-    }
 
     setMessages((current) => [...current, createMessage('user', prompt)])
     setChatInput('')
@@ -373,28 +413,23 @@ export default function SocConsole() {
       const activeConversationId = conversationId || crypto.randomUUID()
       if (!conversationId) {
         setConversationId(activeConversationId)
-        sessionStorage.setItem('tsage_conversation_id', activeConversationId)
+        sessionStorage.setItem(conversationStorageKey, activeConversationId)
       }
-      const result = await streamAgentMessage(
-        readToken.trim(),
-        prompt,
-        activeConversationId,
-        {
-          onActivity: (activity) => {
-            setLiveActivities((current) => {
-              const withoutPrior = current.filter(
-                (item) =>
-                  !(
-                    item.tool === activity.tool && item.label === activity.label
-                  )
-              )
-              return [...withoutPrior, activity]
-            })
-          },
-          onToken: (content) =>
-            setLiveAnswer((current) => `${current}${content}`)
-        }
-      )
+      const result = await streamAgentMessage(prompt, activeConversationId, {
+        onActivity: (activity) => {
+          setLiveActivities((current) => {
+            const withoutPrior = current.filter(
+              (item) =>
+                !(activity.id && item.id
+                  ? item.id === activity.id
+                  : item.tool === activity.tool &&
+                    item.label === activity.label)
+            )
+            return [...withoutPrior, activity]
+          })
+        },
+        onToken: (content) => setLiveAnswer((current) => `${current}${content}`)
+      })
       setMessages((current) => [
         ...current,
         createMessage('agent', result.assistant_message, {
@@ -404,13 +439,14 @@ export default function SocConsole() {
         })
       ])
       setConversationId(result.conversation_id)
-      sessionStorage.setItem('tsage_conversation_id', result.conversation_id)
+      sessionStorage.setItem(conversationStorageKey, result.conversation_id)
       if (result.investigation) {
         setInvestigation(result.investigation)
         sessionStorage.setItem(
-          'tsage_investigation_id',
+          investigationStorageKey,
           result.investigation.investigation_id
         )
+        void refreshInvestigationHistory()
       }
     } catch (error) {
       const message =
@@ -438,20 +474,16 @@ export default function SocConsole() {
 
   async function handleCreateInvestigation(event: FormEvent) {
     event.preventDefault()
-    if (!readToken.trim()) {
-      toast.error('Add a SOC read token before starting an investigation.')
-      return
-    }
 
     setInvestigationBusy(true)
     try {
       const result = await createInvestigation(
-        readToken.trim(),
         alertId.trim(),
         agentId.trim() || undefined
       )
       setInvestigation(result)
-      sessionStorage.setItem('tsage_investigation_id', result.investigation_id)
+      sessionStorage.setItem(investigationStorageKey, result.investigation_id)
+      void refreshInvestigationHistory()
       if (result.approval_request) {
         setModifiedActions(
           JSON.stringify(result.approval_request.proposed_actions, null, 2)
@@ -470,14 +502,12 @@ export default function SocConsole() {
   }
 
   async function refreshInvestigation() {
-    if (!investigation || !readToken.trim()) return
+    if (!investigation) return
     setInvestigationBusy(true)
     try {
-      const result = await getInvestigation(
-        readToken.trim(),
-        investigation.investigation_id
-      )
+      const result = await getInvestigation(investigation.investigation_id)
       setInvestigation(result)
+      void refreshInvestigationHistory()
     } catch (error) {
       toast.error(
         error instanceof Error
@@ -489,19 +519,27 @@ export default function SocConsole() {
     }
   }
 
+  async function selectInvestigation(investigationId: string) {
+    if (investigationBusy) return
+    setInvestigationBusy(true)
+    try {
+      const result = await getInvestigation(investigationId)
+      setInvestigation(result)
+      sessionStorage.setItem(investigationStorageKey, investigationId)
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : 'Investigation could not be loaded.'
+      )
+    } finally {
+      setInvestigationBusy(false)
+    }
+  }
+
   async function handleApproval(decision: ApprovalDecision) {
     const request = investigation?.approval_request
     if (!investigation || !request) return
-    if (!writeToken.trim()) {
-      toast.error(
-        'Add the human-held write token before submitting a decision.'
-      )
-      return
-    }
-    if (!approver.trim()) {
-      toast.error('Enter the approver identity.')
-      return
-    }
 
     let changes: Record<string, unknown>[] | undefined
     if (decision === 'modify') {
@@ -516,17 +554,13 @@ export default function SocConsole() {
 
     setInvestigationBusy(true)
     try {
-      const result = await submitApproval(
-        writeToken.trim(),
-        investigation.investigation_id,
-        {
-          decision,
-          approved_by: approver.trim(),
-          approval_id: request.approval_id,
-          ...(changes ? { modified_actions: changes } : {})
-        }
-      )
+      const result = await submitApproval(investigation.investigation_id, {
+        decision,
+        approval_id: request.approval_id,
+        ...(changes ? { modified_actions: changes } : {})
+      })
       setInvestigation(result)
+      void refreshInvestigationHistory()
       toast.success(`Decision recorded: ${decision}.`)
     } catch (error) {
       toast.error(
@@ -561,48 +595,30 @@ export default function SocConsole() {
             Agent workspace
           </button>
           <button
+            className={view === 'alert-triage' ? 'active' : ''}
+            onClick={() => setView('alert-triage')}
+          >
+            <ShieldAlert size={17} />
+            Alert Triage
+          </button>
+          <button
             className={view === 'investigations' ? 'active' : ''}
-            onClick={() => setView('investigations')}
+            onClick={() => {
+              setView('investigations')
+              void refreshInvestigationHistory()
+            }}
           >
             <FileSearch size={17} />
             Investigations
-            {investigation && <span className="nav-count">1</span>}
+            {pendingApprovalTotal > 0 && (
+              <span className="nav-count" title="Pending human approvals">
+                {pendingApprovalTotal}
+              </span>
+            )}
           </button>
         </nav>
 
         <div className="sidebar-spacer" />
-
-        <section className="connection-box">
-          <div className="connection-title">
-            <KeyRound size={15} />
-            <span>API access</span>
-          </div>
-          <label htmlFor="read-token">Read token</label>
-          <input
-            id="read-token"
-            type="password"
-            value={readToken}
-            onChange={(event) => setReadToken(event.target.value)}
-            placeholder="SOC read token"
-            autoComplete="off"
-          />
-          <label htmlFor="write-token">Approval token</label>
-          <input
-            id="write-token"
-            type="password"
-            value={writeToken}
-            onChange={(event) => setWriteToken(event.target.value)}
-            placeholder="Human-held write token"
-            autoComplete="off"
-          />
-          <button
-            className="button button-secondary button-full"
-            onClick={saveTokens}
-          >
-            <Check size={15} />
-            Save session
-          </button>
-        </section>
 
         <div className="service-indicator">
           <span
@@ -611,7 +627,7 @@ export default function SocConsole() {
           <div>
             <strong>{backendOnline ? 'API connected' : 'API offline'}</strong>
             <span>
-              {!tokensHydrated
+              {!environmentHydrated
                 ? 'Loading configuration'
                 : wazuhHealth?.status === 'healthy'
                   ? 'Wazuh services healthy'
@@ -626,10 +642,22 @@ export default function SocConsole() {
           <div>
             <span className="eyebrow">SOC operations console</span>
             <h1>
-              {view === 'chat' ? 'Agent workspace' : 'Investigation workflow'}
+              {view === 'chat'
+                ? 'Agent workspace'
+                : view === 'alert-triage'
+                  ? 'Alert Triage'
+                  : 'Investigation workflow'}
             </h1>
           </div>
           <div className="topbar-actions">
+            <div className="clerk-controls">
+              <OrganizationSwitcher
+                hidePersonal
+                afterCreateOrganizationUrl="/"
+                afterSelectOrganizationUrl="/"
+              />
+              <UserButton />
+            </div>
             <div
               className={`health-pill ${wazuhHealth?.status === 'healthy' ? 'healthy' : 'unhealthy'}`}
             >
@@ -807,16 +835,18 @@ export default function SocConsole() {
                   <div className="trace-list">
                     {[...activityTrace, ...liveActivities].map(
                       (activity, index) => (
-                        <div key={`${activity.tool || 'agent'}-${index}`}>
+                        <div
+                          key={
+                            activity.id ||
+                            `${activity.tool || 'agent'}-${index}`
+                          }
+                        >
                           {activity.status === 'completed' ? (
                             <CheckCircle2 size={14} />
+                          ) : activity.status === 'failed' ? (
+                            <AlertTriangle size={14} />
                           ) : (
-                            <RefreshCw
-                              size={14}
-                              className={
-                                activity.status === 'running' ? 'spin' : ''
-                              }
-                            />
+                            <RefreshCw size={14} className="spin" />
                           )}
                           <span>{activity.label}</span>
                         </div>
@@ -843,6 +873,14 @@ export default function SocConsole() {
                 </div>
               )}
             </aside>
+          </div>
+        ) : view === 'alert-triage' ? (
+          <div className="investigation-workspace">
+            <div className="investigation-empty">
+              <ShieldAlert size={28} />
+              <h2>Alert Triage</h2>
+              <p>No triage run selected</p>
+            </div>
           </div>
         ) : (
           <div className="investigation-workspace">
@@ -871,15 +909,82 @@ export default function SocConsole() {
                     pattern="[0-9]+"
                   />
                 </div>
-                <button
-                  className="button button-primary"
-                  type="submit"
-                  disabled={investigationBusy}
+                <Show
+                  when={{ permission: 'org:investigations:create' }}
+                  fallback={
+                    <span className="permission-notice">
+                      Investigation permission required
+                    </span>
+                  }
                 >
-                  <CircleGauge size={16} />
-                  Run workflow
-                </button>
+                  <button
+                    className="button button-primary"
+                    type="submit"
+                    disabled={investigationBusy}
+                  >
+                    <CircleGauge size={16} />
+                    Run workflow
+                  </button>
+                </Show>
               </form>
+            </Panel>
+
+            <Panel
+              title="Investigation history"
+              icon={<Clock3 size={17} />}
+              action={
+                <button
+                  className="icon-button"
+                  onClick={() => void refreshInvestigationHistory()}
+                  title="Refresh investigation history"
+                  aria-label="Refresh investigation history"
+                  disabled={historyBusy}
+                >
+                  <RefreshCw size={16} className={historyBusy ? 'spin' : ''} />
+                </button>
+              }
+            >
+              <div className="history-list">
+                {investigationHistory.map((item) => (
+                  <button
+                    key={item.investigation_id}
+                    className={
+                      investigation?.investigation_id === item.investigation_id
+                        ? 'active'
+                        : ''
+                    }
+                    onClick={() =>
+                      void selectInvestigation(item.investigation_id)
+                    }
+                    disabled={investigationBusy}
+                  >
+                    <div>
+                      <strong>{item.alert_id}</strong>
+                      <span>{item.investigation_id}</span>
+                    </div>
+                    <div className="history-tiers">
+                      {item.completed_tiers.length > 0
+                        ? item.completed_tiers
+                            .map((tier) => tier.toUpperCase())
+                            .join(' / ')
+                        : 'Queued'}
+                    </div>
+                    <StatusBadge value={item.status} />
+                    <time>
+                      {item.updated_at
+                        ? new Date(item.updated_at).toLocaleString()
+                        : '-'}
+                    </time>
+                    <ChevronRight size={16} />
+                  </button>
+                ))}
+                {!historyBusy && investigationHistory.length === 0 && (
+                  <div className="panel-empty">
+                    <Clock3 size={20} />
+                    <span>No persisted investigations</span>
+                  </div>
+                )}
+              </div>
             </Panel>
 
             {investigation ? (
@@ -1016,61 +1121,64 @@ export default function SocConsole() {
                                 <StatusBadge value={action.risk_level} />
                               </div>
                               <span>{action.target}</span>
+                              <code>{action.execution_preview}</code>
                               <p>{action.reason}</p>
                               <small>{action.operational_impact}</small>
                             </article>
                           )
                         )}
                       </div>
-                      <div className="approval-form">
-                        <div className="field">
-                          <label htmlFor="approver">Approver identity</label>
-                          <input
-                            id="approver"
-                            value={approver}
-                            onChange={(event) =>
-                              setApprover(event.target.value)
-                            }
-                            placeholder="analyst@example.com"
-                          />
+                      <Show
+                        when={{ permission: 'org:responses:approve' }}
+                        fallback={
+                          <div className="permission-notice">
+                            A responder or administrator must review these
+                            actions.
+                          </div>
+                        }
+                      >
+                        <div className="approval-form">
+                          <div className="field field-full">
+                            <label htmlFor="modified-actions">
+                              Modified actions JSON
+                            </label>
+                            <textarea
+                              id="modified-actions"
+                              value={modifiedActions}
+                              onChange={(event) =>
+                                setModifiedActions(event.target.value)
+                              }
+                              rows={6}
+                            />
+                          </div>
+                          <div className="approval-buttons field-full">
+                            <button
+                              className="button button-danger"
+                              onClick={() => void handleApproval('reject')}
+                              disabled={investigationBusy}
+                            >
+                              <X size={16} />
+                              Reject all
+                            </button>
+                            <button
+                              className="button button-secondary"
+                              onClick={() => void handleApproval('modify')}
+                              disabled={investigationBusy}
+                            >
+                              <ListChecks size={16} />
+                              Save changes for re-review
+                            </button>
+                            <button
+                              className="button button-primary"
+                              onClick={() => void handleApproval('approve')}
+                              disabled={investigationBusy}
+                            >
+                              <Check size={16} />
+                              Approve and execute
+                            </button>
+                          </div>
                         </div>
-                        <div className="field field-full">
-                          <label htmlFor="modified-actions">
-                            Modified actions JSON
-                          </label>
-                          <textarea
-                            id="modified-actions"
-                            value={modifiedActions}
-                            onChange={(event) =>
-                              setModifiedActions(event.target.value)
-                            }
-                            rows={6}
-                          />
-                        </div>
-                        <div className="approval-buttons field-full">
-                          <button
-                            className="button button-danger"
-                            onClick={() => void handleApproval('reject')}
-                          >
-                            <X size={16} />
-                            Reject
-                          </button>
-                          <button
-                            className="button button-secondary"
-                            onClick={() => void handleApproval('modify')}
-                          >
-                            <ListChecks size={16} />
-                            Modify
-                          </button>
-                          <button
-                            className="button button-primary"
-                            onClick={() => void handleApproval('approve')}
-                          >
-                            <Check size={16} />
-                            Approve
-                          </button>
-                        </div>
-                      </div>
+                      </Show>
                     </Panel>
                   )}
 

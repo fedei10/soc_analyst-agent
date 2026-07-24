@@ -12,15 +12,13 @@ and every response carries an X-Request-ID header for log correlation.
 import logging
 import uuid
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from opensearchpy import exceptions as opensearch_exc
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.staticfiles import StaticFiles
 
 from app.api.v1.endpoints.health import router as health_router
 from app.api.v1.endpoints.investigations import read as investigation_read_router
@@ -28,6 +26,14 @@ from app.api.v1.endpoints.investigations import write as investigation_write_rou
 from app.api.v1.endpoints.wazuh import read as wazuh_read_router
 from app.api.v1.endpoints.wazuh import write as wazuh_write_router
 from app.services.wazuh.dependencies import close_wazuh_dependencies
+from app.coreAgents.orchestration.investigation_service import (
+    close_investigation_service,
+)
+from app.coreAgents.orchestration.conversation_agent import (
+    close_soc_chat_agent,
+)
+from app.db.session import close_database
+from app.db.repositories.investigations import close_investigation_repository
 from app.services.wazuh.exceptions import (
     WazuhAPIError,
     WazuhAuthError,
@@ -35,26 +41,33 @@ from app.services.wazuh.exceptions import (
     WazuhPermissionError,
     WazuhValidationError,
 )
+from app.services.redis.connection import close_redis_connection
 
 logger = logging.getLogger("tsage.api")
-STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     yield
+    close_soc_chat_agent()
+    close_investigation_service()
     close_wazuh_dependencies()
+    close_investigation_repository()
+    close_database()
+    close_redis_connection()
 
 app = FastAPI(
     title="tsage SOC API",
     version="1.0.0",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
     description=(
-        "Wazuh-backed SOC platform API. Read endpoints need a wazuh:read bearer "
-        "token (SOC L1/L2 agents); response actions need a human-held wazuh:write token."
+        "Wazuh-backed SOC platform API. Application endpoints require a verified "
+        "Clerk organization session and explicit SOC permissions."
     ),
     lifespan=lifespan,
 )
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.include_router(health_router, prefix="/api/v1")
 app.include_router(wazuh_read_router, prefix="/api/v1")
 app.include_router(wazuh_write_router, prefix="/api/v1")
@@ -235,8 +248,3 @@ async def unhandled_error_handler(request: Request, exc: Exception):
 def liveness():
     """Bare liveness probe for uptime monitors and load balancers."""
     return {"status": "ok"}
-
-
-@app.get("/soc", include_in_schema=False)
-def soc_console():
-    return FileResponse(STATIC_DIR / "soc" / "index.html")

@@ -18,7 +18,7 @@ from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 
-from app.api.auth.deps import require_read, require_write
+from app.api.auth.deps import AuthPrincipal, require_read, require_write
 from app.api.v1.schemas.wazuh import ActiveResponseRequest, RestartAgentRequest
 from app.services.wazuh.dependencies import get_wazuh_gateway, get_wazuh_responder
 from app.services.wazuh.gateway import WazuhGateway
@@ -397,9 +397,10 @@ def run_active_response(
     Queue an active-response command on an agent (block IP, deny host, ...).
     202: Wazuh queues the command; verify the effect via alerts/inventory reads.
     """
+    principal: AuthPrincipal = request.state.principal
     logger.info(
         "active-response command=%s agent=%s approved_by=%s request_id=%s",
-        body.command, agent_id, body.approved_by,
+        body.command, agent_id, principal.user_id,
         getattr(request.state, "request_id", "-"),
     )
     responder.run_active_response(
@@ -412,7 +413,7 @@ def run_active_response(
         "agent_id": agent_id,
         "command": body.command,
         "status": "queued",
-        "approved_by": body.approved_by,
+        "approved_by": principal.user_id,
     }}
 
 
@@ -424,9 +425,16 @@ def restart_agent(
     responder: ResponderDep,
 ):
     """Restart the Wazuh agent process on the endpoint."""
+    principal: AuthPrincipal = request.state.principal
     logger.info(
         "agent-restart agent=%s approved_by=%s request_id=%s",
-        agent_id, body.approved_by, getattr(request.state, "request_id", "-"),
+        agent_id, principal.user_id, getattr(request.state, "request_id", "-"),
     )
     responder.restart_agent(agent_id)
-    return {"data": {"agent_id": agent_id, "status": "restart_queued", "approved_by": body.approved_by}}
+    return {
+        "data": {
+            "agent_id": agent_id,
+            "status": "restart_queued",
+            "approved_by": principal.user_id,
+        }
+    }

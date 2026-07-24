@@ -34,6 +34,13 @@ class RawAlertDocument(BaseModel):
 
 class ArchivedLogSearchResult(BaseModel):
     index_pattern: str
+    archive_status: Literal[
+        "available",
+        "unavailable",
+        "partial",
+        "unknown",
+    ] = "unknown"
+    query_scope: dict[str, Any] = Field(default_factory=dict)
     total: int = Field(ge=0)
     returned: int = Field(ge=0)
     truncated: bool
@@ -65,11 +72,20 @@ class AuthenticationTimeline(BaseModel):
 
 
 class SuccessfulLoginAnalysis(BaseModel):
+    successful_login_search_completed: bool = True
+    search_scope: dict[str, Any] = Field(default_factory=dict)
+    returned_authentication_events: int = Field(default=0, ge=0)
     failed_attempt_count: int = Field(ge=0)
     first_failure: datetime | None = None
     last_failure: datetime | None = None
     successful_login_found: bool
+    successful_login_observed: bool = False
     successful_login_timestamp: datetime | None = None
+    conclusion: Literal[
+        "successful_login_observed",
+        "no_success_in_returned_alerts",
+        "no_failures_in_returned_alerts",
+    ] = "no_success_in_returned_alerts"
     evidence_alert_ids: list[str]
     confidence: float = Field(ge=0.0, le=1.0)
     truncated: bool
@@ -84,11 +100,19 @@ class AttributionResult(BaseModel):
         "insufficient_telemetry",
     ]
     source_ip: str | None = None
+    source_address_scope: Literal[
+        "private",
+        "public",
+        "reserved_or_unknown",
+    ] = "reserved_or_unknown"
     target_user: str | None = None
+    attributed_person: None = None
     confidence: float = Field(ge=0.0, le=1.0)
     disposition: Literal["investigate_and_monitor"] = "investigate_and_monitor"
     containment_recommended: bool = False
     successful_login_after_failures: bool | None = None
+    successful_login_search_completed: bool = False
+    authentication_search_truncated: bool = False
     known_facts: list[str] = Field(default_factory=list)
     evidence_checked: list[dict[str, Any]] = Field(default_factory=list)
     missing_evidence: list[str] = Field(default_factory=list)
@@ -107,12 +131,30 @@ class RuleMitreContext(BaseModel):
     techniques: list[dict] = Field(default_factory=list)
 
 
+class EndpointInventory(BaseModel):
+    agent_id: str
+    component: Literal[
+        "processes",
+        "ports",
+        "packages",
+        "os",
+        "network",
+        "hotfixes",
+    ]
+    total: int = Field(ge=0)
+    returned: int = Field(ge=0)
+    truncated: bool
+    items: list[dict[str, Any]]
+
+
 class DetectionEvidence(BaseModel):
     agent_id: str
     fim_findings: list[dict]
     sca_findings: list[dict]
+    rootcheck_findings: list[dict] = Field(default_factory=list)
     fim_total: int = Field(ge=0)
     sca_total: int = Field(ge=0)
+    rootcheck_total: int = Field(default=0, ge=0)
     truncated: bool
 
 

@@ -26,10 +26,14 @@ from app.coreAgents.orchestration.schemas import (
     RuntimeStartInvestigationInput,
 )
 from app.coreAgents.tools.wazuh._common import run
+from app.coreAgents.tools.system.schemas import SystemDiagnosticInput
 from app.coreAgents.tools.wazuh.schemas import (
     AgentTimeWindowInput,
     ArchivedLogSearchInput,
+    DetectionEvidenceInput,
+    EndpointInventoryInput,
     LogStatisticsInput,
+    RuleMitreContextInput,
     RuntimeAttributionInvestigationInput,
     AuthenticationTimelineInput,
     HighSeverityAlertsInput,
@@ -38,13 +42,67 @@ from app.coreAgents.tools.wazuh.schemas import (
     RuntimeAgentSummaryInput,
     RuntimeAlertByIdInput,
     SuccessfulLoginInput,
+    VulnerabilitySearchInput,
 )
 from app.services.wazuh.dependencies import get_wazuh_gateway
 from app.services.wazuh.gateway import WazuhGateway
 from app.services.wazuh.models import AttributionResult
+from app.services.system.diagnostics import get_system_diagnostic_service
 
 
 MAX_INVESTIGATION_STEPS = 8
+INVENTORY_ANALYSIS_FIELDS = {
+    "processes": {
+        "agent_id",
+        "argvs",
+        "cmd",
+        "euser",
+        "name",
+        "pid",
+        "ppid",
+        "resident",
+        "scan",
+        "start_time",
+        "state",
+        "stime",
+        "utime",
+    },
+    "ports": {
+        "agent_id",
+        "local",
+        "pid",
+        "process",
+        "protocol",
+        "remote",
+        "scan",
+        "state",
+    },
+    "packages": {
+        "agent_id",
+        "architecture",
+        "format",
+        "install_time",
+        "location",
+        "name",
+        "scan",
+        "source",
+        "vendor",
+        "version",
+    },
+    "network": {
+        "adapter",
+        "agent_id",
+        "ipv4",
+        "ipv6",
+        "mac",
+        "mtu",
+        "name",
+        "scan",
+        "state",
+        "type",
+    },
+    "hotfixes": {"agent_id", "hotfix", "scan"},
+}
 
 
 def _severity_for_level(level: int | None) -> str | None:
@@ -64,6 +122,22 @@ def _severity_for_level(level: int | None) -> str | None:
 def _append_unique(values: list[str], value: str | None) -> None:
     if value and value not in values:
         values.append(value)
+
+
+def _inventory_for_analysis(inventory) -> dict[str, Any]:
+    data = inventory.model_dump(mode="json")
+    fields = INVENTORY_ANALYSIS_FIELDS.get(inventory.component)
+    if fields:
+        data["items"] = [
+            {
+                key: value
+                for key, value in item.items()
+                if key in fields and value is not None
+            }
+            for item in data["items"]
+        ]
+        data["normalized_for_analysis"] = True
+    return data
 
 
 def _payload_error(payload: dict[str, Any], tool_name: str) -> dict[str, Any] | None:
@@ -138,12 +212,16 @@ def _state_result(
 def build_soc_chat_tools(
     gateway: WazuhGateway | None = None,
     investigation_service: InvestigationService | None = None,
+    diagnostic_service=None,
 ) -> list:
     def current_gateway() -> WazuhGateway:
         return gateway or get_wazuh_gateway()
 
     def current_investigations() -> InvestigationService:
         return investigation_service or get_investigation_service()
+
+    def current_diagnostics():
+        return diagnostic_service or get_system_diagnostic_service()
 
     @tool("get_recent_wazuh_alerts", args_schema=RecentAlertsInput)
     def get_recent_wazuh_alerts(
@@ -416,7 +494,14 @@ def build_soc_chat_tools(
         center_time: datetime | None = None,
         window_minutes: int = 30,
     ) -> dict:
-        """Check whether a successful login followed authentication failures."""
+        """
+        Check whether a successful login followed authentication failures.
+
+        This check is required before claiming that access did or did not
+        succeed. Prefer source_ip plus agent_id without target_user so a success
+        under a different account is not missed. A negative result only means
+        no success was found in the bounded returned Wazuh alerts.
+        """
         return run(
             lambda: current_gateway()
             .check_successful_login_after_failures(
@@ -567,6 +652,8 @@ def build_soc_chat_tools(
             )
 
         auth_events: list[dict[str, Any]] = []
+        auth_search_completed = False
+        auth_search_truncated = False
         if (
             len(evidence_checked) < MAX_INVESTIGATION_STEPS
             and agent_id
@@ -575,7 +662,7 @@ def build_soc_chat_tools(
             auth_payload = run(
                 lambda: gateway_instance.build_authentication_timeline(
                     source_ip=str(source_ip) if source_ip else None,
-                    target_user=str(target_user) if target_user else None,
+                    target_user=None,
                     agent_id=str(agent_id),
                     center_time=center_time,
                     window_minutes=window_minutes,
@@ -588,6 +675,11 @@ def build_soc_chat_tools(
                 if isinstance(auth_data, dict)
                 else []
             )
+            auth_search_completed = auth_payload.get("ok") is True
+            auth_search_truncated = bool(
+                isinstance(auth_data, dict)
+                and auth_data.get("truncated")
+            )
             record(
                 "build_authentication_timeline",
                 auth_payload,
@@ -597,10 +689,8 @@ def build_soc_chat_tools(
                     for item in auth_events[:20]
                     if isinstance(item, dict)
                 ],
-                truncated=bool(
-                    isinstance(auth_data, dict)
-                    and auth_data.get("truncated")
-                ),
+                truncated=auth_search_truncated,
+                scope="source IP and agent; any target user",
             )
 
         archive_events: list[dict[str, Any]] = []
@@ -641,6 +731,11 @@ def build_soc_chat_tools(
                 truncated=bool(
                     isinstance(archive_data, dict)
                     and archive_data.get("truncated")
+                ),
+                archive_status=(
+                    archive_data.get("archive_status")
+                    if isinstance(archive_data, dict)
+                    else "unknown"
                 ),
             )
 
@@ -710,7 +805,7 @@ def build_soc_chat_tools(
         failures = [
             item for item in auth_events if item.get("event_outcome") == "failure"
         ]
-        last_failure = max(
+        first_failure = min(
             (
                 timestamp
                 for item in failures
@@ -722,9 +817,9 @@ def build_soc_chat_tools(
             item
             for item in auth_events
             if item.get("event_outcome") == "success"
-            and last_failure is not None
+            and first_failure is not None
             and (timestamp := _iso_datetime(item.get("timestamp"))) is not None
-            and timestamp > last_failure
+            and timestamp > first_failure
         ]
         successful_login_after_failures = (
             bool(successes_after_failure) if failures else None
@@ -769,8 +864,16 @@ def build_soc_chat_tools(
                 (
                     "A successful login followed the observed failures."
                     if successful_login_after_failures
-                    else "No successful login was found after the observed failures."
+                    else (
+                        "No successful login was found in the returned "
+                        "authentication alerts after the first failure."
+                    )
                 ),
+            )
+        if auth_search_truncated:
+            _append_unique(
+                known_facts,
+                "The authentication search was truncated; coverage is incomplete.",
             )
 
         missing_evidence = [
@@ -809,13 +912,32 @@ def build_soc_chat_tools(
             ),
         }[attribution_status]
 
+        source_address_scope = "reserved_or_unknown"
+        if source_ip:
+            try:
+                parsed_source = ipaddress.ip_address(str(source_ip))
+                source_address_scope = (
+                    "private"
+                    if parsed_source.is_private
+                    else (
+                        "public"
+                        if parsed_source.is_global
+                        else "reserved_or_unknown"
+                    )
+                )
+            except ValueError:
+                pass
+
         attribution = AttributionResult(
             alert_id=alert_id,
             status=attribution_status,
             source_ip=str(source_ip) if source_ip else None,
+            source_address_scope=source_address_scope,
             target_user=str(target_user) if target_user else None,
             confidence=confidence,
             successful_login_after_failures=successful_login_after_failures,
+            successful_login_search_completed=auth_search_completed,
+            authentication_search_truncated=auth_search_truncated,
             known_facts=known_facts,
             evidence_checked=evidence_checked,
             missing_evidence=missing_evidence,
@@ -889,6 +1011,103 @@ def build_soc_chat_tools(
             active_agent_id=agent_id,
         )
 
+    @tool("get_endpoint_inventory", args_schema=EndpointInventoryInput)
+    def get_endpoint_inventory(
+        agent_id: str,
+        component: str,
+        limit: int = 20,
+        text: str | None = None,
+    ) -> dict:
+        """
+        Retrieve one bounded endpoint inventory category.
+
+        Use for observed processes, listening ports, installed packages,
+        operating-system details, network interfaces, or hotfixes. The category
+        is allowlisted; arbitrary Wazuh paths are never accepted.
+        """
+        return run(
+            lambda: _inventory_for_analysis(
+                current_gateway().get_agent_inventory(
+                    agent_id=agent_id,
+                    component=component,
+                    limit=limit,
+                    text=text,
+                )
+            )
+        )
+
+    @tool(
+        "get_endpoint_security_findings",
+        args_schema=DetectionEvidenceInput,
+    )
+    def get_endpoint_security_findings(
+        agent_id: str,
+        limit: int = 20,
+    ) -> dict:
+        """
+        Retrieve bounded FIM, SCA, and rootcheck findings for one endpoint.
+
+        Use to validate file changes, configuration gaps, or rootcheck findings
+        associated with an observed Wazuh agent.
+        """
+        return run(
+            lambda: current_gateway()
+            .get_detection_evidence(agent_id=agent_id, limit=limit)
+            .model_dump(mode="json")
+        )
+
+    @tool(
+        "search_endpoint_vulnerabilities",
+        args_schema=VulnerabilitySearchInput,
+    )
+    def search_endpoint_vulnerabilities(
+        severity: str | None = None,
+        agent_id: str | None = None,
+        limit: int = 20,
+    ) -> dict:
+        """Search bounded Wazuh vulnerability state by endpoint and severity."""
+
+        def fetch() -> dict:
+            vulnerabilities, total = current_gateway().search_vulnerabilities(
+                severity=severity,
+                agent_id=agent_id,
+                limit=limit,
+            )
+            return {
+                "total": total,
+                "returned": len(vulnerabilities),
+                "truncated": total > len(vulnerabilities),
+                "vulnerabilities": vulnerabilities,
+            }
+
+        return run(fetch)
+
+    @tool(
+        "get_detection_rule_context",
+        args_schema=RuleMitreContextInput,
+    )
+    def get_detection_rule_context(rule_id: str) -> dict:
+        """Retrieve one Wazuh rule and its Wazuh-provided MITRE context."""
+
+        def fetch() -> dict:
+            context = current_gateway().get_rule_and_mitre_context(rule_id)
+            return {
+                "found": context is not None,
+                "context": context.model_dump(mode="json") if context else None,
+            }
+
+        return run(fetch)
+
+    @tool("collect_host_diagnostic", args_schema=SystemDiagnosticInput)
+    def collect_host_diagnostic(diagnostic: str) -> dict:
+        """
+        Run one fixed read-only diagnostic on the TSAGE API host.
+
+        This accepts an allowlisted diagnostic name, never shell text or
+        arguments. Use Wazuh endpoint tools for remote agent evidence.
+        """
+        return run(lambda: current_diagnostics().collect(diagnostic))
+
     @tool("start_investigation", args_schema=RuntimeStartInvestigationInput)
     def start_investigation(
         alert_id: str,
@@ -896,32 +1115,78 @@ def build_soc_chat_tools(
         runtime: ToolRuntime[SOCChatContext, SOCChatState],
     ) -> Command:
         """
-        Start the formal L1/L2/L3 workflow for a verified Wazuh alert.
+        Start the formal L1/L2/L3 workflow after an exact Wazuh lookup.
 
-        Use only for an exact alert ID already observed through a read tool.
-        This tool never approves or executes a response action.
+        The tool verifies the supplied alert ID itself and fails closed when the
+        alert is absent. It never approves or executes a response action.
         """
-        if runtime.state.get("active_alert_id") != alert_id:
+        verification = run(
+            lambda: (
+                alert.model_dump(mode="json")
+                if (alert := current_gateway().get_alert_by_id(alert_id))
+                else None
+            )
+        )
+        if not verification.get("ok"):
+            return _state_result(runtime, verification)
+
+        alert = verification.get("data")
+        if not isinstance(alert, dict):
             return _state_result(
                 runtime,
                 {
                     "ok": False,
                     "error": {
-                        "code": "ALERT_NOT_VERIFIED",
+                        "code": "ALERT_NOT_FOUND",
                         "message": (
-                            "Retrieve this exact alert with get_alert_details "
-                            "before starting a formal investigation."
+                            "The exact Wazuh alert was not found; no formal "
+                            "investigation was started."
+                        ),
+                        "retryable": False,
+                    },
+                },
+            )
+
+        try:
+            snapshot = current_investigations().start(
+                alert_id=alert_id,
+                agent_id=(
+                    str(alert["agent_id"]) if alert.get("agent_id") else None
+                ),
+                initiated_by=runtime.context.user_id,
+                initiation_reason=reason,
+                organization_id=runtime.context.organization_id,
+                owner_user_id=runtime.context.user_id,
+            )
+        except Exception:
+            return _state_result(
+                runtime,
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "INVESTIGATION_START_FAILED",
+                        "message": (
+                            "The alert was verified, but the formal workflow "
+                            "could not be started."
                         ),
                         "retryable": True,
                     },
                 },
+                active_alert_id=alert_id,
+                active_agent_id=(
+                    str(alert["agent_id"]) if alert.get("agent_id") else None
+                ),
             )
-        snapshot = current_investigations().start(
-            alert_id=alert_id,
-            initiated_by="soc_chat_agent",
-            initiation_reason=reason,
-        )
-        payload = {"ok": True, "data": snapshot}
+
+        payload = {
+            "ok": True,
+            "data": snapshot,
+            "verification": {
+                "alert_id": alert_id,
+                "agent_id": alert.get("agent_id"),
+                "rule_id": alert.get("rule_id"),
+            },
+        }
         return _state_result(
             runtime,
             payload,
@@ -930,6 +1195,16 @@ def build_soc_chat_tools(
             active_agent_id=snapshot.get("agent_id"),
             current_severity=snapshot.get("severity"),
             current_investigation_stage=snapshot["current_stage"],
+            attempted_tools=[
+                *runtime.state.get("attempted_tools", []),
+                "get_alert_details",
+                "start_investigation",
+            ][-50:],
+            known_facts=[
+                f"Alert {alert_id} was verified before workflow startup.",
+                f"Alert rule: {alert.get('rule_id') or 'not recorded'}.",
+                f"Affected agent: {alert.get('agent_id') or 'not recorded'}.",
+            ],
         )
 
     @tool(
@@ -942,7 +1217,10 @@ def build_soc_chat_tools(
     ) -> Command:
         """Retrieve current state and validated results for an investigation."""
         try:
-            snapshot = current_investigations().snapshot(investigation_id)
+            snapshot = current_investigations().snapshot(
+                investigation_id,
+                organization_id=runtime.context.organization_id,
+            )
             payload = {"ok": True, "data": snapshot}
             return _state_result(
                 runtime,
@@ -996,6 +1274,11 @@ def build_soc_chat_tools(
         check_successful_login_after_failures,
         investigate_alert_attribution,
         get_endpoint_context,
+        get_endpoint_inventory,
+        get_endpoint_security_findings,
+        search_endpoint_vulnerabilities,
+        get_detection_rule_context,
+        collect_host_diagnostic,
         get_open_investigations,
         start_investigation,
         get_investigation_status,

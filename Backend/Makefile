@@ -1,7 +1,8 @@
 WAZUH_SSH   := soclab@192.168.100.15
 TUNNEL_SOCK := /tmp/wazuh-tunnel-$(USER).sock
+DATABASE_ENV ?= .env.local
 
-.PHONY: tunnel tunnel-stop tunnel-status
+.PHONY: tunnel tunnel-stop tunnel-status storage-up storage-down storage-status storage-init retention-clean database-up database-down database-init
 
 tunnel: ## start SSH tunnel to Wazuh on PC1 (9200 indexer, 55000 API)
 	@ssh -S $(TUNNEL_SOCK) -O check $(WAZUH_SSH) 2>/dev/null && echo "tunnel already running" || ( \
@@ -17,3 +18,24 @@ tunnel-stop:
 
 tunnel-status:
 	@ssh -S $(TUNNEL_SOCK) -O check $(WAZUH_SSH) 2>/dev/null && echo "tunnel up" || echo "tunnel down"
+
+storage-up:
+	docker compose --env-file $(DATABASE_ENV) up -d --wait postgres redis
+
+storage-down:
+	docker compose --env-file $(DATABASE_ENV) down
+
+storage-status:
+	docker compose --env-file $(DATABASE_ENV) ps
+
+storage-init:
+	venv/bin/python -m app.db.setup
+
+retention-clean:
+	venv/bin/python -m app.db.retention
+
+database-up: storage-up
+
+database-down: storage-down
+
+database-init: storage-init

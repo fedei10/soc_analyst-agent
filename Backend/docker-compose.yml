@@ -1,0 +1,43 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${TSAGE_POSTGRES_DB:-tsage}
+      POSTGRES_USER: ${TSAGE_POSTGRES_USER:-tsage}
+      POSTGRES_PASSWORD: ${TSAGE_POSTGRES_PASSWORD:-tsage-local-dev-only}
+    ports:
+      - "${TSAGE_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - tsage-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    environment:
+      TSAGE_REDIS_PASSWORD: ${TSAGE_REDIS_PASSWORD:-tsage-redis-local-dev-only}
+    command:
+      - sh
+      - -c
+      - >-
+        exec redis-server --save '' --appendonly no
+        --requirepass "$${TSAGE_REDIS_PASSWORD}"
+    ports:
+      - "${TSAGE_REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          redis-cli --no-auth-warning -a "$${TSAGE_REDIS_PASSWORD}" ping
+          | grep -q PONG
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  tsage-postgres-data:

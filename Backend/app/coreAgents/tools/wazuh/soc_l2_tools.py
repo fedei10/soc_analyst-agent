@@ -86,9 +86,12 @@ def build_l2_tools(gateway: WazuhGateway | None = None) -> list[StructuredTool]:
             func=check_successful_login_after_failures,
             name="check_successful_login_after_failures",
             description=(
-                "Read-only deterministic check for a successful login after failed attempts. "
-                "The service performs all counting and timestamp comparison and returns the "
-                "evidence IDs, confidence, and truncation state."
+                "Required read-only check before claiming whether access followed "
+                "authentication failures. Search broadly by source IP and agent; omit "
+                "target_user when checking whether the same source succeeded as another "
+                "account. Returns explicit query scope, completion, evidence IDs, and "
+                "truncation state. A negative result means no success in returned alerts, "
+                "not proof that access never occurred."
             ),
             args_schema=SuccessfulLoginInput,
         ),

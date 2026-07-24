@@ -1,7 +1,7 @@
 """Application-facing Wazuh operations used by API routes and SOC tools."""
 
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 from app.services.wazuh.indexer_client import WazuhIndexerClient
 from app.services.wazuh.models import (
@@ -11,6 +11,7 @@ from app.services.wazuh.models import (
     ArchivedLogSearchResult,
     AuthenticationTimeline,
     DetectionEvidence,
+    EndpointInventory,
     RawAlertDocument,
     RuleMitreContext,
     SuccessfulLoginAnalysis,
@@ -171,6 +172,53 @@ class WazuhGateway:
             last_keep_alive=item.get("lastKeepAlive"),
         )
 
+    def get_agent_inventory(
+        self,
+        *,
+        agent_id: str,
+        component: Literal[
+            "processes",
+            "ports",
+            "packages",
+            "os",
+            "network",
+            "hotfixes",
+        ],
+        limit: int = 50,
+        text: str | None = None,
+    ) -> EndpointInventory:
+        """Return one allowlisted, bounded syscollector inventory component."""
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100.")
+        paths = {
+            "processes": "processes",
+            "ports": "ports",
+            "packages": "packages",
+            "os": "os",
+            "network": "netiface",
+            "hotfixes": "hotfixes",
+        }
+        syscollector_component = paths.get(component)
+        if syscollector_component is None:
+            raise ValueError("Unsupported endpoint inventory component.")
+        params: dict[str, Any] = {"limit": limit}
+        if text:
+            params["search"] = text
+        payload = self.server.get(
+            f"/syscollector/{agent_id}/{syscollector_component}",
+            params=params,
+        )
+        items = _items(payload)
+        total = _total(payload)
+        return EndpointInventory(
+            agent_id=agent_id,
+            component=component,
+            total=total,
+            returned=len(items),
+            truncated=total > len(items),
+            items=items,
+        )
+
     def get_related_alerts(
         self, *, alert_id: str, hours: int = 24, limit: int = 100
     ) -> AlertSearchResult:
@@ -259,26 +307,49 @@ class WazuhGateway:
             center_time=center_time,
             window_minutes=window_minutes,
         )
-        failures = [event for event in timeline.events if event.event_outcome == "failure"]
+        events = sorted(timeline.events, key=lambda event: event.timestamp)
+        failures = [
+            event for event in events if event.event_outcome == "failure"
+        ]
+        first_failure = failures[0].timestamp if failures else None
         last_failure = failures[-1].timestamp if failures else None
         successes = [
             event
-            for event in timeline.events
+            for event in events
             if event.event_outcome == "success"
-            and last_failure is not None
-            and event.timestamp > last_failure
+            and first_failure is not None
+            and event.timestamp > first_failure
         ]
         success = successes[0] if successes else None
-        evidence_ids = [event.alert_id for event in failures]
         if success:
-            evidence_ids.append(success.alert_id)
+            conclusion = "successful_login_observed"
+        elif failures:
+            conclusion = "no_success_in_returned_alerts"
+        else:
+            conclusion = "no_failures_in_returned_alerts"
         return SuccessfulLoginAnalysis(
+            successful_login_search_completed=True,
+            search_scope={
+                "source": "wazuh-alerts-*",
+                "source_ip": source_ip,
+                "target_user": target_user,
+                "agent_id": agent_id,
+                "hours": hours,
+                "center_time": (
+                    center_time.isoformat() if center_time else None
+                ),
+                "window_minutes": window_minutes,
+                "limit": limit,
+            },
+            returned_authentication_events=timeline.returned,
             failed_attempt_count=len(failures),
-            first_failure=failures[0].timestamp if failures else None,
+            first_failure=first_failure,
             last_failure=last_failure,
             successful_login_found=success is not None,
+            successful_login_observed=success is not None,
             successful_login_timestamp=success.timestamp if success else None,
-            evidence_alert_ids=evidence_ids,
+            conclusion=conclusion,
+            evidence_alert_ids=[event.alert_id for event in events],
             confidence=1.0 if timeline.events and not timeline.truncated else 0.5,
             truncated=timeline.truncated,
         )
@@ -314,17 +385,29 @@ class WazuhGateway:
     def get_detection_evidence(self, *, agent_id: str, limit: int = 100) -> DetectionEvidence:
         fim = self.server.get("/syscheck/{agent_id}".format(agent_id=agent_id), params={"limit": limit})
         sca = self.server.get("/sca/{agent_id}".format(agent_id=agent_id), params={"limit": limit})
+        rootcheck = self.server.get(
+            "/rootcheck/{agent_id}".format(agent_id=agent_id),
+            params={"limit": limit},
+        )
         fim_items = _items(fim)
         sca_items = _items(sca)
+        rootcheck_items = _items(rootcheck)
         fim_total = _total(fim)
         sca_total = _total(sca)
+        rootcheck_total = _total(rootcheck)
         return DetectionEvidence(
             agent_id=agent_id,
             fim_findings=fim_items,
             sca_findings=sca_items,
+            rootcheck_findings=rootcheck_items,
             fim_total=fim_total,
             sca_total=sca_total,
-            truncated=fim_total > len(fim_items) or sca_total > len(sca_items),
+            rootcheck_total=rootcheck_total,
+            truncated=(
+                fim_total > len(fim_items)
+                or sca_total > len(sca_items)
+                or rootcheck_total > len(rootcheck_items)
+            ),
         )
 
     def alert_summary(self, hours: int = 24) -> dict[str, Any]:

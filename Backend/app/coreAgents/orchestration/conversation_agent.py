@@ -20,6 +20,16 @@ from app.coreAgents.orchestration.conversation_tools import (
 from app.coreAgents.tools.python_functions.yaml_loader import (
     load_prompt_template,
 )
+from app.db.checkpointer import (
+    CheckpointerHandle,
+    create_investigation_checkpointer,
+)
+from app.db.store import StoreHandle, create_memory_store
+from app.db.sanitization import sanitize_for_storage
+
+
+_chat_checkpointer: CheckpointerHandle | None = None
+_chat_store: StoreHandle | None = None
 
 
 @dynamic_prompt
@@ -62,6 +72,7 @@ def create_soc_chat_agent(
     model=None,
     tools=None,
     checkpointer=None,
+    store=None,
 ):
     return create_agent(
         model=model or get_agent_model("chat"),
@@ -73,10 +84,47 @@ def create_soc_chat_agent(
         state_schema=SOCChatState,
         context_schema=SOCChatContext,
         checkpointer=checkpointer or InMemorySaver(),
+        store=store,
         name="soc_chat_agent",
     )
 
 
 @lru_cache(maxsize=1)
 def get_soc_chat_agent():
-    return create_soc_chat_agent()
+    global _chat_checkpointer, _chat_store
+
+    _chat_checkpointer = create_investigation_checkpointer()
+    _chat_store = create_memory_store()
+    return create_soc_chat_agent(
+        checkpointer=_chat_checkpointer.saver,
+        store=_chat_store.store,
+    )
+
+
+def close_soc_chat_agent() -> None:
+    global _chat_checkpointer, _chat_store
+
+    get_soc_chat_agent.cache_clear()
+    if _chat_store is not None:
+        _chat_store.close()
+        _chat_store = None
+    if _chat_checkpointer is not None:
+        _chat_checkpointer.close()
+        _chat_checkpointer = None
+
+
+def put_curated_soc_memory(
+    *,
+    namespace: tuple[str, ...],
+    key: str,
+    value: dict,
+) -> None:
+    """Write validated application memory to the active LangGraph store."""
+
+    if _chat_store is None:
+        return
+    _chat_store.store.put(
+        namespace,
+        key,
+        sanitize_for_storage(value),
+    )

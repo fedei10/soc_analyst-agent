@@ -49,6 +49,9 @@ def test_write_action_requires_approval():
     )
 
     assert action.requires_approval is True
+    assert action.execution_preview == (
+        "Wazuh active response: firewall-drop target=192.0.2.10"
+    )
 
 
 def test_read_action_does_not_require_approval():
@@ -72,6 +75,18 @@ def test_llm_cannot_override_approval_policy():
             risk_level="high",
             operational_impact="Possible disruption",
             requires_approval=False,
+        )
+
+
+def test_llm_cannot_override_execution_preview():
+    with pytest.raises(ValidationError):
+        ProposedAction(
+            action_type="restart_service",
+            target="wazuh-agent.service",
+            reason="Restore telemetry",
+            risk_level="medium",
+            operational_impact="Brief telemetry interruption",
+            execution_preview="bash -c unsafe-command",
         )
 
 

@@ -1,62 +1,70 @@
-# TSAGE SOC Console
+# TSAGE SOC Backend
 
-Local FastAPI console for testing the L1, L2, and L3 SOC agents, their
-allowlisted Wazuh tools, and the LangGraph investigation workflow.
+FastAPI and LangGraph run locally. PostgreSQL 16 and Redis 7.4 run through
+Docker Compose. PostgreSQL is authoritative; Redis is optional coordination.
+
+## Configure
+
+Copy the required values from `.env.example` into `.env.local`.
+
+- `DATABASE_URL` points to the Compose PostgreSQL port.
+- `REDIS_URL` includes the Compose Redis password.
+- `CLERK_SECRET_KEY` is the claimed Clerk application's server key.
+- `CLERK_AUTHORIZED_PARTIES` contains the frontend origin.
+
+Never expose `CLERK_SECRET_KEY` through a `NEXT_PUBLIC_*` variable.
+
+Create these Clerk organization permissions and assign them to analyst,
+responder, and admin roles:
+
+- `org:soc:read`
+- `org:investigations:create`
+- `org:responses:approve`
+- `org:responses:execute`
 
 ## Run
 
 ```bash
+make storage-up
+make storage-init
 source venv/bin/activate
 uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-Open `http://127.0.0.1:8000/soc`.
+Only `GET /health` is public. Application requests require a verified Clerk
+session token and active organization.
 
-1. Paste one value from `SOC_READ_API_KEYS` into **Read token**.
-2. Paste one value from `SOC_WRITE_API_KEYS` into **Write token** only when
-   testing a human approval.
-3. Send the task to the conversational orchestrator; it calls the bounded
-   Wazuh tools needed for the request and can start the formal L1/L2/L3 graph.
-4. Check **Tool activity** to see which Wazuh tools the agent invoked.
-5. Use **Investigations** with a real Wazuh alert document ID to run the full
-   LangGraph workflow.
+Useful authenticated endpoints:
 
-The tokens are kept in browser `sessionStorage` and are not written into the
-frontend source.
+- `GET /api/v1/health/storage`
+- `GET /api/v1/health/wazuh`
+- `POST /api/v1/soc/orchestrator/chat/stream`
+- `GET /api/v1/soc/conversations`
+- `GET /api/v1/investigations`
+- `GET /api/v1/investigations/{id}/events`
+- `GET /api/v1/investigations/{id}/approvals`
+- `POST /api/v1/investigations/{id}/approval`
 
-## Connect Wazuh
+The formal workflow uses fixed sequential L1, L2, and L3 teams. Each specialist
+has an exact read-only tool allowlist and a four-call limit. L3 response
+proposals still pass server policy and a human approval checkpoint before the
+existing response executor can run.
 
-The API expects the Wazuh indexer and manager API through the PC1 SSH tunnel:
+## Existing Records
+
+Assign pre-Clerk records to an organization idempotently:
 
 ```bash
-make tunnel
-make tunnel-status
+venv/bin/python -m app.db.backfill_organization \
+  --organization-id org_example \
+  --owner-user-id user_example
 ```
 
-Then use **Refresh** in the console. The Wazuh status indicator must be healthy
-before running an investigation from a real alert.
-
-The threat-hunting tool searches `WAZUH_ARCHIVE_INDEX` (default
-`wazuh-archives-*`) so it can find logs that did not trigger rules. A zero
-archive count means this API found no indexed archive events; it does not prove
-that the activity never occurred. Enable Wazuh JSON archive collection and
-archive indexing on the Wazuh host before relying on archive searches.
-
-Conversational read tools include normalized and raw alert lookup, agent/time
-correlation, authentication timelines, successful-login checks, bounded
-archive-log search, log statistics, and deterministic alert attribution.
-
-Useful endpoints:
-
-- Console: `http://127.0.0.1:8000/soc`
-- OpenAPI: `http://127.0.0.1:8000/docs`
-- Liveness: `http://127.0.0.1:8000/health`
-- Wazuh diagnostics: `http://127.0.0.1:8000/api/v1/health/wazuh`
-- Orchestrator chat: `POST http://127.0.0.1:8000/api/v1/soc/orchestrator/chat`
+Apply the default retention schedule with `make retention-clean`. Reports,
+approvals, actions, and curated memories are not automatically deleted.
 
 ## Tests
 
 ```bash
-pytest -q
-node --check app/static/soc/app.js
+venv/bin/python -m pytest -q
 ```

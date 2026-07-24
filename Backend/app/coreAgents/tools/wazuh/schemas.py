@@ -1,6 +1,7 @@
 """Strict input schemas for the allowlisted SOC agent tools."""
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import (
     BaseModel,
@@ -100,7 +101,31 @@ class RuleMitreContextInput(ToolInput):
 
 class DetectionEvidenceInput(ToolInput):
     agent_id: str = Field(pattern=r"^\d+$", max_length=16)
-    limit: int = Field(default=100, ge=1, le=200)
+    limit: int = Field(default=20, ge=1, le=200)
+
+
+class EndpointInventoryInput(ToolInput):
+    agent_id: str = Field(pattern=r"^\d+$", max_length=16)
+    component: Literal[
+        "processes",
+        "ports",
+        "packages",
+        "os",
+        "network",
+        "hotfixes",
+    ]
+    limit: int = Field(default=20, ge=1, le=100)
+    text: str | None = Field(default=None, min_length=2, max_length=128)
+
+
+class VulnerabilitySearchInput(ToolInput):
+    severity: Literal["Low", "Medium", "High", "Critical"] | None = None
+    agent_id: str | None = Field(
+        default=None,
+        pattern=r"^\d+$",
+        max_length=16,
+    )
+    limit: int = Field(default=20, ge=1, le=100)
 
 
 # ToolRuntime is injected by LangGraph after model arguments are generated.

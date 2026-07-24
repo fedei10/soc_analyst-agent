@@ -316,6 +316,13 @@ def prepare_actions(state: InvestigationState) -> dict:
         )
 
     validated_actions = []
+    trusted_action_fields = {
+        "action_type",
+        "target",
+        "reason",
+        "risk_level",
+        "operational_impact",
+    }
     try:
         for raw_action in raw_actions:
             if not isinstance(raw_action, dict):
@@ -323,7 +330,7 @@ def prepare_actions(state: InvestigationState) -> dict:
             trusted_fields = {
                 key: value
                 for key, value in raw_action.items()
-                if key != "requires_approval"
+                if key in trusted_action_fields
             }
             action = ProposedAction.model_validate(trusted_fields)
             validated_actions.append(action.model_dump(mode="json"))
@@ -369,7 +376,14 @@ def mark_awaiting_approval(state: InvestigationState) -> dict:
             {
                 key: value
                 for key, value in action.items()
-                if key != "requires_approval"
+                if key
+                in {
+                    "action_type",
+                    "target",
+                    "reason",
+                    "risk_level",
+                    "operational_impact",
+                }
             }
             for action in actions
         ],
@@ -502,15 +516,18 @@ def create_final_report(state: InvestigationState) -> dict:
         or []
     )
     approval_decision = state.get("approval_decision") or {}
-    response_status = (
-        "rejected"
-        if approval_decision.get("decision") == "reject"
-        else (
-            "queued"
-            if state.get("executed_actions")
-            else "not_executed"
-        )
-    )
+    executed_actions = state.get("executed_actions", [])
+    if approval_decision.get("decision") == "reject":
+        response_status = "rejected"
+    elif executed_actions and all(
+        action.get("status") == "completed"
+        for action in executed_actions
+    ):
+        response_status = "completed"
+    elif executed_actions:
+        response_status = "queued"
+    else:
+        response_status = "not_executed"
     report = {
         "investigation_id": state["investigation_id"],
         "status": "completed",

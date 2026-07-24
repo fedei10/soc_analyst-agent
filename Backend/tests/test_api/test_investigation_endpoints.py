@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+from app.api.auth.deps import AuthPrincipal
 from app.api.v1.endpoints import investigations
 from app.api.v1.schemas.investigation import (
     AgentChatRequest,
@@ -29,6 +30,15 @@ class FakeAgent:
         }
 
 
+PRINCIPAL = AuthPrincipal(
+    user_id="user_test",
+    session_id="sess_test",
+    organization_id="org_test",
+    organization_role="org:admin",
+    permissions=frozenset(),
+)
+
+
 def test_investigation_and_chat_routes_are_registered():
     paths = app.openapi()["paths"]
 
@@ -36,7 +46,16 @@ def test_investigation_and_chat_routes_are_registered():
     assert "/api/v1/investigations/{investigation_id}" in paths
     assert "/api/v1/investigations/{investigation_id}/approval" in paths
     assert "/api/v1/investigations/{investigation_id}/report" in paths
+    assert "/api/v1/investigations/{investigation_id}/agent-runs" in paths
+    assert "/api/v1/investigations/{investigation_id}/audit" in paths
+    assert "/api/v1/investigations/{investigation_id}/approvals" in paths
+    assert "/api/v1/investigations/{investigation_id}/actions" in paths
+    assert "/api/v1/investigations/{investigation_id}/events" in paths
+    assert "/api/v1/health/database" in paths
+    assert "/api/v1/health/storage" in paths
     assert "/api/v1/soc/chat" in paths
+    assert "/api/v1/soc/conversations" in paths
+    assert "/api/v1/soc/conversations/{conversation_id}/messages" in paths
     assert "/api/v1/soc/orchestrator/chat" in paths
     assert "/api/v1/soc/orchestrator/chat/stream" in paths
 
@@ -64,7 +83,8 @@ def test_chat_uses_selected_agent_and_returns_structured_output(monkeypatch):
         AgentChatRequest(
             tier="l1",
             message="Review high-severity Wazuh alerts.",
-        )
+        ),
+        PRINCIPAL,
     )
 
     data = response["data"]
@@ -103,7 +123,8 @@ def test_conversational_endpoint_returns_natural_answer_and_thread(monkeypatch):
         OrchestratorChatRequest(
             message="Investigate the failed and successful login sequence.",
             conversation_id="conversation-123",
-        )
+        ),
+        PRINCIPAL,
     )
 
     data = response["data"]
@@ -133,7 +154,8 @@ def test_conversational_endpoint_generates_thread_id(monkeypatch):
     )
 
     response = investigations.chat_with_soc_orchestrator(
-        OrchestratorChatRequest(message="analyze")
+        OrchestratorChatRequest(message="analyze"),
+        PRINCIPAL,
     )
 
     data = response["data"]

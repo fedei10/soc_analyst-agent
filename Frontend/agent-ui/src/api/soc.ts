@@ -4,6 +4,7 @@ import type {
   ApprovalInput,
   ChatActivity,
   Investigation,
+  InvestigationHistory,
   WazuhHealth
 } from '@/types/soc'
 
@@ -20,22 +21,17 @@ export class APIError extends Error {
   }
 }
 
-function headers(token?: string, hasBody = false): HeadersInit {
+function headers(hasBody = false): HeadersInit {
   const value: Record<string, string> = {}
-  if (token) value.Authorization = `Bearer ${token}`
   if (hasBody) value['Content-Type'] = 'application/json'
   return value
 }
 
-async function request<T>(
-  path: string,
-  token?: string,
-  options: RequestInit = {}
-): Promise<T> {
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`${BACKEND_ROOT}${path}`, {
     ...options,
     headers: {
-      ...headers(token, Boolean(options.body)),
+      ...headers(Boolean(options.body)),
       ...(options.headers || {})
     },
     cache: 'no-store'
@@ -58,9 +54,8 @@ export function getLiveness(): Promise<{ status: string }> {
   return request('/health')
 }
 
-export async function getWazuhHealth(token: string): Promise<WazuhHealth> {
+export async function getWazuhHealth(): Promise<WazuhHealth> {
   const response = await fetch(`${BACKEND_ROOT}/api/v1/health/wazuh`, {
-    headers: headers(token),
     cache: 'no-store'
   })
   const body = await response.json().catch(() => ({}))
@@ -75,15 +70,11 @@ export async function getWazuhHealth(token: string): Promise<WazuhHealth> {
   return body as WazuhHealth
 }
 
-export function getAlertSummary(
-  token: string,
-  hours = 24
-): Promise<AlertSummary> {
-  return request(`/api/v1/alerts/summary?hours=${hours}`, token)
+export function getAlertSummary(hours = 24): Promise<AlertSummary> {
+  return request(`/api/v1/alerts/summary?hours=${hours}`)
 }
 
 export async function streamAgentMessage(
-  token: string,
   message: string,
   conversationId: string,
   handlers: {
@@ -95,7 +86,7 @@ export async function streamAgentMessage(
     `${BACKEND_ROOT}/api/v1/soc/orchestrator/chat/stream`,
     {
       method: 'POST',
-      headers: headers(token, true),
+      headers: headers(true),
       body: JSON.stringify({
         message,
         conversation_id: conversationId
@@ -140,7 +131,8 @@ export async function streamAgentMessage(
     } else if (event === 'error') {
       throw new APIError(
         String(payload.message || 'The SOC agent did not respond.'),
-        503
+        503,
+        payload.code ? String(payload.code) : undefined
       )
     }
   }
@@ -166,11 +158,10 @@ export async function streamAgentMessage(
 }
 
 export function sendAgentMessage(
-  token: string,
   message: string,
   conversationId: string
 ): Promise<AgentChatResponse> {
-  return request('/api/v1/soc/orchestrator/chat', token, {
+  return request('/api/v1/soc/orchestrator/chat', {
     method: 'POST',
     body: JSON.stringify({
       message,
@@ -180,11 +171,10 @@ export function sendAgentMessage(
 }
 
 export function createInvestigation(
-  token: string,
   alertId: string,
   agentId?: string
 ): Promise<Investigation> {
-  return request('/api/v1/investigations', token, {
+  return request('/api/v1/investigations', {
     method: 'POST',
     body: JSON.stringify({
       alert_id: alertId,
@@ -194,23 +184,31 @@ export function createInvestigation(
 }
 
 export function getInvestigation(
-  token: string,
   investigationId: string
 ): Promise<Investigation> {
   return request(
-    `/api/v1/investigations/${encodeURIComponent(investigationId)}`,
-    token
+    `/api/v1/investigations/${encodeURIComponent(investigationId)}`
   )
 }
 
+export function getInvestigationHistory(
+  limit = 25,
+  status?: string
+): Promise<InvestigationHistory> {
+  const query = new URLSearchParams({
+    limit: String(limit),
+    offset: '0'
+  })
+  if (status) query.set('status', status)
+  return request(`/api/v1/investigations?${query.toString()}`)
+}
+
 export function submitApproval(
-  token: string,
   investigationId: string,
   input: ApprovalInput
 ): Promise<Investigation> {
   return request(
     `/api/v1/investigations/${encodeURIComponent(investigationId)}/approval`,
-    token,
     {
       method: 'POST',
       body: JSON.stringify(input)

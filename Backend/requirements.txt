@@ -1,10 +1,14 @@
 fastapi
+clerk-backend-api>=6,<7
 python-dotenv
 redis
 psycopg2-binary
 elasticsearch
 sqlalchemy
 asyncpg
+alembic
+psycopg[binary,pool]>=3.2,<4
+langgraph-checkpoint-postgres>=3,<4
 openai
 anthropic
 jinja2

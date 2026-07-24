@@ -1,3 +1,5 @@
+@import '@clerk/ui/themes/shadcn.css';
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -21,6 +23,11 @@
     --red: #ff7777;
     --scrollbar-width: 0.35rem;
     --color-border-default: 43, 52, 57, 1;
+    --font-geist-sans:
+      Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+      "Segoe UI", sans-serif;
+    --font-dm-mono:
+      "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
   }
 
   * {
@@ -59,6 +66,34 @@
   ::selection {
     background: rgba(97, 230, 163, 0.24);
   }
+}
+
+.auth-page {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 24px;
+  background: var(--ink-0);
+}
+
+.organization-required {
+  display: flex;
+  max-width: 420px;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  color: var(--text);
+  text-align: center;
+}
+
+.organization-required > svg {
+  color: var(--green);
+}
+
+.organization-required h1 {
+  margin: 0;
+  font-size: 24px;
+  letter-spacing: 0;
 }
 
 ::-webkit-scrollbar {
@@ -311,6 +346,43 @@
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+.clerk-controls {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  border-right: 1px solid var(--line);
+  padding-right: 8px;
+}
+
+.clerk-controls .cl-organizationSwitcherTrigger {
+  height: 32px;
+  max-width: 220px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--ink-2);
+  color: var(--text-soft);
+  box-shadow: none;
+}
+
+.clerk-controls .cl-userButtonAvatarBox {
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--line-strong);
+}
+
+.permission-notice {
+  display: inline-flex;
+  min-height: 36px;
+  align-items: center;
+  border: 1px solid rgba(243, 201, 105, 0.3);
+  border-radius: 5px;
+  padding: 8px 10px;
+  background: rgba(243, 201, 105, 0.06);
+  color: var(--amber);
+  font-size: 11px;
 }
 
 .health-pill,
@@ -1119,6 +1191,70 @@
   gap: 10px;
 }
 
+.history-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.history-list > button {
+  display: grid;
+  min-height: 54px;
+  width: 100%;
+  align-items: center;
+  grid-template-columns: minmax(180px, 1fr) 90px 110px 170px 20px;
+  gap: 10px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: transparent;
+  padding: 8px 10px;
+  color: var(--text-soft);
+  text-align: left;
+  cursor: pointer;
+}
+
+.history-list > button:last-of-type {
+  border-bottom: 0;
+}
+
+.history-list > button:hover,
+.history-list > button.active {
+  background: var(--ink-2);
+}
+
+.history-list > button > div:first-child {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.history-list strong,
+.history-list span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-list strong {
+  color: var(--text);
+  font-size: 11px;
+}
+
+.history-list span,
+.history-list time,
+.history-tiers {
+  font-family: var(--font-dm-mono), monospace;
+  font-size: 9px;
+}
+
+.history-list time {
+  white-space: nowrap;
+}
+
+.history-list > button > svg {
+  color: var(--text-dim);
+}
+
 .field {
   display: flex;
   min-width: 0;
@@ -1300,6 +1436,20 @@
   color: var(--amber);
 }
 
+.approval-actions article > code {
+  display: block;
+  overflow-x: auto;
+  margin-top: 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--ink-0);
+  padding: 8px;
+  color: var(--amber);
+  font-family: var(--font-dm-mono), monospace;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
 .approval-actions {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -1467,7 +1617,23 @@
 
   .soc-topbar {
     min-height: 68px;
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 10px;
     padding: 11px 14px;
+  }
+
+  .topbar-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+
+  .clerk-controls {
+    margin-right: auto;
+  }
+
+  .clerk-controls .cl-organizationSwitcherTrigger {
+    max-width: min(190px, 52vw);
   }
 
   .soc-topbar h1 {
@@ -1515,6 +1681,15 @@
 
   .investigation-form {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .history-list > button {
+    grid-template-columns: minmax(0, 1fr) 80px 20px;
+  }
+
+  .history-list > button > .status-badge,
+  .history-list > button > time {
+    display: none;
   }
 
   .summary-grid {

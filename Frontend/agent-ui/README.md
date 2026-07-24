@@ -1,56 +1,29 @@
 # TSAGE SOC Console
 
-Next.js interface for the TSAGE FastAPI backend. It exposes:
+Next.js 15 frontend for the TSAGE SOC orchestrator and formal investigation
+workflow.
 
-- One orchestrator chat that routes requests to SOC L1, L2, or L3
-- Visible specialist selection and routing reason
-- Agent tool-call traces
-- Wazuh health and 24-hour alert totals
-- LangGraph investigation state
-- L1/L2/L3 structured results and audit history
-- Human approval for state-changing response actions
-
-## Start the project
-
-From the repository root, start the backend:
+Clerk runs in Keyless mode until the development application is claimed. After
+claiming it, keep the generated frontend values in `.env.local` and provide the
+server credential only to FastAPI.
 
 ```bash
-cd Backend
-./venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+corepack pnpm install
+corepack pnpm dev
 ```
 
-Start the frontend in another terminal:
+Open `http://localhost:3000`, sign in, and select a Clerk organization. The
+server-side Next.js proxy obtains the session token with `await auth()`, removes
+caller authorization, and forwards the verified token to FastAPI.
+
+The console shows `UserButton`, `OrganizationSwitcher`, live tool activity, SOC
+specialist progress, investigation history, reports, and human approval
+controls. Permission-sensitive controls use the active organization's Clerk
+permissions.
+
+Validation:
 
 ```bash
-cd Frontend/agent-ui
-npm run dev
-```
-
-Open `http://127.0.0.1:3000`.
-
-The frontend proxies `/api/tsage/*` to `http://127.0.0.1:8000` through a
-timeout-aware Next.js route handler. To use a different backend:
-
-```bash
-TSAGE_API_URL=http://127.0.0.1:8100 npm run dev
-```
-
-## Connect
-
-1. Enter one configured `SOC_READ_API_KEYS` value in **Read token**.
-2. Enter a `SOC_WRITE_API_KEYS` value only when testing human approval.
-3. Save the session.
-4. Start the Wazuh SSH tunnel with `make tunnel` from `Backend/`.
-5. Refresh the environment indicator.
-6. Describe the task to the orchestrator; it selects the minimum sufficient
-   SOC tier automatically.
-
-Tokens are stored in browser `sessionStorage`; they are not bundled into the
-frontend.
-
-## Validate
-
-```bash
-npm run typecheck
-npm run build
+corepack pnpm run typecheck
+corepack pnpm run build
 ```

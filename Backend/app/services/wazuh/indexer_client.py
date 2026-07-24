@@ -93,6 +93,20 @@ def _event_outcome(source: dict[str, Any]) -> str:
     return "unknown"
 
 
+def _archive_status(response: dict[str, Any], total: int) -> str:
+    shards = response.get("_shards")
+    if isinstance(shards, dict):
+        try:
+            total_shards = int(shards.get("total", 0))
+            failed_shards = int(shards.get("failed", 0))
+        except (TypeError, ValueError):
+            return "available" if total > 0 else "unknown"
+        if failed_shards > 0:
+            return "partial"
+        return "available" if total_shards > 0 else "unavailable"
+    return "available" if total > 0 else "unknown"
+
+
 class WazuhIndexerClient:
     """Owns all index names and OpenSearch DSL used by the application."""
 
@@ -345,6 +359,15 @@ class WazuhIndexerClient:
         total = self._total(response)
         return ArchivedLogSearchResult(
             index_pattern=self.ARCHIVE_INDEX,
+            archive_status=_archive_status(response, total),
+            query_scope={
+                "text": text,
+                "hours": hours,
+                "agent_id": agent_id,
+                "start_time": start_time.isoformat() if start_time else None,
+                "end_time": end_time.isoformat() if end_time else None,
+                "limit": limit,
+            },
             total=total,
             returned=len(events),
             truncated=total > len(events),
@@ -376,10 +399,12 @@ class WazuhIndexerClient:
             allow_no_indices=True,
         )
         aggregations = response.get("aggregations", {})
+        total = self._total(response)
         return {
             "index_pattern": self.ARCHIVE_INDEX,
+            "archive_status": _archive_status(response, total),
             "hours": hours,
-            "total_events": self._total(response),
+            "total_events": total,
             "earliest": aggregations.get("earliest", {}).get("value_as_string"),
             "latest": aggregations.get("latest", {}).get("value_as_string"),
         }

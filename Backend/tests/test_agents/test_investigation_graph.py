@@ -40,6 +40,10 @@ class FakeResponder:
         self.calls.append(kwargs)
         return {"data": {"affected_items": ["001"]}}
 
+    def restart_agent(self, agent_id):
+        self.calls.append({"restart_agent": agent_id})
+        return {"data": {"affected_items": [agent_id]}}
+
 
 def enabled_response_settings():
     return SimpleNamespace(
@@ -339,11 +343,11 @@ def test_modified_write_action_interrupts_again():
                 "approval_id": interrupted["approval_request"]["approval_id"],
                 "modified_actions": [
                     {
-                        "action_type": "isolate_agent",
-                        "target": "agent-001",
-                        "reason": "Prefer isolation over blocking one IP",
+                        "action_type": "restart_agent",
+                        "target": "001",
+                        "reason": "Restart the affected Wazuh agent",
                         "risk_level": "high",
-                        "operational_impact": "Agent loses network connectivity",
+                        "operational_impact": "Temporary telemetry interruption",
                         "requires_approval": False,
                     }
                 ],

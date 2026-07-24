@@ -12,7 +12,11 @@ from app.coreAgents.orchestration.routing import requires_approval
 from app.coreAgents.orchestration.state import InvestigationState
 
 
-SUPPORTED_RESPONSE_ACTIONS = {"block_ip"}
+SUPPORTED_RESPONSE_ACTIONS = {
+    "block_ip",
+    "restart_agent",
+    "restart_service",
+}
 
 
 def _executor_failure(
@@ -53,6 +57,7 @@ def execute_response(
     state: InvestigationState,
     *,
     responder=None,
+    system_executor=None,
     settings_obj=None,
     now: datetime | None = None,
 ) -> dict:
@@ -128,20 +133,60 @@ def execute_response(
         )
 
     agent_id = _agent_id(state)
-    if agent_id is None:
+    requires_wazuh = any(
+        action["action_type"] in {"block_ip", "restart_agent"}
+        for action in approved_actions
+    )
+    if requires_wazuh and agent_id is None:
         return _executor_failure(state, code="INVALID_RESPONSE_AGENT")
 
     validated_targets: list[str] = []
     for action in approved_actions:
-        try:
-            validated_targets.append(str(ip_address(action.get("target"))))
-        except (TypeError, ValueError):
-            return _executor_failure(
-                state,
-                code="INVALID_RESPONSE_TARGET",
-            )
+        action_type = action["action_type"]
+        target = action.get("target")
+        if action_type == "block_ip":
+            try:
+                validated_targets.append(str(ip_address(target)))
+            except (TypeError, ValueError):
+                return _executor_failure(
+                    state,
+                    code="INVALID_RESPONSE_TARGET",
+                )
+        elif action_type == "restart_agent":
+            target_agent = str(target or "")
+            if (
+                not target_agent.isdigit()
+                or target_agent != agent_id
+            ):
+                return _executor_failure(
+                    state,
+                    code="INVALID_RESPONSE_TARGET",
+                )
+            validated_targets.append(target_agent)
+        else:
+            service_name = str(target or "")
+            if system_executor is None:
+                try:
+                    from app.services.system.remediation import (
+                        SystemRemediationService,
+                    )
 
-    if responder is None:
+                    system_executor = SystemRemediationService()
+                except Exception:
+                    return _executor_failure(
+                        state,
+                        code="SELF_HEALING_UNAVAILABLE",
+                    )
+            try:
+                system_executor.validate_service(service_name)
+            except Exception:
+                return _executor_failure(
+                    state,
+                    code="INVALID_RESPONSE_TARGET",
+                )
+            validated_targets.append(service_name)
+
+    if requires_wazuh and responder is None:
         try:
             from app.services.wazuh.dependencies import get_wazuh_responder
 
@@ -154,13 +199,22 @@ def execute_response(
 
     executed = list(state.get("executed_actions", []))
     for action, target in zip(approved_actions, validated_targets):
+        action_type = action["action_type"]
         try:
-            responder.run_active_response(
-                agent_id=agent_id,
-                command="firewall-drop",
-                arguments=[target],
-                alert=state.get("source_alert"),
-            )
+            if action_type == "block_ip":
+                responder.run_active_response(
+                    agent_id=agent_id,
+                    command="firewall-drop",
+                    arguments=[target],
+                    alert=state.get("source_alert"),
+                )
+                execution_status = "queued"
+            elif action_type == "restart_agent":
+                responder.restart_agent(target)
+                execution_status = "queued"
+            else:
+                system_executor.restart_service(target)
+                execution_status = "completed"
         except Exception:
             return _executor_failure(
                 state,
@@ -172,7 +226,7 @@ def execute_response(
             {
                 "action_type": action["action_type"],
                 "target": target,
-                "status": "queued",
+                "status": execution_status,
                 "approval_id": decision["approval_id"],
                 "approved_by": decision["approved_by"],
             }
@@ -187,7 +241,7 @@ def execute_response(
                 **audit_event(
                     state,
                     stage="response_execution",
-                    event="response_queued",
+                    event="response_actions_executed",
                 ),
                 "approval_id": decision["approval_id"],
                 "approved_by": decision["approved_by"],

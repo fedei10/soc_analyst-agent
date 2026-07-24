@@ -1,9 +1,8 @@
 """
-Request schemas for the state-changing Wazuh endpoints (wazuh:write scope).
+Request schemas for state-changing Wazuh endpoints.
 
-Both models reject unknown fields and require `approved_by`: response actions
-are only executed after a named human approves them, and that name is logged
-with the request_id for the audit trail.
+The approving/executing actor is always derived from the verified Clerk
+principal and is never accepted from the client body.
 """
 from typing import Literal
 
@@ -23,13 +22,7 @@ class ActiveResponseRequest(BaseModel):
     alert: dict | None = Field(
         default=None, description="Original alert JSON, passed to the AR script for context."
     )
-    approved_by: str = Field(
-        min_length=1, max_length=100,
-        description="Name of the human who approved this action.",
-    )
 
 
 class RestartAgentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-
-    approved_by: str = Field(min_length=1, max_length=100)
