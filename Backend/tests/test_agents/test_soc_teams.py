@@ -251,6 +251,7 @@ def test_l2_and_l3_teams_preserve_authoritative_result_contracts():
             classification="suspicious",
             severity="high",
             confidence=0.9,
+            evidence_refs=["alert:alert-1"],
         ).model_dump(mode="json"),
     }
     l2_result = create_l2_team(agents=team_agents(l2)).invoke(l2_state)
@@ -294,7 +295,7 @@ def test_team_continues_after_one_specialist_fails():
         "completed",
     ]
     assert result["specialist_runs"][0]["error_code"] == (
-        "L1_ALERT_CONTEXT_FAILED"
+        "L1_ALERT_CONTEXT_TIMEOUT"
     )
     supervisor_payload = json.loads(
         agents["l1_supervisor"].calls[0]["messages"][0]["content"]
@@ -302,7 +303,7 @@ def test_team_continues_after_one_specialist_fails():
     assert supervisor_payload["specialist_failures"] == [
         {
             "role": "l1_alert_context",
-            "error_code": "L1_ALERT_CONTEXT_FAILED",
+            "error_code": "L1_ALERT_CONTEXT_TIMEOUT",
         }
     ]
     assert "provider timeout" not in str(result)

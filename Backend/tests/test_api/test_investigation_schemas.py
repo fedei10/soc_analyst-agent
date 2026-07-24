@@ -13,6 +13,7 @@ def test_l1_result_accepts_valid_output():
         source_ip="192.0.2.10",
         escalate=True,
         escalation_reason="Related activity requires investigation",
+        evidence_refs=["alert:alert-1"],
     )
 
     assert result.severity.value == "medium"

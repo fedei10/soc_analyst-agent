@@ -49,7 +49,7 @@ class AgentSummaryInput(ToolInput):
 
 class RelatedAlertsInput(AlertByIdInput):
     hours: int = Field(default=24, ge=1, le=168)
-    limit: int = Field(default=100, ge=1, le=200)
+    limit: int = Field(default=25, ge=1, le=50)
 
 
 class AuthenticationTimelineInput(ToolInput):
@@ -57,7 +57,7 @@ class AuthenticationTimelineInput(ToolInput):
     target_user: str | None = Field(default=None, max_length=128)
     agent_id: str | None = Field(default=None, pattern=r"^\d+$", max_length=16)
     hours: int = Field(default=24, ge=1, le=168)
-    limit: int = Field(default=100, ge=1, le=200)
+    limit: int = Field(default=25, ge=1, le=50)
     center_time: datetime | None = None
     window_minutes: int = Field(default=30, ge=1, le=1440)
 
@@ -69,7 +69,7 @@ class AuthenticationTimelineInput(ToolInput):
 
 
 class SuccessfulLoginInput(AuthenticationTimelineInput):
-    limit: int = Field(default=200, ge=1, le=200)
+    limit: int = Field(default=50, ge=1, le=50)
 
 
 class AgentTimeWindowInput(ToolInput):

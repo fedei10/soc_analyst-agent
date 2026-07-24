@@ -170,7 +170,7 @@ class L1Result(StrictModel):
     escalate: bool = False
     escalation_reason: str | None = None
     evidence: list[dict[str, Any]] = Field(default_factory=list)
-    evidence_refs: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(min_length=1)
 
 
 class L2Result(StrictModel):
@@ -186,7 +186,7 @@ class L2Result(StrictModel):
     requires_l3: bool = False
     escalation_reason: str | None = None
     recommended_next_steps: list[str] = Field(default_factory=list)
-    evidence_refs: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(min_length=1)
 
 
 class ProposedAction(StrictModel):
@@ -229,7 +229,7 @@ class L3Result(StrictModel):
     rule_recommendations: list[dict[str, Any]] = Field(default_factory=list)
     remediation_steps: list[str] = Field(default_factory=list)
     proposed_actions: list[ProposedAction] = Field(default_factory=list)
-    evidence_refs: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(min_length=1)
 
 
 class OrchestratorDecision(StrictModel):

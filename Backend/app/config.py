@@ -13,14 +13,14 @@ logger = logging.getLogger("tsage.config")
 class Settings(BaseSettings):
     # API Keys
     GROQ_API_KEY: SecretStr = SecretStr("")
-    GROQ_AGENT_MODEL: str = "qwen/qwen3.6-27b"
+    GROQ_AGENT_MODEL: str = "openai/gpt-oss-20b"
     GROQ_STRUCTURED_MODEL: str = "openai/gpt-oss-20b"
     OXYY_API_KEY: SecretStr = SecretStr("")
     OXYY_BASE_URL: str = "https://api.oxyy.ai/v1"
     OXYY_AGENT_MODEL: str = "codestral-2508"
     OXYY_STRUCTURED_MODEL: str = "gemma-4-31b-it"
     CEREBRAS_API_KEY: SecretStr = SecretStr("")
-    CEREBRAS_AGENT_MODEL: str = "gemma-4-31b"
+    CEREBRAS_AGENT_MODEL: str = "gpt-oss-120b"
     CEREBRAS_STRUCTURED_MODEL: str = "gpt-oss-120b"
     GOOGLE_API_KEY: SecretStr = SecretStr("")
     GEMINI_AGENT_MODEL: str = "gemini-2.5-flash"

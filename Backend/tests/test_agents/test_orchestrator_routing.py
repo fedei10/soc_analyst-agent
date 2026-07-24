@@ -7,6 +7,7 @@ def l1_result(**overrides):
         "classification": "suspicious",
         "severity": "low",
         "confidence": 0.95,
+        "evidence_refs": ["alert:alert-1"],
     }
     result.update(overrides)
     return result
@@ -17,6 +18,7 @@ def l2_result(**overrides):
         "summary": "Investigation completed",
         "severity": "medium",
         "confidence": 0.9,
+        "evidence_refs": ["alert:alert-1"],
     }
     result.update(overrides)
     return result

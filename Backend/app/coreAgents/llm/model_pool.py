@@ -5,6 +5,7 @@ from typing import Literal
 
 from langchain.agents.middleware import (
     ModelCallLimitMiddleware,
+    ModelRetryMiddleware,
     ToolCallLimitMiddleware,
 )
 from pydantic import BaseModel
@@ -46,6 +47,19 @@ ROUTER_PROVIDER_ORDER: tuple[ProviderName, ...] = ("gemini",)
 FORMATTER_PROVIDER_ORDER: tuple[ProviderName, ...] = ("gemini",)
 
 
+def _retryable_model_error(exc: Exception) -> bool:
+    name = type(exc).__name__.lower()
+    message = str(exc).lower()
+    return (
+        "ratelimit" in name
+        or "timeout" in name
+        or "429" in message
+        or "queue_exceeded" in message
+        or "temporarily unavailable" in message
+        or "service unavailable" in message
+    )
+
+
 def get_agent_model(role: AgentRole):
     return AGENT_MODELS[get_agent_provider(role)]
 
@@ -58,6 +72,15 @@ def get_agent_middleware(role: AgentRole) -> list:
     model_limit = 10 if role == "chat" else 8
     tool_limit = 8 if role == "chat" else 6
     return [
+        ModelRetryMiddleware(
+            max_retries=3,
+            retry_on=_retryable_model_error,
+            on_failure="error",
+            initial_delay=2.0,
+            backoff_factor=2.0,
+            max_delay=20.0,
+            jitter=True,
+        ),
         ModelCallLimitMiddleware(run_limit=model_limit, exit_behavior="end"),
         ToolCallLimitMiddleware(run_limit=tool_limit, exit_behavior="continue"),
     ]

@@ -16,6 +16,7 @@ class StructuredFakeAgent:
                 "classification": "benign",
                 "severity": "low",
                 "confidence": 0.9,
+                "evidence_refs": ["alert:alert-1"],
             },
         }
 
@@ -46,3 +47,21 @@ def test_transcript_serializes_tool_calls_for_formatter():
 
     assert "get_alert_by_id" in transcript
     assert "Checking Wazuh." in transcript
+
+
+def test_transcript_bounds_large_tool_results():
+    transcript = _format_transcript([
+        SimpleNamespace(
+            type="tool",
+            content='{"alerts": [' + ",".join(
+                f'{{"alert_id": "alert-{index}"}}'
+                for index in range(100)
+            ) + "]}",
+            name="get_related_alerts",
+            tool_calls=None,
+        )
+    ])
+
+    assert len(transcript) < 7000
+    assert "alert-0" in transcript
+    assert "_truncated_items" in transcript

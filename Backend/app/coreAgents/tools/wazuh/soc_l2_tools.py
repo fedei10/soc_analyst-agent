@@ -18,7 +18,7 @@ def build_l2_tools(gateway: WazuhGateway | None = None) -> list[StructuredTool]:
     def current_gateway() -> WazuhGateway:
         return gateway or get_wazuh_gateway()
 
-    def get_related_alerts(alert_id: str, hours: int = 24, limit: int = 100) -> dict:
+    def get_related_alerts(alert_id: str, hours: int = 24, limit: int = 25) -> dict:
         return run(lambda: current_gateway().get_related_alerts(
             alert_id=alert_id, hours=hours, limit=limit
         ).model_dump(mode="json"))
@@ -28,7 +28,7 @@ def build_l2_tools(gateway: WazuhGateway | None = None) -> list[StructuredTool]:
         target_user: str | None = None,
         agent_id: str | None = None,
         hours: int = 24,
-        limit: int = 100,
+        limit: int = 25,
         center_time: datetime | None = None,
         window_minutes: int = 30,
     ) -> dict:
@@ -47,7 +47,7 @@ def build_l2_tools(gateway: WazuhGateway | None = None) -> list[StructuredTool]:
         target_user: str | None = None,
         agent_id: str | None = None,
         hours: int = 24,
-        limit: int = 200,
+        limit: int = 50,
         center_time: datetime | None = None,
         window_minutes: int = 30,
     ) -> dict:

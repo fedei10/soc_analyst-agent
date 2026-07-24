@@ -6,6 +6,51 @@ from typing import Any
 from pydantic import BaseModel
 
 
+MAX_TOOL_CONTENT_CHARS = 6000
+MAX_COLLECTION_ITEMS = 12
+
+
+def _compact_value(value: Any, *, depth: int = 0) -> Any:
+    if depth >= 5:
+        return "[depth limit]"
+    if isinstance(value, dict):
+        return {
+            str(key): _compact_value(item, depth=depth + 1)
+            for key, item in list(value.items())[:40]
+        }
+    if isinstance(value, list):
+        compacted = [
+            _compact_value(item, depth=depth + 1)
+            for item in value[:MAX_COLLECTION_ITEMS]
+        ]
+        if len(value) > MAX_COLLECTION_ITEMS:
+            compacted.append({
+                "_truncated_items": len(value) - MAX_COLLECTION_ITEMS
+            })
+        return compacted
+    if isinstance(value, str) and len(value) > 1500:
+        return f"{value[:1500]}...[truncated]"
+    return value
+
+
+def _bounded_tool_content(content: Any) -> Any:
+    if not isinstance(content, str):
+        return _compact_value(content)
+    try:
+        parsed = json.loads(content)
+    except (TypeError, ValueError):
+        parsed = content
+    compacted = _compact_value(parsed)
+    rendered = (
+        compacted
+        if isinstance(compacted, str)
+        else json.dumps(compacted, default=str)
+    )
+    if len(rendered) > MAX_TOOL_CONTENT_CHARS:
+        return f"{rendered[:MAX_TOOL_CONTENT_CHARS]}...[truncated]"
+    return rendered
+
+
 def _serialize_message(message: Any) -> dict[str, Any]:
     if isinstance(message, dict):
         return message
@@ -14,6 +59,10 @@ def _serialize_message(message: Any) -> dict[str, Any]:
         "type": getattr(message, "type", message.__class__.__name__),
         "content": getattr(message, "content", ""),
     }
+    if serialized["type"] == "tool":
+        serialized["content"] = _bounded_tool_content(
+            serialized["content"]
+        )
     name = getattr(message, "name", None)
     if name:
         serialized["name"] = name

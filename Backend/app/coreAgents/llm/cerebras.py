@@ -10,7 +10,7 @@ llm = ChatCerebras(
     model=settings.CEREBRAS_AGENT_MODEL,
     temperature=0.5,
     timeout=30,
-    max_retries=1,
+    max_retries=0,
     tags=["provider:cerebras", "purpose:agent"],
 )
 
@@ -19,6 +19,6 @@ structured_llm = ChatCerebras(
     model=settings.CEREBRAS_STRUCTURED_MODEL,
     temperature=0,
     timeout=30,
-    max_retries=1,
+    max_retries=0,
     tags=["provider:cerebras", "purpose:structured"],
 )

@@ -1,5 +1,6 @@
 from langchain.agents.middleware import (
     ModelCallLimitMiddleware,
+    ModelRetryMiddleware,
     ToolCallLimitMiddleware,
 )
 from langchain_core.runnables import RunnableLambda
@@ -26,8 +27,9 @@ def test_orchestrator_uses_only_gemini():
 def test_agent_middleware_limits_calls_without_cross_provider_fallbacks():
     middleware = model_pool.get_agent_middleware("l2")
     assert any(isinstance(item, ModelCallLimitMiddleware) for item in middleware)
+    assert any(isinstance(item, ModelRetryMiddleware) for item in middleware)
     assert any(isinstance(item, ToolCallLimitMiddleware) for item in middleware)
-    assert len(middleware) == 2
+    assert len(middleware) == 3
 
 
 def test_structured_model_uses_only_assigned_provider(monkeypatch):
