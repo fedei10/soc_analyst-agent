@@ -116,12 +116,15 @@ def test_missing_alert_is_404(client, gateway):
     assert response.json()["error"]["code"] == "not_found"
 
 
-def test_read_token_cannot_run_response_actions(client):
+def test_analyst_cannot_request_direct_response_actions(client, responder):
+    restarted = []
+    responder.restart_agent = restarted.append
+
     response = client.put(
         "/api/v1/agents/001/restart", headers=READ, json={}
     )
     assert response.status_code == 403
-    assert response.json()["error"]["code"] == "forbidden"
+    assert restarted == []
 
 
 def test_write_token_uses_separate_responder(client, responder):

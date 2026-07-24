@@ -170,6 +170,7 @@ class L1Result(StrictModel):
     escalate: bool = False
     escalation_reason: str | None = None
     evidence: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
 
 
 class L2Result(StrictModel):
@@ -185,6 +186,7 @@ class L2Result(StrictModel):
     requires_l3: bool = False
     escalation_reason: str | None = None
     recommended_next_steps: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
 
 
 class ProposedAction(StrictModel):
@@ -193,6 +195,7 @@ class ProposedAction(StrictModel):
     reason: str = Field(min_length=1)
     risk_level: ActionRisk
     operational_impact: str = Field(min_length=1)
+    evidence_refs: list[str] = Field(default_factory=list)
 
     @computed_field
     @property
@@ -226,6 +229,7 @@ class L3Result(StrictModel):
     rule_recommendations: list[dict[str, Any]] = Field(default_factory=list)
     remediation_steps: list[str] = Field(default_factory=list)
     proposed_actions: list[ProposedAction] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
 
 
 class OrchestratorDecision(StrictModel):
@@ -261,6 +265,13 @@ class ApprovalRequest(StrictModel):
     allowed_decisions: list[ApprovalChoice] = Field(
         default_factory=lambda: ["approve", "reject", "modify"]
     )
+
+
+class ExecutionAuthorization(StrictModel):
+    approval_id: str = Field(min_length=1, max_length=100)
+    execution_id: str = Field(min_length=1, max_length=100)
+    executed_by: str = Field(min_length=1, max_length=128)
+    action_ids: list[str] = Field(min_length=1, max_length=20)
 
 
 class StartInvestigationInput(StrictModel):

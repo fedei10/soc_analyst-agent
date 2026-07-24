@@ -1,11 +1,11 @@
-"""Clerk authentication and organization permission dependencies."""
+"""Clerk session authentication for personal TSAGE accounts."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
 import logging
-from typing import Any, Callable
+from typing import Any
 
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -14,10 +14,6 @@ from app.config import settings
 
 
 logger = logging.getLogger("tsage.auth")
-SOC_READ = "org:soc:read"
-INVESTIGATIONS_CREATE = "org:investigations:create"
-RESPONSES_APPROVE = "org:responses:approve"
-RESPONSES_EXECUTE = "org:responses:execute"
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -26,15 +22,7 @@ _bearer = HTTPBearer(auto_error=False)
 class AuthPrincipal:
     user_id: str
     session_id: str | None
-    organization_id: str
-    organization_role: str | None
-    permissions: frozenset[str]
-
-    def has_permission(self, permission: str) -> bool:
-        return (
-            self.organization_role == "org:admin"
-            or permission in self.permissions
-        )
+    scope_id: str
 
 
 def _secret(value) -> str | None:
@@ -88,28 +76,14 @@ def authenticate_clerk_request(request: Request):
     )
 
 
-def _permission_values(payload: dict[str, Any]) -> frozenset[str]:
-    raw = payload.get("org_permissions") or []
-    if isinstance(raw, str):
-        raw = raw.replace(",", " ").split()
-    if not isinstance(raw, (list, tuple, set, frozenset)):
-        return frozenset()
-    return frozenset(str(item) for item in raw if item)
-
-
 def _principal_from_payload(payload: dict[str, Any]) -> AuthPrincipal:
     user_id = str(payload.get("sub") or "").strip()
-    organization_id = str(payload.get("org_id") or "").strip()
     if not user_id:
         raise HTTPException(401, "Clerk session token has no subject.")
-    if settings.CLERK_REQUIRE_ORGANIZATION and not organization_id:
-        raise HTTPException(403, "Select a Clerk organization to use TSAGE.")
     return AuthPrincipal(
         user_id=user_id,
         session_id=str(payload.get("sid") or "").strip() or None,
-        organization_id=organization_id,
-        organization_role=str(payload.get("org_role") or "").strip() or None,
-        permissions=_permission_values(payload),
+        scope_id=user_id,
     )
 
 
@@ -125,12 +99,6 @@ def _sync_principal(principal: AuthPrincipal) -> None:
 
         repository = get_identity_repository()
         repository.upsert_user(user_id=principal.user_id)
-        repository.upsert_membership(
-            organization_id=principal.organization_id,
-            user_id=principal.user_id,
-            role=principal.organization_role or "org:member",
-            permissions=sorted(principal.permissions),
-        )
     except Exception as exc:
         if settings.DATABASE_REQUIRED:
             raise HTTPException(
@@ -138,14 +106,13 @@ def _sync_principal(principal: AuthPrincipal) -> None:
                 "Identity persistence is unavailable.",
             ) from exc
         logger.warning(
-            "Clerk identity projection skipped user=%s org=%s error=%s",
+            "Clerk identity projection skipped user=%s error=%s",
             principal.user_id,
-            principal.organization_id,
             type(exc).__name__,
         )
 
 
-def require_principal(
+async def require_principal(
     request: Request,
     _credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ) -> AuthPrincipal:
@@ -170,22 +137,31 @@ def require_principal(
     return principal
 
 
-def require_permission(permission: str) -> Callable[..., AuthPrincipal]:
-    def dependency(
-        principal: AuthPrincipal = Depends(require_principal),
-    ) -> AuthPrincipal:
-        if not principal.has_permission(permission):
-            raise HTTPException(
-                403,
-                f"Clerk organization permission required: {permission}.",
-            )
-        return principal
-
-    dependency.__name__ = f"require_{permission.replace(':', '_')}"
-    return dependency
+async def require_authenticated(
+    principal: AuthPrincipal = Depends(require_principal),
+) -> AuthPrincipal:
+    return principal
 
 
-require_read = require_permission(SOC_READ)
-require_investigate = require_permission(INVESTIGATIONS_CREATE)
-require_approve = require_permission(RESPONSES_APPROVE)
-require_write = require_permission(RESPONSES_EXECUTE)
+require_read = require_authenticated
+require_investigate = require_authenticated
+require_approve = require_authenticated
+
+
+async def require_execute(
+    principal: AuthPrincipal = Depends(require_principal),
+) -> AuthPrincipal:
+    allowed = {
+        value.strip()
+        for value in settings.CLERK_EXECUTOR_USER_IDS.split(",")
+        if value.strip()
+    }
+    if principal.user_id not in allowed:
+        raise HTTPException(
+            403,
+            "This Clerk user is not authorized to execute response actions.",
+        )
+    return principal
+
+
+require_write = require_execute

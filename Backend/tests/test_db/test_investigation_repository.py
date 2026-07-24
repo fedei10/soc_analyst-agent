@@ -6,8 +6,10 @@ from sqlalchemy.pool import StaticPool
 
 from app.db.base import Base
 from app.db.repositories.investigations import (
+    ResponseExecutionConflictError,
     SQLAlchemyInvestigationRepository,
 )
+import pytest
 
 
 def repository():
@@ -177,6 +179,39 @@ def test_repository_isolates_organization_queries():
         "INV-PERSIST-001",
         organization_id="org-other",
     ) == []
+
+
+def test_response_action_claim_is_atomic_and_cannot_repeat():
+    store = repository()
+    value = snapshot()
+    value["status"] = "approved"
+    value["current_stage"] = "response_approved"
+    value["executed_actions"] = []
+    store.save_snapshot(value)
+
+    claim = store.claim_response_actions(
+        "INV-PERSIST-001",
+        organization_id="org-test",
+        approval_id="APR-001",
+        executed_by="user-responder",
+    )
+
+    assert claim["action_ids"]
+    actions = store.list_response_actions(
+        "INV-PERSIST-001",
+        organization_id="org-test",
+    )
+    assert actions[0]["status"] == "executing"
+    assert actions[0]["execution_id"] == claim["execution_id"]
+    assert actions[0]["executor_user_id"] == "user-responder"
+
+    with pytest.raises(ResponseExecutionConflictError):
+        store.claim_response_actions(
+            "INV-PERSIST-001",
+            organization_id="org-test",
+            approval_id="APR-001",
+            executed_by="user-responder",
+        )
 
 
 def test_repository_persists_multiple_specialist_runs_and_sanitizes_tools():

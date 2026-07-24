@@ -92,6 +92,7 @@ def l1_result(severity="low", confidence=0.95):
         classification="suspicious",
         severity=severity,
         confidence=confidence,
+        evidence_refs=["alert:alert-1"],
     )
 
 
@@ -100,6 +101,7 @@ def l2_result(severity="medium"):
         summary="L2 investigation completed",
         severity=severity,
         confidence=0.9,
+        evidence_refs=["alert:alert-1"],
     )
 
 
@@ -111,6 +113,7 @@ def graph_with_write_action(*, responder=None, response_settings=None):
         l3_agent=FakeAgent(
             L3Result(
                 summary="Containment is recommended",
+                evidence_refs=["alert:alert-1"],
                 proposed_actions=[
                     {
                         "action_type": "block_ip",
@@ -118,6 +121,7 @@ def graph_with_write_action(*, responder=None, response_settings=None):
                         "reason": "Confirmed malicious authentication",
                         "risk_level": "medium",
                         "operational_impact": "May block a legitimate administrator",
+                        "evidence_refs": ["alert:alert-1"],
                     }
                 ],
             )
@@ -130,7 +134,10 @@ def graph_with_write_action(*, responder=None, response_settings=None):
 def test_low_risk_alert_stops_after_l1():
     l1 = FakeAgent(l1_result())
     l2 = FakeAgent(l2_result())
-    l3 = FakeAgent(L3Result(summary="L3 completed"))
+    l3 = FakeAgent(L3Result(
+        summary="L3 completed",
+        evidence_refs=["alert:alert-1"],
+    ))
     graph = create_investigation_graph(
         gateway=FakeGateway(sample_alert()),
         l1_agent=l1,
@@ -150,7 +157,10 @@ def test_low_risk_alert_stops_after_l1():
 def test_medium_alert_reaches_l2_then_reports():
     l1 = FakeAgent(l1_result(severity="medium"))
     l2 = FakeAgent(l2_result())
-    l3 = FakeAgent(L3Result(summary="L3 completed"))
+    l3 = FakeAgent(L3Result(
+        summary="L3 completed",
+        evidence_refs=["alert:alert-1"],
+    ))
     graph = create_investigation_graph(
         gateway=FakeGateway(sample_alert()),
         l1_agent=l1,
@@ -173,6 +183,7 @@ def test_high_alert_reaches_l3_then_reports():
         L3Result(
             summary="L3 containment analysis completed",
             remediation_steps=["Review containment options"],
+            evidence_refs=["alert:alert-1"],
         )
     )
     graph = create_investigation_graph(
@@ -271,7 +282,7 @@ def test_rejected_action_resumes_to_final_report_without_execution():
     assert result["approval_decision"]["decision"] == "reject"
 
 
-def test_approved_action_reaches_response_executor():
+def test_approval_stops_before_separate_response_execution():
     responder = FakeResponder()
     graph = graph_with_write_action(
         responder=responder,
@@ -280,7 +291,7 @@ def test_approved_action_reaches_response_executor():
     config = graph_config()
     interrupted = graph.invoke(initial_state(), config=config)
 
-    result = graph.invoke(
+    approved = graph.invoke(
         Command(
             resume={
                 "decision": "approve",
@@ -291,10 +302,31 @@ def test_approved_action_reaches_response_executor():
         config=config,
     )
 
+    assert approved["status"] == "approved"
+    assert approved["current_stage"] == "response_approved"
+    assert approved["executed_actions"] == []
+    assert responder.calls == []
+
+    result = graph.invoke(
+        Command(
+            resume={
+                "approval_id": approved["approval_request"]["approval_id"],
+                "execution_id": "EXE-001",
+                "executed_by": "responder@example.com",
+                "action_ids": ["ACT-001"],
+            }
+        ),
+        config=config,
+    )
+
     assert result["status"] == "completed"
     assert result["current_stage"] == "final_report"
-    assert result["executed_actions"][0]["status"] == "queued"
-    assert result["final_report"]["response_status"] == "queued"
+    assert result["executed_actions"][0]["status"] == (
+        "verification_pending"
+    )
+    assert result["final_report"]["response_status"] == (
+        "verification_pending"
+    )
     assert responder.calls[0]["command"] == "firewall-drop"
     assert responder.calls[0]["arguments"] == ["192.0.2.10"]
 

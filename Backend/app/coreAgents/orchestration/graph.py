@@ -14,6 +14,7 @@ from app.coreAgents.orchestration.nodes import (
     normalize_alert,
     prepare_actions,
     request_human_approval,
+    request_execution_authorization,
     run_l1,
     run_l2,
     run_l3,
@@ -26,6 +27,7 @@ from app.coreAgents.orchestration.routing import (
     route_after_step,
 )
 from app.coreAgents.orchestration.state import InvestigationState
+from app.coreAgents.orchestration.verifier import verify_response
 
 
 def create_investigation_graph(
@@ -41,6 +43,7 @@ def create_investigation_graph(
     responder=None,
     system_executor=None,
     response_settings=None,
+    verification_gateway=None,
     clock=None,
 ):
     """Compile the read-only investigation graph with checkpoint persistence."""
@@ -90,6 +93,13 @@ def create_investigation_graph(
             now=clock,
         )
 
+    def response_verification_node(state: InvestigationState) -> dict:
+        return verify_response(
+            state,
+            gateway=verification_gateway or gateway,
+            system_executor=system_executor,
+        )
+
     builder = StateGraph(InvestigationState)
     builder.add_node("initialize", initialize_investigation)
     builder.add_node("load_alert", load_alert_node)
@@ -101,7 +111,12 @@ def create_investigation_graph(
     builder.add_node("awaiting_approval", mark_awaiting_approval)
     builder.add_node("human_approval", request_human_approval)
     builder.add_node("response_approved", mark_response_approved)
+    builder.add_node(
+        "execution_authorization",
+        request_execution_authorization,
+    )
     builder.add_node("response_executor", response_executor_node)
+    builder.add_node("response_verification", response_verification_node)
     builder.add_node("final_report", create_final_report)
     builder.add_node("failed", handle_failure)
 
@@ -160,15 +175,20 @@ def create_investigation_graph(
             "failed": "failed",
         },
     )
-    builder.add_edge("response_approved", "response_executor")
+    builder.add_edge("response_approved", "execution_authorization")
+    builder.add_edge("execution_authorization", "response_executor")
     builder.add_conditional_edges(
         "response_executor",
         lambda state: route_after_step(
             state,
-            success_node="final_report",
+            success_node="response_verification",
         ),
-        {"final_report": "final_report", "failed": "failed"},
+        {
+            "response_verification": "response_verification",
+            "failed": "failed",
+        },
     )
+    builder.add_edge("response_verification", "final_report")
     builder.add_edge("final_report", END)
     builder.add_edge("failed", END)
 

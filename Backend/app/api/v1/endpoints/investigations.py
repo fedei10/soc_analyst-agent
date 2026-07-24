@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from app.api.auth.deps import (
     AuthPrincipal,
     require_approve,
+    require_execute,
     require_investigate,
     require_read,
 )
@@ -21,6 +22,7 @@ from app.api.v1.schemas.investigation import (
     ApprovalDecisionInput,
     InvestigationCreate,
     OrchestratorChatRequest,
+    ResponseExecutionInput,
 )
 from app.coreAgents.orchestration.agent_runner import invoke_validated_agent
 from app.coreAgents.orchestration.conversation_runner import (
@@ -31,6 +33,7 @@ from app.coreAgents.orchestration.investigation_service import (
     InvestigationNotFoundError,
     get_investigation_service,
 )
+from app.db.repositories.investigations import ResponseExecutionConflictError
 from app.coreAgents.orchestration.schemas import L1Result, L2Result, L3Result
 from app.db.session import database_url
 from app.services.redis.ephemeral import EphemeralRedis
@@ -45,7 +48,20 @@ InvestigatorPrincipal = Annotated[
     Depends(require_investigate),
 ]
 ApproverPrincipal = Annotated[AuthPrincipal, Depends(require_approve)]
+ExecutorPrincipal = Annotated[AuthPrincipal, Depends(require_execute)]
 activity_store = EphemeralRedis()
+
+
+def _public_data(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _public_data(item)
+            for key, item in value.items()
+            if key != "organization_id"
+        }
+    if isinstance(value, list):
+        return [_public_data(item) for item in value]
+    return value
 
 
 def _enforce_rate_limit(
@@ -55,7 +71,7 @@ def _enforce_rate_limit(
     limit: int,
 ) -> None:
     result = activity_store.check_rate_limit(
-        organization_id=principal.organization_id,
+        organization_id=principal.scope_id,
         subject=f"{principal.user_id}:{operation}",
         limit=limit,
         window_seconds=60,
@@ -160,11 +176,11 @@ def create_investigation(
         alert_id=request.alert_id,
         agent_id=request.agent_id,
         initiated_by=principal.user_id,
-        organization_id=principal.organization_id,
+        organization_id=principal.scope_id,
         owner_user_id=principal.user_id,
     )
     _publish_activity(snapshot)
-    return {"data": snapshot}
+    return {"data": _public_data(snapshot)}
 
 
 def _history_item(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -216,7 +232,7 @@ def list_investigations(
         limit=limit,
         offset=offset,
         status=status,
-        organization_id=principal.organization_id,
+        organization_id=principal.scope_id,
     )
     return {
         "data": {
@@ -224,7 +240,7 @@ def list_investigations(
             "count": len(items),
             "total": service.history_count(
                 status=status,
-                organization_id=principal.organization_id,
+                organization_id=principal.scope_id,
             ),
             "limit": limit,
             "offset": offset,
@@ -241,9 +257,11 @@ def get_investigation(
     principal: ReadPrincipal,
 ):
     return {
-        "data": _snapshot(
-            investigation_id,
-            organization_id=principal.organization_id,
+        "data": _public_data(
+            _snapshot(
+                investigation_id,
+                organization_id=principal.scope_id,
+            )
         )
     }
 
@@ -259,7 +277,7 @@ def decide_investigation(
 ):
     before = _snapshot(
         investigation_id,
-        organization_id=principal.organization_id,
+        organization_id=principal.scope_id,
     )
     if "human_approval" not in before["pending_nodes"]:
         raise HTTPException(
@@ -273,10 +291,35 @@ def decide_investigation(
             **request.model_dump(mode="json", exclude_none=True),
             "approved_by": principal.user_id,
         },
-        organization_id=principal.organization_id,
+        organization_id=principal.scope_id,
     )
     _publish_activity(snapshot)
-    return {"data": snapshot}
+    return {"data": _public_data(snapshot)}
+
+
+@write.post(
+    "/investigations/{investigation_id}/execute",
+    tags=["investigations"],
+    dependencies=[Depends(require_execute)],
+)
+def execute_investigation_response(
+    investigation_id: str,
+    request: ResponseExecutionInput,
+    principal: ExecutorPrincipal,
+):
+    try:
+        snapshot = get_investigation_service().execute_approved(
+            investigation_id,
+            approval_id=request.approval_id,
+            executed_by=principal.user_id,
+            organization_id=principal.scope_id,
+        )
+    except InvestigationNotFoundError:
+        raise HTTPException(404, f"Investigation {investigation_id} not found.")
+    except ResponseExecutionConflictError as exc:
+        raise HTTPException(409, str(exc))
+    _publish_activity(snapshot)
+    return {"data": _public_data(snapshot)}
 
 
 @read.get(
@@ -290,13 +333,13 @@ def get_investigation_report(
     try:
         report = get_investigation_service().report(
             investigation_id,
-            organization_id=principal.organization_id,
+            organization_id=principal.scope_id,
         )
     except InvestigationNotFoundError:
         raise HTTPException(404, f"Investigation {investigation_id} not found.")
     if report is None:
         raise HTTPException(409, "Investigation report is not ready.")
-    return {"data": report}
+    return {"data": _public_data(report)}
 
 
 @read.get(
@@ -310,11 +353,16 @@ def get_investigation_agent_runs(
     try:
         items = get_investigation_service().agent_runs(
             investigation_id,
-            organization_id=principal.organization_id,
+            organization_id=principal.scope_id,
         )
     except InvestigationNotFoundError:
         raise HTTPException(404, f"Investigation {investigation_id} not found.")
-    return {"data": {"items": items, "count": len(items)}}
+    return {
+        "data": {
+            "items": _public_data(items),
+            "count": len(items),
+        }
+    }
 
 
 @read.get(
@@ -328,11 +376,16 @@ def get_investigation_audit(
     try:
         items = get_investigation_service().audit_history(
             investigation_id,
-            organization_id=principal.organization_id,
+            organization_id=principal.scope_id,
         )
     except InvestigationNotFoundError:
         raise HTTPException(404, f"Investigation {investigation_id} not found.")
-    return {"data": {"items": items, "count": len(items)}}
+    return {
+        "data": {
+            "items": _public_data(items),
+            "count": len(items),
+        }
+    }
 
 
 @read.get(
@@ -346,11 +399,16 @@ def get_investigation_approvals(
     try:
         items = get_investigation_service().approval_history(
             investigation_id,
-            organization_id=principal.organization_id,
+            organization_id=principal.scope_id,
         )
     except InvestigationNotFoundError:
         raise HTTPException(404, f"Investigation {investigation_id} not found.")
-    return {"data": {"items": items, "count": len(items)}}
+    return {
+        "data": {
+            "items": _public_data(items),
+            "count": len(items),
+        }
+    }
 
 
 @read.get(
@@ -364,11 +422,16 @@ def get_investigation_actions(
     try:
         items = get_investigation_service().response_actions(
             investigation_id,
-            organization_id=principal.organization_id,
+            organization_id=principal.scope_id,
         )
     except InvestigationNotFoundError:
         raise HTTPException(404, f"Investigation {investigation_id} not found.")
-    return {"data": {"items": items, "count": len(items)}}
+    return {
+        "data": {
+            "items": _public_data(items),
+            "count": len(items),
+        }
+    }
 
 
 @read.get(
@@ -382,12 +445,12 @@ def stream_investigation_activity(
 ):
     _snapshot(
         investigation_id,
-        organization_id=principal.organization_id,
+        organization_id=principal.scope_id,
     )
 
     def events():
         redis_events = activity_store.read_activity(
-            organization_id=principal.organization_id,
+            organization_id=principal.scope_id,
             investigation_id=investigation_id,
             after_id=after_id,
             limit=500,
@@ -396,19 +459,22 @@ def stream_investigation_activity(
             for item in redis_events:
                 yield _sse(
                     str(item["event"]),
-                    {
+                    _public_data({
                         "id": item["id"],
                         "timestamp": item.get("timestamp"),
                         **(item.get("payload") or {}),
-                    },
+                    }),
                 )
             return
 
         for item in get_investigation_service().audit_history(
             investigation_id,
-            organization_id=principal.organization_id,
+            organization_id=principal.scope_id,
         ):
-            yield _sse(str(item.get("event") or "activity"), item)
+            yield _sse(
+                str(item.get("event") or "activity"),
+                _public_data(item),
+            )
 
     return StreamingResponse(
         events(),
@@ -427,14 +493,14 @@ def list_conversations(
     offset: int = Query(default=0, ge=0),
 ):
     items = _conversation_repository().list_conversations(
-        organization_id=principal.organization_id,
+        organization_id=principal.scope_id,
         owner_user_id=principal.user_id,
         limit=limit,
         offset=offset,
     )
     return {
         "data": {
-            "items": items,
+            "items": _public_data(items),
             "count": len(items),
             "limit": limit,
             "offset": offset,
@@ -454,21 +520,23 @@ def list_conversation_messages(
     repository = _conversation_repository()
     conversation = repository.get_conversation(
         conversation_id,
-        organization_id=principal.organization_id,
+        organization_id=principal.scope_id,
     )
     if conversation is None:
         raise HTTPException(404, "Conversation not found.")
-    if (
-        conversation["owner_user_id"] != principal.user_id
-        and principal.organization_role != "org:admin"
-    ):
+    if conversation["owner_user_id"] != principal.user_id:
         raise HTTPException(404, "Conversation not found.")
     items = repository.list_messages(
         conversation_id,
-        organization_id=principal.organization_id,
+        organization_id=principal.scope_id,
         limit=limit,
     )
-    return {"data": {"items": items, "count": len(items)}}
+    return {
+        "data": {
+            "items": _public_data(items),
+            "count": len(items),
+        }
+    }
 
 
 def _agent_for_tier(tier: str):
@@ -557,7 +625,7 @@ def chat_with_soc_orchestrator(
         result = run_soc_conversation(
             message=request.message,
             conversation_id=conversation_id,
-            organization_id=principal.organization_id,
+            organization_id=principal.scope_id,
             user_id=principal.user_id,
         )
     except Exception as exc:
@@ -566,11 +634,15 @@ def chat_with_soc_orchestrator(
             503,
             "SOC conversation is unavailable. Check the LLM and Wazuh connections.",
         ) from exc
-    return {"data": result}
+    return {"data": _public_data(result)}
 
 
 def _sse(event: str, payload: dict[str, Any]) -> str:
-    return f"event: {event}\ndata: {json.dumps(payload, default=str)}\n\n"
+    public_payload = _public_data(payload)
+    return (
+        f"event: {event}\n"
+        f"data: {json.dumps(public_payload, default=str)}\n\n"
+    )
 
 
 @read.post(
@@ -593,7 +665,7 @@ def stream_with_soc_orchestrator(
         for event, payload in stream_soc_conversation(
             message=request.message,
             conversation_id=conversation_id,
-            organization_id=principal.organization_id,
+            organization_id=principal.scope_id,
             user_id=principal.user_id,
         ):
             yield _sse(event, payload)

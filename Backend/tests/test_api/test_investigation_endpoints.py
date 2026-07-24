@@ -26,6 +26,7 @@ class FakeAgent:
                 severity="medium",
                 confidence=0.88,
                 escalate=True,
+                evidence_refs=["alert:alert-1"],
             ),
         }
 
@@ -33,9 +34,7 @@ class FakeAgent:
 PRINCIPAL = AuthPrincipal(
     user_id="user_test",
     session_id="sess_test",
-    organization_id="org_test",
-    organization_role="org:admin",
-    permissions=frozenset(),
+    scope_id="user_test",
 )
 
 
@@ -45,6 +44,7 @@ def test_investigation_and_chat_routes_are_registered():
     assert "/api/v1/investigations" in paths
     assert "/api/v1/investigations/{investigation_id}" in paths
     assert "/api/v1/investigations/{investigation_id}/approval" in paths
+    assert "/api/v1/investigations/{investigation_id}/execute" in paths
     assert "/api/v1/investigations/{investigation_id}/report" in paths
     assert "/api/v1/investigations/{investigation_id}/agent-runs" in paths
     assert "/api/v1/investigations/{investigation_id}/audit" in paths
@@ -70,6 +70,13 @@ def test_initial_investigation_state_matches_graph_contract():
     assert state["agent_id"] == "001"
     assert state["status"] == "created"
     assert state["audit_events"] == []
+
+
+def test_public_api_data_hides_internal_scope():
+    assert investigations._public_data({
+        "organization_id": "user_test",
+        "nested": [{"organization_id": "user_test", "status": "running"}],
+    }) == {"nested": [{"status": "running"}]}
 
 
 def test_chat_uses_selected_agent_and_returns_structured_output(monkeypatch):

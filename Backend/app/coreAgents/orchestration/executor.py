@@ -78,7 +78,12 @@ def execute_response(
 
     request = state.get("approval_request")
     decision = state.get("approval_decision")
-    if not isinstance(request, dict) or not isinstance(decision, dict):
+    authorization = state.get("execution_authorization")
+    if (
+        not isinstance(request, dict)
+        or not isinstance(decision, dict)
+        or not isinstance(authorization, dict)
+    ):
         return _executor_failure(state, code="VALID_APPROVAL_MISSING")
 
     if request.get("investigation_id") != state.get("investigation_id"):
@@ -93,6 +98,15 @@ def execute_response(
         return _executor_failure(state, code="APPROVAL_ID_MISMATCH")
     if decision.get("decision") != "approve" or not decision.get("approved_by"):
         return _executor_failure(state, code="VALID_APPROVAL_MISSING")
+    if authorization.get("approval_id") != decision.get("approval_id"):
+        return _executor_failure(state, code="APPROVAL_ID_MISMATCH")
+    action_ids = authorization.get("action_ids")
+    if (
+        not isinstance(action_ids, list)
+        or len(action_ids) != len(request.get("proposed_actions") or [])
+        or any(not isinstance(value, str) or not value for value in action_ids)
+    ):
+        return _executor_failure(state, code="ACTION_CLAIM_MISMATCH")
 
     expires_at = _parse_expiry(request.get("expires_at"))
     current_time = now or datetime.now(UTC)
@@ -198,7 +212,11 @@ def execute_response(
             )
 
     executed = list(state.get("executed_actions", []))
-    for action, target in zip(approved_actions, validated_targets):
+    for action_id, action, target in zip(
+        action_ids,
+        approved_actions,
+        validated_targets,
+    ):
         action_type = action["action_type"]
         try:
             if action_type == "block_ip":
@@ -224,11 +242,15 @@ def execute_response(
 
         executed.append(
             {
+                "action_id": action_id,
                 "action_type": action["action_type"],
                 "target": target,
-                "status": execution_status,
+                "status": "executed",
+                "provider_status": execution_status,
                 "approval_id": decision["approval_id"],
                 "approved_by": decision["approved_by"],
+                "execution_id": authorization["execution_id"],
+                "executed_by": authorization["executed_by"],
             }
         )
 

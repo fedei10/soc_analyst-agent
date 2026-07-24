@@ -1,11 +1,10 @@
-"""Role-specific model selection and cross-provider fallbacks."""
+"""Fixed provider assignment for each SOC role."""
 
 from collections.abc import Sequence
 from typing import Literal
 
 from langchain.agents.middleware import (
     ModelCallLimitMiddleware,
-    ModelFallbackMiddleware,
     ToolCallLimitMiddleware,
 )
 from pydantic import BaseModel
@@ -37,40 +36,29 @@ STRUCTURED_MODELS = {
     "gemini": gemini_structured_llm,
 }
 
-# Different primaries spread normal traffic across quotas. Every model call can
-# fail over to the other providers when a provider is throttled or unavailable.
-AGENT_PROVIDER_ORDER: dict[AgentRole, tuple[ProviderName, ...]] = {
-    "chat": ("gemini", "cerebras", "groq", "oxy"),
-    "l1": ("groq", "oxy", "cerebras", "gemini"),
-    "l2": ("cerebras", "oxy", "groq", "gemini"),
-    "l3": ("gemini", "oxy", "cerebras", "groq"),
+AGENT_PROVIDER: dict[AgentRole, ProviderName] = {
+    "chat": "gemini",
+    "l1": "cerebras",
+    "l2": "groq",
+    "l3": "oxy",
 }
-ROUTER_PROVIDER_ORDER: tuple[ProviderName, ...] = (
-    "oxy",
-    "groq",
-    "gemini",
-    "cerebras",
-)
-FORMATTER_PROVIDER_ORDER: tuple[ProviderName, ...] = (
-    "gemini",
-    "groq",
-    "oxy",
-    "cerebras",
-)
+ROUTER_PROVIDER_ORDER: tuple[ProviderName, ...] = ("gemini",)
+FORMATTER_PROVIDER_ORDER: tuple[ProviderName, ...] = ("gemini",)
 
 
 def get_agent_model(role: AgentRole):
-    return AGENT_MODELS[AGENT_PROVIDER_ORDER[role][0]]
+    return AGENT_MODELS[get_agent_provider(role)]
+
+
+def get_agent_provider(role: AgentRole) -> ProviderName:
+    return AGENT_PROVIDER[role]
 
 
 def get_agent_middleware(role: AgentRole) -> list:
-    order = AGENT_PROVIDER_ORDER[role]
-    fallbacks = [AGENT_MODELS[name] for name in order[1:]]
     model_limit = 10 if role == "chat" else 8
     tool_limit = 8 if role == "chat" else 6
     return [
         ModelCallLimitMiddleware(run_limit=model_limit, exit_behavior="end"),
-        ModelFallbackMiddleware(*fallbacks),
         ToolCallLimitMiddleware(run_limit=tool_limit, exit_behavior="continue"),
     ]
 

@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import uuid
 from copy import deepcopy
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -32,6 +33,10 @@ from app.db.session import (
 
 
 TERMINAL_STATUSES = {"completed", "failed", "rejected"}
+
+
+class ResponseExecutionConflictError(RuntimeError):
+    pass
 
 
 def _json_value(value: Any) -> Any:
@@ -134,12 +139,29 @@ class InvestigationRepository(Protocol):
         organization_id: str,
     ) -> list[dict[str, Any]]: ...
 
+    def claim_response_actions(
+        self,
+        investigation_id: str,
+        *,
+        organization_id: str,
+        approval_id: str,
+        executed_by: str,
+    ) -> dict[str, Any]: ...
+
+    def mark_execution_failed(
+        self,
+        execution_id: str,
+        *,
+        organization_id: str,
+    ) -> None: ...
+
 
 class InMemoryInvestigationRepository:
     durable = False
 
     def __init__(self) -> None:
         self._snapshots: dict[tuple[str, str], dict[str, Any]] = {}
+        self._claims: dict[tuple[str, str], dict[str, Any]] = {}
         self._lock = RLock()
 
     def save_snapshot(self, snapshot: dict[str, Any]) -> None:
@@ -295,6 +317,75 @@ class InMemoryInvestigationRepository:
                 else None
             ),
         }]
+
+    def claim_response_actions(
+        self,
+        investigation_id: str,
+        *,
+        organization_id: str,
+        approval_id: str,
+        executed_by: str,
+    ) -> dict[str, Any]:
+        with self._lock:
+            key = (organization_id, investigation_id)
+            snapshot = self._snapshots.get(key)
+            if snapshot is None:
+                raise ResponseExecutionConflictError(
+                    "Investigation is not persisted."
+                )
+            decision = snapshot.get("approval_decision") or {}
+            if (
+                decision.get("decision") != "approve"
+                or decision.get("approval_id") != approval_id
+            ):
+                raise ResponseExecutionConflictError(
+                    "Actions are not approved."
+                )
+            if key in self._claims:
+                raise ResponseExecutionConflictError(
+                    "Response actions were already claimed."
+                )
+            actions = snapshot.get("approval_request", {}).get(
+                "proposed_actions",
+                [],
+            )
+            if not actions:
+                raise ResponseExecutionConflictError(
+                    "No approved response actions exist."
+                )
+            execution_id = f"EXE-{uuid.uuid4().hex}"
+            action_ids = [
+                _stable_id(
+                    "ACT",
+                    investigation_id,
+                    index,
+                    action.get("action_type"),
+                    action.get("target"),
+                )
+                for index, action in enumerate(actions)
+            ]
+            claim = {
+                "execution_id": execution_id,
+                "action_ids": action_ids,
+                "executed_by": executed_by,
+            }
+            self._claims[key] = claim
+            return deepcopy(claim)
+
+    def mark_execution_failed(
+        self,
+        execution_id: str,
+        *,
+        organization_id: str,
+    ) -> None:
+        with self._lock:
+            for key, claim in self._claims.items():
+                if (
+                    key[0] == organization_id
+                    and claim["execution_id"] == execution_id
+                ):
+                    claim["status"] = "failed"
+                    return
 
 
 class SQLAlchemyInvestigationRepository:
@@ -833,13 +924,13 @@ class SQLAlchemyInvestigationRepository:
                 status = "approved"
             else:
                 status = "proposed"
-            action_id = _stable_id(
+            action_id = str(action.get("action_id") or _stable_id(
                 "ACT",
                 investigation_id,
                 index,
                 action.get("action_type"),
                 action.get("target"),
-            )
+            ))
             record = session.get(ResponseActionRecord, action_id)
             details = {**action, **(execution or {})}
             if record is None:
@@ -857,17 +948,98 @@ class SQLAlchemyInvestigationRepository:
                         decision.get("approved_by_user_id")
                         or snapshot.get("owner_user_id")
                     ),
+                    execution_id=(
+                        execution.get("execution_id") if execution else None
+                    ),
+                    executor_user_id=(
+                        execution.get("executed_by") if execution else None
+                    ),
+                    executed_at=(
+                        datetime.now(UTC) if execution else None
+                    ),
                     details=details,
                 ))
             else:
-                record.status = status
+                if not (
+                    record.status == "executing"
+                    and status == "approved"
+                ):
+                    record.status = status
                 record.approval_id = decision.get("approval_id")
                 record.approved_by = decision.get("approved_by")
                 record.approved_by_user_id = (
                     decision.get("approved_by_user_id")
                     or record.approved_by_user_id
                 )
+                if execution:
+                    record.execution_id = execution.get(
+                        "execution_id",
+                        record.execution_id,
+                    )
+                    record.executor_user_id = execution.get(
+                        "executed_by",
+                        record.executor_user_id,
+                    )
+                    record.executed_at = record.executed_at or datetime.now(UTC)
                 record.details = details
+
+    def claim_response_actions(
+        self,
+        investigation_id: str,
+        *,
+        organization_id: str,
+        approval_id: str,
+        executed_by: str,
+    ) -> dict[str, Any]:
+        execution_id = f"EXE-{uuid.uuid4().hex}"
+        now = datetime.now(UTC)
+        with self._session_factory.begin() as session:
+            records = list(session.scalars(
+                select(ResponseActionRecord)
+                .where(
+                    ResponseActionRecord.investigation_id == investigation_id,
+                    ResponseActionRecord.organization_id == organization_id,
+                    ResponseActionRecord.approval_id == approval_id,
+                )
+                .order_by(ResponseActionRecord.created_at)
+                .with_for_update()
+            ).all())
+            if not records:
+                raise ResponseExecutionConflictError(
+                    "No approved response actions exist."
+                )
+            if any(record.status != "approved" for record in records):
+                raise ResponseExecutionConflictError(
+                    "Response actions are already claimed or completed."
+                )
+            for record in records:
+                record.status = "executing"
+                record.execution_id = execution_id
+                record.executor_user_id = executed_by
+                record.claimed_at = now
+            return {
+                "execution_id": execution_id,
+                "action_ids": [record.action_id for record in records],
+                "executed_by": executed_by,
+            }
+
+    def mark_execution_failed(
+        self,
+        execution_id: str,
+        *,
+        organization_id: str,
+    ) -> None:
+        with self._session_factory.begin() as session:
+            records = list(session.scalars(
+                select(ResponseActionRecord).where(
+                    ResponseActionRecord.execution_id == execution_id,
+                    ResponseActionRecord.organization_id == organization_id,
+                    ResponseActionRecord.status == "executing",
+                )
+            ).all())
+            for record in records:
+                record.status = "execution_failed"
+                record.executed_at = datetime.now(UTC)
 
     def get_snapshot(
         self,
@@ -1063,6 +1235,10 @@ class SQLAlchemyInvestigationRepository:
                     "approval_id": record.approval_id,
                     "approved_by": record.approved_by,
                     "approved_by_user_id": record.approved_by_user_id,
+                    "execution_id": record.execution_id,
+                    "executor_user_id": record.executor_user_id,
+                    "claimed_at": record.claimed_at,
+                    "executed_at": record.executed_at,
                     "details": deepcopy(record.details),
                     "created_at": record.created_at,
                     "updated_at": record.updated_at,

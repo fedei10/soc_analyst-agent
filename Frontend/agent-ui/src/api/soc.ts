@@ -215,3 +215,16 @@ export function submitApproval(
     }
   )
 }
+
+export function executeApprovedResponse(
+  investigationId: string,
+  approvalId: string
+): Promise<Investigation> {
+  return request(
+    `/api/v1/investigations/${encodeURIComponent(investigationId)}/execute`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ approval_id: approvalId })
+    }
+  )
+}

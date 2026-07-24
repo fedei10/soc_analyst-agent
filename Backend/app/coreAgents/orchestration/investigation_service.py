@@ -17,6 +17,7 @@ from app.db.checkpointer import (
 )
 from app.db.repositories.investigations import (
     InvestigationRepository,
+    ResponseExecutionConflictError,
     get_investigation_repository,
 )
 
@@ -157,18 +158,72 @@ class InvestigationService:
         *,
         organization_id: str | None = None,
     ) -> dict[str, Any]:
-        self.snapshot(
-            investigation_id,
-            organization_id=organization_id,
-        )
-        self.graph.invoke(
-            Command(resume=decision),
-            config=investigation_config(investigation_id),
-        )
-        return self.snapshot(
-            investigation_id,
-            organization_id=organization_id,
-        )
+        with self._lock:
+            self.snapshot(
+                investigation_id,
+                organization_id=organization_id,
+            )
+            self.graph.invoke(
+                Command(resume=decision),
+                config=investigation_config(investigation_id),
+            )
+            return self.snapshot(
+                investigation_id,
+                organization_id=organization_id,
+            )
+
+    def execute_approved(
+        self,
+        investigation_id: str,
+        *,
+        approval_id: str,
+        executed_by: str,
+        organization_id: str,
+    ) -> dict[str, Any]:
+        with self._lock:
+            before = self.snapshot(
+                investigation_id,
+                organization_id=organization_id,
+            )
+            if "execution_authorization" not in before["pending_nodes"]:
+                raise ResponseExecutionConflictError(
+                    "Investigation is not waiting for response execution."
+                )
+            request = before.get("approval_request") or {}
+            if request.get("approval_id") != approval_id:
+                raise ResponseExecutionConflictError(
+                    "Approval ID does not match this investigation."
+                )
+            claim = self.repository.claim_response_actions(
+                investigation_id,
+                organization_id=organization_id,
+                approval_id=approval_id,
+                executed_by=executed_by,
+            )
+            try:
+                self.graph.invoke(
+                    Command(resume={
+                        "approval_id": approval_id,
+                        **claim,
+                    }),
+                    config=investigation_config(investigation_id),
+                )
+                result = self.snapshot(
+                    investigation_id,
+                    organization_id=organization_id,
+                )
+            except Exception:
+                self.repository.mark_execution_failed(
+                    claim["execution_id"],
+                    organization_id=organization_id,
+                )
+                raise
+            if result.get("status") == "failed":
+                self.repository.mark_execution_failed(
+                    claim["execution_id"],
+                    organization_id=organization_id,
+                )
+            return result
 
     def list_recent(
         self,

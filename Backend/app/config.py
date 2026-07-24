@@ -32,7 +32,9 @@ class Settings(BaseSettings):
     CLERK_SECRET_KEY: SecretStr = SecretStr("")
     CLERK_JWT_KEY: SecretStr = SecretStr("")
     CLERK_AUTHORIZED_PARTIES: str = "http://localhost:3000"
-    CLERK_REQUIRE_ORGANIZATION: bool = True
+    # Comma-separated Clerk user IDs allowed to execute approved responses.
+    # Empty means no user can execute, while approval remains a separate step.
+    CLERK_EXECUTOR_USER_IDS: str = ""
 
     # LangSmith tracing
     LANGSMITH_API_KEY: SecretStr = SecretStr("")

@@ -1,4 +1,4 @@
-"""Durable, organization-scoped SOC records."""
+"""Durable user-scoped SOC records."""
 
 from datetime import UTC, datetime
 from typing import Any
@@ -42,37 +42,6 @@ class UserRecord(Base):
         DateTime(timezone=True),
         default=utc_now,
         onupdate=utc_now,
-    )
-
-
-class OrganizationMembershipRecord(Base):
-    __tablename__ = "soc_organization_memberships"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    organization_id: Mapped[str] = mapped_column(String(128), index=True)
-    user_id: Mapped[str] = mapped_column(
-        ForeignKey("soc_users.user_id", ondelete="CASCADE"),
-        index=True,
-    )
-    role: Mapped[str] = mapped_column(String(64), index=True)
-    permissions: Mapped[list[str]] = mapped_column(JSON_VALUE, default=list)
-    active: Mapped[bool] = mapped_column(default=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=utc_now,
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=utc_now,
-        onupdate=utc_now,
-    )
-
-    __table_args__ = (
-        UniqueConstraint(
-            "organization_id",
-            "user_id",
-            name="uq_soc_membership_organization_user",
-        ),
     )
 
 
@@ -321,6 +290,22 @@ class ResponseActionRecord(Base):
     approved_by: Mapped[str | None] = mapped_column(String(100))
     approved_by_user_id: Mapped[str | None] = mapped_column(
         String(128),
+        index=True,
+    )
+    execution_id: Mapped[str | None] = mapped_column(
+        String(100),
+        index=True,
+    )
+    executor_user_id: Mapped[str | None] = mapped_column(
+        String(128),
+        index=True,
+    )
+    claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        index=True,
+    )
+    executed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
         index=True,
     )
     details: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE)

@@ -1,6 +1,5 @@
 from langchain.agents.middleware import (
     ModelCallLimitMiddleware,
-    ModelFallbackMiddleware,
     ToolCallLimitMiddleware,
 )
 from langchain_core.runnables import RunnableLambda
@@ -13,27 +12,25 @@ class SampleResult(BaseModel):
     summary: str
 
 
-def test_each_soc_tier_has_a_different_primary_provider():
-    assert model_pool.AGENT_PROVIDER_ORDER["l1"][0] == "groq"
-    assert model_pool.AGENT_PROVIDER_ORDER["l2"][0] == "cerebras"
-    assert model_pool.AGENT_PROVIDER_ORDER["l3"][0] == "gemini"
+def test_each_soc_role_has_the_assigned_provider():
+    assert model_pool.AGENT_PROVIDER["chat"] == "gemini"
+    assert model_pool.AGENT_PROVIDER["l1"] == "cerebras"
+    assert model_pool.AGENT_PROVIDER["l2"] == "groq"
+    assert model_pool.AGENT_PROVIDER["l3"] == "oxy"
 
 
-def test_every_agent_role_can_fall_back_to_all_other_providers():
-    expected = {"groq", "oxy", "cerebras", "gemini"}
-    for order in model_pool.AGENT_PROVIDER_ORDER.values():
-        assert set(order) == expected
-        assert len(order) == len(expected)
+def test_orchestrator_uses_only_gemini():
+    assert model_pool.ROUTER_PROVIDER_ORDER == ("gemini",)
 
 
-def test_agent_middleware_limits_calls_and_adds_fallbacks():
+def test_agent_middleware_limits_calls_without_cross_provider_fallbacks():
     middleware = model_pool.get_agent_middleware("l2")
     assert any(isinstance(item, ModelCallLimitMiddleware) for item in middleware)
-    assert any(isinstance(item, ModelFallbackMiddleware) for item in middleware)
     assert any(isinstance(item, ToolCallLimitMiddleware) for item in middleware)
+    assert len(middleware) == 2
 
 
-def test_structured_model_uses_next_provider_after_failure(monkeypatch):
+def test_structured_model_uses_only_assigned_provider(monkeypatch):
     class FakeStructuredModel:
         def __init__(self, result=None, error=None):
             self.result = result
@@ -49,18 +46,13 @@ def test_structured_model_uses_next_provider_after_failure(monkeypatch):
 
     monkeypatch.setitem(
         model_pool.STRUCTURED_MODELS,
-        "oxy",
-        FakeStructuredModel(error=RuntimeError("rate limited")),
-    )
-    monkeypatch.setitem(
-        model_pool.STRUCTURED_MODELS,
-        "groq",
-        FakeStructuredModel(result={"summary": "fallback worked"}),
+        "cerebras",
+        FakeStructuredModel(result={"summary": "assigned provider worked"}),
     )
 
     runnable = model_pool.get_structured_model(
         SampleResult,
-        ("oxy", "groq"),
+        ("cerebras",),
     )
 
-    assert runnable.invoke("test").summary == "fallback worked"
+    assert runnable.invoke("test").summary == "assigned provider worked"

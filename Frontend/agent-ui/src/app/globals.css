@@ -76,26 +76,6 @@
   background: var(--ink-0);
 }
 
-.organization-required {
-  display: flex;
-  max-width: 420px;
-  flex-direction: column;
-  align-items: center;
-  gap: 18px;
-  color: var(--text);
-  text-align: center;
-}
-
-.organization-required > svg {
-  color: var(--green);
-}
-
-.organization-required h1 {
-  margin: 0;
-  font-size: 24px;
-  letter-spacing: 0;
-}
-
 ::-webkit-scrollbar {
   width: var(--scrollbar-width);
   height: var(--scrollbar-width);
@@ -357,32 +337,10 @@
   padding-right: 8px;
 }
 
-.clerk-controls .cl-organizationSwitcherTrigger {
-  height: 32px;
-  max-width: 220px;
-  border: 1px solid var(--line);
-  border-radius: 5px;
-  background: var(--ink-2);
-  color: var(--text-soft);
-  box-shadow: none;
-}
-
 .clerk-controls .cl-userButtonAvatarBox {
   width: 30px;
   height: 30px;
   border: 1px solid var(--line-strong);
-}
-
-.permission-notice {
-  display: inline-flex;
-  min-height: 36px;
-  align-items: center;
-  border: 1px solid rgba(243, 201, 105, 0.3);
-  border-radius: 5px;
-  padding: 8px 10px;
-  background: rgba(243, 201, 105, 0.06);
-  color: var(--amber);
-  font-size: 11px;
 }
 
 .health-pill,
@@ -1630,10 +1588,6 @@
 
   .clerk-controls {
     margin-right: auto;
-  }
-
-  .clerk-controls .cl-organizationSwitcherTrigger {
-    max-width: min(190px, 52vw);
   }
 
   .soc-topbar h1 {

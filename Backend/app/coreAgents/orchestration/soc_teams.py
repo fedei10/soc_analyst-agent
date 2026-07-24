@@ -14,6 +14,7 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
 from app.coreAgents.orchestration.agent_runner import invoke_validated_agent
+from app.coreAgents.orchestration.evidence import validate_result_evidence
 from app.coreAgents.orchestration.schemas import (
     L1Result,
     L2Result,
@@ -221,7 +222,6 @@ def _specialist_payload(
     return {
         "task": spec.purpose,
         **_team_context(state, tier),
-        "prior_specialist_findings": state.get("specialist_findings", {}),
     }
 
 
@@ -524,6 +524,7 @@ def _specialist_node(
                     }
                 ],
                 result_model=result_model,
+                role=tier,
             )
         except Exception:
             completed_at = datetime.now(UTC)
@@ -617,6 +618,7 @@ def _final_result_update(
 ) -> dict[str, Any]:
     if tier == "l1":
         validated = L1Result.model_validate(result)
+        validate_result_evidence(state, validated)
         return {
             "status": "running",
             "current_stage": "l1_completed",
@@ -630,6 +632,7 @@ def _final_result_update(
         }
     if tier == "l2":
         validated = L2Result.model_validate(result)
+        validate_result_evidence(state, validated)
         return {
             "status": "running",
             "current_stage": "l2_completed",
@@ -641,6 +644,7 @@ def _final_result_update(
         }
 
     validated = L3Result.model_validate(result)
+    validate_result_evidence(state, validated)
     return {
         "status": "running",
         "current_stage": "l3_completed",
@@ -722,6 +726,7 @@ def _supervisor_node(
                     }
                 ],
                 result_model=result_models[tier],
+                role=tier,
             )
         except Exception:
             completed_at = datetime.now(UTC)
@@ -764,8 +769,46 @@ def _supervisor_node(
             }
 
         completed_at = datetime.now(UTC)
+        try:
+            final_update = _final_result_update(state, tier, result)
+        except ValueError:
+            completed_at = datetime.now(UTC)
+            error_code = "UNSUPPORTED_EVIDENCE_REFERENCE"
+            return {
+                "status": "failed",
+                "current_stage": "failed",
+                "errors": [{
+                    "stage": tier,
+                    "code": error_code,
+                    "message": "Model conclusions cite unavailable evidence.",
+                }],
+                "specialist_runs": [
+                    _run_record(
+                        tier=tier,
+                        role=reported_role,
+                        run_id=run_id,
+                        started_at=started_at,
+                        completed_at=completed_at,
+                        status="failed",
+                        payload=payload,
+                        response=response,
+                        result=result,
+                        error_code=error_code,
+                    )
+                ],
+                "audit_events": [
+                    _audit_event(
+                        state,
+                        tier=tier,
+                        role=reported_role,
+                        run_id=run_id,
+                        event="subagent_failed",
+                        timestamp=completed_at,
+                    )
+                ],
+            }
         return {
-            **_final_result_update(state, tier, result),
+            **final_update,
             "specialist_runs": [
                 _run_record(
                     tier=tier,

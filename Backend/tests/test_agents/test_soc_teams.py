@@ -87,6 +87,7 @@ def l1_agents(*, first_error=None, second_error=None):
                 confidence=0.9,
                 escalate=True,
                 evidence=[{"alert_id": "alert-1"}],
+                evidence_refs=["alert:alert-1"],
             ),
             call_order=order,
         ),
@@ -124,6 +125,7 @@ def l2_agents():
                 timeline=[{"timestamp": "2026-07-23T10:00:00Z"}],
                 affected_assets=["agent-001"],
                 requires_l3=True,
+                evidence_refs=["alert:alert-1"],
             ),
             call_order=order,
         ),
@@ -154,6 +156,7 @@ def l3_agents():
                         "reason": "Confirmed malicious authentication",
                         "risk_level": "medium",
                         "operational_impact": "May block a legitimate administrator",
+                        "evidence_refs": ["alert:alert-1"],
                     }
                 ],
             ),
@@ -163,6 +166,7 @@ def l3_agents():
             "l3_supervisor",
             L3Result(
                 summary="Containment requires approval",
+                evidence_refs=["alert:alert-1"],
                 proposed_actions=[
                     {
                         "action_type": "block_ip",
@@ -170,6 +174,7 @@ def l3_agents():
                         "reason": "Confirmed malicious authentication",
                         "risk_level": "medium",
                         "operational_impact": "May block a legitimate administrator",
+                        "evidence_refs": ["alert:alert-1"],
                     }
                 ],
             ),
@@ -438,6 +443,7 @@ def test_parent_graph_inherits_team_state_without_duplicate_run_records():
         classification="benign",
         severity="low",
         confidence=0.95,
+        evidence_refs=["alert:alert-1"],
     )
     graph = create_investigation_graph(
         gateway=FakeGateway(),

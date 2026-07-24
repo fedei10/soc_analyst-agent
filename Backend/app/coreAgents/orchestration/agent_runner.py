@@ -37,6 +37,7 @@ def invoke_validated_agent(
     *,
     messages: list[dict[str, Any]],
     result_model: type[BaseModel],
+    role: str | None = None,
 ) -> tuple[dict[str, Any], BaseModel]:
     """Execute tools, then normalize the transcript into a validated result."""
     response = agent.invoke({"messages": messages})
@@ -54,12 +55,18 @@ def invoke_validated_agent(
 
     from app.coreAgents.llm.model_pool import (
         FORMATTER_PROVIDER_ORDER,
+        get_agent_provider,
         get_structured_model,
     )
 
+    provider_order = (
+        (get_agent_provider(role),)
+        if role is not None
+        else FORMATTER_PROVIDER_ORDER
+    )
     formatter = get_structured_model(
         result_model,
-        FORMATTER_PROVIDER_ORDER,
+        provider_order,
     )
     validated = formatter.invoke(
         [

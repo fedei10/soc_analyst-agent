@@ -60,7 +60,9 @@ class InvestigationState(TypedDict, total=False):
     proposed_actions: NotRequired[list[dict[str, Any]]]
     approval_request: NotRequired[dict[str, Any] | None]
     approval_decision: NotRequired[dict[str, Any] | None]
+    execution_authorization: NotRequired[dict[str, Any] | None]
     executed_actions: NotRequired[list[dict[str, Any]]]
+    verification_results: NotRequired[list[dict[str, Any]]]
 
     final_report: NotRequired[dict[str, Any] | None]
 

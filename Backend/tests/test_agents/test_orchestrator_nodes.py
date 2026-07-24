@@ -41,6 +41,7 @@ def test_l1_node_stores_validated_structured_output():
         confidence=0.82,
         escalate=True,
         evidence=[{"alert_id": "alert-1"}],
+        evidence_refs=["alert:alert-1"],
     )
     agent = FakeAgent(result)
 
@@ -75,6 +76,7 @@ def test_l2_node_stores_timeline_and_assets():
             timeline=[{"timestamp": "2026-07-23T10:00:00Z"}],
             affected_assets=["agent-001"],
             requires_l3=True,
+            evidence_refs=["alert:alert-1"],
         )
     )
 
@@ -98,6 +100,7 @@ def test_l3_node_can_propose_but_not_execute_actions():
     agent = FakeAgent(
         L3Result(
             summary="Containment recommended",
+            evidence_refs=["alert:alert-1"],
             proposed_actions=[
                 {
                     "action_type": "block_ip",
@@ -105,6 +108,7 @@ def test_l3_node_can_propose_but_not_execute_actions():
                     "reason": "Malicious authentication",
                     "risk_level": "medium",
                     "operational_impact": "May block a legitimate administrator",
+                    "evidence_refs": ["alert:alert-1"],
                 }
             ],
         )

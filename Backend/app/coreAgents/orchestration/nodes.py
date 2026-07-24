@@ -10,12 +10,14 @@ from langgraph.types import interrupt
 from app.coreAgents.orchestration.schemas import (
     ApprovalDecision,
     ApprovalRequest,
+    ExecutionAuthorization,
     L1Result,
     L2Result,
     L3Result,
     ProposedAction,
 )
 from app.coreAgents.orchestration.routing import requires_approval
+from app.coreAgents.orchestration.evidence import validate_result_evidence
 from app.coreAgents.orchestration.state import InvestigationState
 from app.coreAgents.orchestration.agent_runner import invoke_validated_agent
 
@@ -175,6 +177,7 @@ def invoke_structured_agent(
     *,
     payload: dict,
     result_model: type[BaseModel],
+    role: str,
 ) -> BaseModel:
     _, validated = invoke_validated_agent(
         agent,
@@ -185,6 +188,7 @@ def invoke_structured_agent(
             }
         ],
         result_model=result_model,
+        role=role,
     )
     return validated
 
@@ -208,11 +212,20 @@ def run_l1(state: InvestigationState, *, agent=None) -> dict:
                 "evidence": state.get("evidence", []),
             },
             result_model=L1Result,
+            role="l1",
         )
     except Exception:
         return failed_update(state, stage="l1", code="L1_AGENT_FAILED")
 
     validated = L1Result.model_validate(result)
+    try:
+        validate_result_evidence(state, validated)
+    except ValueError:
+        return failed_update(
+            state,
+            stage="l1",
+            code="UNSUPPORTED_EVIDENCE_REFERENCE",
+        )
     return {
         "status": "running",
         "current_stage": "l1_completed",
@@ -245,11 +258,20 @@ def run_l2(state: InvestigationState, *, agent=None) -> dict:
                 "evidence": state.get("evidence", []),
             },
             result_model=L2Result,
+            role="l2",
         )
     except Exception:
         return failed_update(state, stage="l2", code="L2_AGENT_FAILED")
 
     validated = L2Result.model_validate(result)
+    try:
+        validate_result_evidence(state, validated)
+    except ValueError:
+        return failed_update(
+            state,
+            stage="l2",
+            code="UNSUPPORTED_EVIDENCE_REFERENCE",
+        )
     return {
         "status": "running",
         "current_stage": "l2_completed",
@@ -286,11 +308,20 @@ def run_l3(state: InvestigationState, *, agent=None) -> dict:
                 "affected_assets": state.get("affected_assets", []),
             },
             result_model=L3Result,
+            role="l3",
         )
     except Exception:
         return failed_update(state, stage="l3", code="L3_AGENT_FAILED")
 
     validated = L3Result.model_validate(result)
+    try:
+        validate_result_evidence(state, validated)
+    except ValueError:
+        return failed_update(
+            state,
+            stage="l3",
+            code="UNSUPPORTED_EVIDENCE_REFERENCE",
+        )
     return {
         "status": "running",
         "current_stage": "l3_completed",
@@ -322,6 +353,7 @@ def prepare_actions(state: InvestigationState) -> dict:
         "reason",
         "risk_level",
         "operational_impact",
+        "evidence_refs",
     }
     try:
         for raw_action in raw_actions:
@@ -383,6 +415,7 @@ def mark_awaiting_approval(state: InvestigationState) -> dict:
                     "reason",
                     "risk_level",
                     "operational_impact",
+                    "evidence_refs",
                 }
             }
             for action in actions
@@ -499,6 +532,66 @@ def mark_response_approved(state: InvestigationState) -> dict:
     }
 
 
+def request_execution_authorization(state: InvestigationState) -> dict:
+    """Pause after approval so only the executor operation can continue."""
+    request = state.get("approval_request") or {}
+    decision = state.get("approval_decision") or {}
+    if (
+        decision.get("decision") != "approve"
+        or decision.get("approval_id") != request.get("approval_id")
+    ):
+        return failed_update(
+            state,
+            stage="response_execution",
+            code="VALID_APPROVAL_MISSING",
+        )
+
+    raw_authorization = interrupt({
+        "type": "response_execution",
+        "investigation_id": state["investigation_id"],
+        "approval_id": request["approval_id"],
+        "action_count": len(request.get("proposed_actions", [])),
+    })
+    try:
+        authorization = ExecutionAuthorization.model_validate(
+            raw_authorization
+        )
+    except (TypeError, ValueError):
+        return failed_update(
+            state,
+            stage="response_execution",
+            code="INVALID_EXECUTION_AUTHORIZATION",
+        )
+    if authorization.approval_id != request.get("approval_id"):
+        return failed_update(
+            state,
+            stage="response_execution",
+            code="APPROVAL_ID_MISMATCH",
+        )
+    if len(authorization.action_ids) != len(
+        request.get("proposed_actions", [])
+    ):
+        return failed_update(
+            state,
+            stage="response_execution",
+            code="ACTION_CLAIM_MISMATCH",
+        )
+    return {
+        "status": "running",
+        "current_stage": "response_execution_authorized",
+        "execution_authorization": authorization.model_dump(mode="json"),
+        "audit_events": [{
+            **audit_event(
+                state,
+                stage="response_execution",
+                event="response_execution_authorized",
+            ),
+            "execution_id": authorization.execution_id,
+            "executed_by": authorization.executed_by,
+        }],
+    }
+
+
 def create_final_report(state: InvestigationState) -> dict:
     l1 = state.get("l1_result") or {}
     l2 = state.get("l2_result") or {}
@@ -520,12 +613,22 @@ def create_final_report(state: InvestigationState) -> dict:
     if approval_decision.get("decision") == "reject":
         response_status = "rejected"
     elif executed_actions and all(
-        action.get("status") == "completed"
+        action.get("status") == "verified"
         for action in executed_actions
     ):
-        response_status = "completed"
+        response_status = "verified"
+    elif any(
+        action.get("status") == "verification_failed"
+        for action in executed_actions
+    ):
+        response_status = "verification_failed"
+    elif any(
+        action.get("status") == "verification_pending"
+        for action in executed_actions
+    ):
+        response_status = "verification_pending"
     elif executed_actions:
-        response_status = "queued"
+        response_status = "executed_unverified"
     else:
         response_status = "not_executed"
     report = {
@@ -538,6 +641,7 @@ def create_final_report(state: InvestigationState) -> dict:
         "mitre_techniques": l1.get("mitre_techniques", []),
         "recommendations": recommendations,
         "response_status": response_status,
+        "verification_results": state.get("verification_results", []),
     }
 
     return {

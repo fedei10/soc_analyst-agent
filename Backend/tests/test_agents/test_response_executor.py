@@ -76,6 +76,12 @@ def approved_state(*, action_type="block_ip", target="192.0.2.10"):
             "approval_id": "APR-001",
             "modified_actions": None,
         },
+        "execution_authorization": {
+            "approval_id": "APR-001",
+            "execution_id": "EXE-001",
+            "executed_by": "responder@example.com",
+            "action_ids": ["ACT-001"],
+        },
         "executed_actions": [],
         "audit_events": [],
         "errors": [],
@@ -208,7 +214,8 @@ def test_approved_block_ip_uses_allowlisted_responder_command():
     )
 
     assert update["status"] == "running"
-    assert update["executed_actions"][0]["status"] == "queued"
+    assert update["executed_actions"][0]["status"] == "executed"
+    assert update["executed_actions"][0]["provider_status"] == "queued"
     assert responder.calls == [
         {
             "agent_id": "001",
@@ -228,7 +235,7 @@ def test_approved_agent_restart_uses_wazuh_responder():
         settings_obj=settings(),
     )
 
-    assert update["executed_actions"][0]["status"] == "queued"
+    assert update["executed_actions"][0]["status"] == "executed"
     assert responder.calls == [{"restart_agent": "001"}]
 
 
@@ -246,7 +253,7 @@ def test_approved_service_restart_uses_allowlisted_system_executor():
 
     assert executor.validated == ["wazuh-agent.service"]
     assert executor.restarted == ["wazuh-agent.service"]
-    assert update["executed_actions"][0]["status"] == "completed"
+    assert update["executed_actions"][0]["status"] == "executed"
 
 
 def test_responder_failure_does_not_leak_details():

@@ -10,6 +10,7 @@ os.environ.setdefault("CEREBRAS_API_KEY", "test")
 os.environ.setdefault("GOOGLE_API_KEY", "test")
 os.environ["CLERK_SECRET_KEY"] = "sk_test_unit"
 os.environ["CLERK_AUTHORIZED_PARTIES"] = "http://testserver"
+os.environ["CLERK_EXECUTOR_USER_IDS"] = "user_responder"
 os.environ["LANGSMITH_TRACING"] = "false"
 os.environ["LANGCHAIN_TRACING_V2"] = "false"
 os.environ["DATABASE_URL"] = ""
@@ -21,7 +22,7 @@ os.environ["REDIS_REQUIRED"] = "false"
 
 @pytest.fixture(autouse=True)
 def fake_clerk_session(monkeypatch):
-    """Keep API tests offline while exercising real Clerk permission mapping."""
+    """Keep API tests offline while exercising Clerk user authentication."""
     from app.api.auth import deps
 
     def authenticate(request):
@@ -34,9 +35,6 @@ def fake_clerk_session(monkeypatch):
                 payload={
                     "sub": "user_responder",
                     "sid": "sess_responder",
-                    "org_id": "org_test",
-                    "org_role": "org:admin",
-                    "org_permissions": [],
                 },
             )
         if token == "test-read-key":
@@ -46,12 +44,6 @@ def fake_clerk_session(monkeypatch):
                 payload={
                     "sub": "user_analyst",
                     "sid": "sess_analyst",
-                    "org_id": "org_test",
-                    "org_role": "org:soc_analyst",
-                    "org_permissions": [
-                        deps.SOC_READ,
-                        deps.INVESTIGATIONS_CREATE,
-                    ],
                 },
             )
         return SimpleNamespace(

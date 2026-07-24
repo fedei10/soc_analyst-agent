@@ -12,6 +12,7 @@ and every response carries an X-Request-ID header for log correlation.
 import logging
 import uuid
 from contextlib import asynccontextmanager
+from typing import Callable
 
 import httpx
 from fastapi import FastAPI, Request
@@ -64,10 +65,55 @@ app = FastAPI(
     openapi_url=None,
     description=(
         "Wazuh-backed SOC platform API. Application endpoints require a verified "
-        "Clerk organization session and explicit SOC permissions."
+        "Clerk user session."
     ),
     lifespan=lifespan,
 )
+
+
+class RequestContextMiddleware:
+    """Attach request IDs and enforce JSON without BaseHTTPMiddleware."""
+
+    def __init__(self, application: Callable) -> None:
+        self.app = application
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope, receive=receive)
+        request.state.request_id = uuid.uuid4().hex[:16]
+        if request.method in {"POST", "PUT", "PATCH"}:
+            content_type = request.headers.get("content-type", "")
+            if not content_type.startswith("application/json"):
+                response = error_envelope(
+                    request,
+                    415,
+                    "unsupported_media_type",
+                    "Unsupported Media Type - send JSON.",
+                    f"received Content-Type: '{content_type or 'none'}'",
+                )
+                await response(scope, receive, send)
+                return
+
+        async def send_with_request_id(message):
+            if message["type"] == "http.response.start":
+                headers = [
+                    header
+                    for header in message.get("headers", [])
+                    if header[0].lower() != b"x-request-id"
+                ]
+                headers.append(
+                    (b"x-request-id", request.state.request_id.encode())
+                )
+                message["headers"] = headers
+            await send(message)
+
+        await self.app(scope, receive, send_with_request_id)
+
+
+app.add_middleware(RequestContextMiddleware)
 app.include_router(health_router, prefix="/api/v1")
 app.include_router(wazuh_read_router, prefix="/api/v1")
 app.include_router(wazuh_write_router, prefix="/api/v1")
@@ -104,25 +150,6 @@ def error_envelope(
     )
     # set here too: the 500 handler runs outside the middleware below
     response.headers["X-Request-ID"] = getattr(request.state, "request_id", "-")
-    return response
-
-
-@app.middleware("http")
-async def request_context(request: Request, call_next):
-    request.state.request_id = uuid.uuid4().hex[:16]
-
-    # ponytail: JSON-only API; loosen when multipart/file uploads arrive
-    if request.method in {"POST", "PUT", "PATCH"}:
-        content_type = request.headers.get("content-type", "")
-        if not content_type.startswith("application/json"):
-            return error_envelope(
-                request, 415, "unsupported_media_type",
-                "Unsupported Media Type — send the body as Content-Type: application/json.",
-                f"received Content-Type: '{content_type or 'none'}'",
-            )
-
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = request.state.request_id
     return response
 
 
@@ -245,6 +272,6 @@ async def unhandled_error_handler(request: Request, exc: Exception):
 
 
 @app.get("/health", tags=["health"])
-def liveness():
+async def liveness():
     """Bare liveness probe for uptime monitors and load balancers."""
     return {"status": "ok"}

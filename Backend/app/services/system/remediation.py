@@ -64,3 +64,15 @@ class SystemRemediationService:
             "status": "completed",
             "completed_at": datetime.now(UTC).isoformat(),
         }
+
+    def is_service_active(self, service_name: str) -> bool:
+        self.validate_service(service_name)
+        completed = subprocess.run(
+            ["systemctl", "is-active", "--quiet", service_name],
+            capture_output=True,
+            text=True,
+            timeout=self.timeout,
+            check=False,
+            shell=False,
+        )
+        return completed.returncode == 0

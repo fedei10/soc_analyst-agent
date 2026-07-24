@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -9,63 +10,53 @@ from app.api.auth import deps
 
 def _state(
     *,
-    role: str = "org:soc_analyst",
-    permissions: list[str] | None = None,
-    org_id: str | None = "org_test",
+    user_id: str = "user_test",
 ):
-    payload = {
-        "sub": "user_test",
-        "sid": "sess_test",
-        "org_role": role,
-        "org_permissions": permissions or [],
-    }
-    if org_id is not None:
-        payload["org_id"] = org_id
-    return SimpleNamespace(is_signed_in=True, payload=payload, reason=None)
+    return SimpleNamespace(
+        is_signed_in=True,
+        payload={"sub": user_id, "sid": "sess_test"},
+        reason=None,
+    )
 
 
 def _principal(monkeypatch, state):
     monkeypatch.setattr(deps, "authenticate_clerk_request", lambda _: state)
     request = Request({"type": "http", "headers": []})
-    return deps.require_principal(request, None)
+    return asyncio.run(deps.require_principal(request, None))
 
 
-def test_analyst_permissions_are_enforced(monkeypatch):
-    principal = _principal(
-        monkeypatch,
-        _state(
-            permissions=[
-                deps.SOC_READ,
-                deps.INVESTIGATIONS_CREATE,
-            ]
-        ),
-    )
+def test_authenticated_user_can_use_soc_dependencies(monkeypatch):
+    principal = _principal(monkeypatch, _state())
 
-    assert deps.require_read(principal) == principal
-    with pytest.raises(HTTPException) as approve:
-        deps.require_approve(principal)
-    assert approve.value.status_code == 403
-    with pytest.raises(HTTPException) as execute:
-        deps.require_write(principal)
-    assert execute.value.status_code == 403
+    assert asyncio.run(deps.require_read(principal)) == principal
+    assert asyncio.run(deps.require_investigate(principal)) == principal
+    assert asyncio.run(deps.require_approve(principal)) == principal
 
 
-def test_admin_role_can_use_all_soc_permissions(monkeypatch):
-    principal = _principal(monkeypatch, _state(role="org:admin"))
+def test_approval_does_not_grant_response_execution(monkeypatch):
+    principal = _principal(monkeypatch, _state(user_id="user_analyst"))
 
-    assert deps.require_read(principal) == principal
-    assert deps.require_approve(principal) == principal
-    assert deps.require_write(principal) == principal
-
-
-def test_active_organization_is_required(monkeypatch):
+    assert asyncio.run(deps.require_approve(principal)) == principal
     with pytest.raises(HTTPException) as error:
-        _principal(
-            monkeypatch,
-            _state(
-                permissions=[deps.SOC_READ],
-                org_id=None,
-            ),
-        )
+        asyncio.run(deps.require_execute(principal))
     assert error.value.status_code == 403
-    assert "organization" in str(error.value.detail).lower()
+
+
+def test_allowlisted_responder_can_execute(monkeypatch):
+    principal = _principal(monkeypatch, _state(user_id="user_responder"))
+
+    assert asyncio.run(deps.require_execute(principal)) == principal
+    assert asyncio.run(deps.require_write(principal)) == principal
+
+
+def test_user_id_is_the_private_data_scope(monkeypatch):
+    principal = _principal(monkeypatch, _state(user_id="user_personal"))
+
+    assert principal.scope_id == "user_personal"
+
+
+def test_subject_is_required(monkeypatch):
+    with pytest.raises(HTTPException) as error:
+        _principal(monkeypatch, _state(user_id=""))
+    assert error.value.status_code == 401
+    assert "subject" in str(error.value.detail).lower()

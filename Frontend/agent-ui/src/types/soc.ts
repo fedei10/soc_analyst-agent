@@ -74,6 +74,7 @@ export interface ProposedAction {
   operational_impact: string
   requires_approval: boolean
   execution_preview: string
+  evidence_refs: string[]
 }
 
 export interface ApprovalRequest {
@@ -107,6 +108,7 @@ export interface Investigation {
   approval_request?: ApprovalRequest | null
   approval_decision?: Record<string, unknown> | null
   executed_actions: Record<string, unknown>[]
+  verification_results?: Record<string, unknown>[]
   final_report?: Record<string, unknown> | null
   errors: Array<Record<string, unknown>>
   audit_events: AuditEvent[]

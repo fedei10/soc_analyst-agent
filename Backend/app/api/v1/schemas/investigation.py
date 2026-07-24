@@ -64,7 +64,6 @@ class AgentRunHistoryItem(APIModel):
     run_id: str
     parent_run_id: str | None = None
     investigation_id: str
-    organization_id: str
     tier: Literal["l1", "l2", "l3"]
     role: str
     attempt: int = Field(ge=1)
@@ -106,6 +105,10 @@ class ApprovalDecisionInput(APIModel):
         default=None,
         max_length=10,
     )
+
+
+class ResponseExecutionInput(APIModel):
+    approval_id: str = Field(min_length=1, max_length=100)
 
 
 class ChatHistoryMessage(APIModel):
@@ -159,6 +162,7 @@ __all__ = [
     "OrchestratorChatRequest",
     "ProposedAction",
     "ResponseActionHistoryItem",
+    "ResponseExecutionInput",
     "Severity",
     "StrictModel",
     "WRITE_ACTIONS",

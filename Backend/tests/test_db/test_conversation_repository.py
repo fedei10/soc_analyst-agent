@@ -27,43 +27,36 @@ def repositories():
     return ConversationRepository(factory), IdentityRepository(factory)
 
 
-def test_identity_and_conversation_history_are_organization_scoped():
+def test_identity_and_conversation_history_are_user_scoped():
     conversations, identities = repositories()
     identities.upsert_user(
         user_id="user-1",
         email="analyst@example.com",
         display_name="Analyst",
     )
-    membership = identities.upsert_membership(
-        organization_id="org-1",
-        user_id="user-1",
-        role="analyst",
-        permissions=["org:soc:read", "authorization-token"],
-    )
     conversations.create_conversation(
         conversation_id="conversation-1",
-        organization_id="org-1",
+        organization_id="user-1",
         owner_user_id="user-1",
         metadata={"active_asset": "host-1", "api_key": "not-stored"},
     )
     message = conversations.append_message(
         conversation_id="conversation-1",
-        organization_id="org-1",
+        organization_id="user-1",
         sender_user_id="user-1",
         role="user",
         content="Investigate host-1",
         metadata={"token": "not-stored", "source": "chat"},
     )
 
-    assert membership["role"] == "analyst"
     assert conversations.get_conversation(
         "conversation-1",
-        organization_id="org-2",
+        organization_id="user-2",
     ) is None
     assert message["metadata"] == {"source": "chat"}
     assert conversations.list_messages(
         "conversation-1",
-        organization_id="org-1",
+        organization_id="user-1",
     )[0]["content"] == "Investigate host-1"
 
 

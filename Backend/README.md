@@ -11,16 +11,10 @@ Copy the required values from `.env.example` into `.env.local`.
 - `REDIS_URL` includes the Compose Redis password.
 - `CLERK_SECRET_KEY` is the claimed Clerk application's server key.
 - `CLERK_AUTHORIZED_PARTIES` contains the frontend origin.
+- `CLERK_EXECUTOR_USER_IDS` lists Clerk users allowed to execute approved
+  responses. Empty denies execution.
 
 Never expose `CLERK_SECRET_KEY` through a `NEXT_PUBLIC_*` variable.
-
-Create these Clerk organization permissions and assign them to analyst,
-responder, and admin roles:
-
-- `org:soc:read`
-- `org:investigations:create`
-- `org:responses:approve`
-- `org:responses:execute`
 
 ## Run
 
@@ -32,7 +26,8 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
 Only `GET /health` is public. Application requests require a verified Clerk
-session token and active organization.
+session token. Investigations, conversations, and memory are isolated by the
+verified Clerk user ID.
 
 Useful authenticated endpoints:
 
@@ -44,21 +39,15 @@ Useful authenticated endpoints:
 - `GET /api/v1/investigations/{id}/events`
 - `GET /api/v1/investigations/{id}/approvals`
 - `POST /api/v1/investigations/{id}/approval`
+- `POST /api/v1/investigations/{id}/execute`
 
 The formal workflow uses fixed sequential L1, L2, and L3 teams. Each specialist
 has an exact read-only tool allowlist and a four-call limit. L3 response
-proposals still pass server policy and a human approval checkpoint before the
-existing response executor can run.
-
-## Existing Records
-
-Assign pre-Clerk records to an organization idempotently:
-
-```bash
-venv/bin/python -m app.db.backfill_organization \
-  --organization-id org_example \
-  --owner-user-id user_example
-```
+proposals pass server policy and a human approval checkpoint. Approval only
+records a decision. A separate executor operation atomically claims the
+approved actions, runs the allowlisted responder, and records post-action
+verification. Keep `WAZUH_READ_ONLY=true` and dangerous tools disabled until
+this path has been validated in the lab.
 
 Apply the default retention schedule with `make retention-clean`. Reports,
 approvals, actions, and curated memories are not automatically deleted.

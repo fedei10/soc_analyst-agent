@@ -1,11 +1,6 @@
 'use client'
 
-import {
-  OrganizationSwitcher,
-  Show,
-  UserButton,
-  useOrganization
-} from '@clerk/nextjs'
+import { UserButton, useUser } from '@clerk/nextjs'
 import {
   Activity,
   AlertTriangle,
@@ -39,6 +34,7 @@ import { toast } from 'sonner'
 
 import {
   createInvestigation,
+  executeApprovedResponse,
   getAlertSummary,
   getInvestigation,
   getInvestigationHistory,
@@ -259,7 +255,7 @@ function Metric({
 }
 
 export default function SocConsole() {
-  const { organization, isLoaded: organizationLoaded } = useOrganization()
+  const { user, isLoaded: userLoaded } = useUser()
   const [view, setView] = useState<WorkspaceView>('chat')
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [chatInput, setChatInput] = useState('')
@@ -282,9 +278,9 @@ export default function SocConsole() {
   const [alertId, setAlertId] = useState('')
   const [agentId, setAgentId] = useState('')
   const [modifiedActions, setModifiedActions] = useState('')
-  const organizationId = organization?.id
-  const conversationStorageKey = `tsage_conversation_id:${organizationId || 'none'}`
-  const investigationStorageKey = `tsage_investigation_id:${organizationId || 'none'}`
+  const userId = user?.id
+  const conversationStorageKey = `tsage_conversation_id:${userId || 'none'}`
+  const investigationStorageKey = `tsage_investigation_id:${userId || 'none'}`
 
   const activityTrace = useMemo(
     () =>
@@ -348,7 +344,7 @@ export default function SocConsole() {
   }
 
   useEffect(() => {
-    if (!organizationLoaded || !organizationId) return
+    if (!userLoaded || !userId) return
     setMessages([])
     setInvestigation(null)
     const storedInvestigation = sessionStorage.getItem(investigationStorageKey)
@@ -365,27 +361,10 @@ export default function SocConsole() {
         .catch(() => sessionStorage.removeItem(investigationStorageKey))
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [organizationLoaded, organizationId])
+  }, [userLoaded, userId])
 
-  if (!organizationLoaded) {
-    return <main className="auth-page">Loading organization...</main>
-  }
-
-  if (!organizationId) {
-    return (
-      <main className="auth-page">
-        <div className="organization-required">
-          <Shield size={30} />
-          <h1>Select a SOC organization</h1>
-          <OrganizationSwitcher
-            hidePersonal
-            afterCreateOrganizationUrl="/"
-            afterSelectOrganizationUrl="/"
-          />
-          <UserButton />
-        </div>
-      </main>
-    )
+  if (!userLoaded || !userId) {
+    return <main className="auth-page">Loading account...</main>
   }
 
   function resetChat() {
@@ -573,6 +552,30 @@ export default function SocConsole() {
     }
   }
 
+  async function handleExecution() {
+    const request = investigation?.approval_request
+    if (!investigation || !request) return
+
+    setInvestigationBusy(true)
+    try {
+      const result = await executeApprovedResponse(
+        investigation.investigation_id,
+        request.approval_id
+      )
+      setInvestigation(result)
+      void refreshInvestigationHistory()
+      toast.success('Approved response executed and verification recorded.')
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : 'Approved response could not be executed.'
+      )
+    } finally {
+      setInvestigationBusy(false)
+    }
+  }
+
   return (
     <div className="soc-shell">
       <aside className="soc-sidebar">
@@ -651,11 +654,6 @@ export default function SocConsole() {
           </div>
           <div className="topbar-actions">
             <div className="clerk-controls">
-              <OrganizationSwitcher
-                hidePersonal
-                afterCreateOrganizationUrl="/"
-                afterSelectOrganizationUrl="/"
-              />
               <UserButton />
             </div>
             <div
@@ -909,23 +907,14 @@ export default function SocConsole() {
                     pattern="[0-9]+"
                   />
                 </div>
-                <Show
-                  when={{ permission: 'org:investigations:create' }}
-                  fallback={
-                    <span className="permission-notice">
-                      Investigation permission required
-                    </span>
-                  }
+                <button
+                  className="button button-primary"
+                  type="submit"
+                  disabled={investigationBusy}
                 >
-                  <button
-                    className="button button-primary"
-                    type="submit"
-                    disabled={investigationBusy}
-                  >
-                    <CircleGauge size={16} />
-                    Run workflow
-                  </button>
-                </Show>
+                  <CircleGauge size={16} />
+                  Run workflow
+                </button>
               </form>
             </Panel>
 
@@ -1128,57 +1117,87 @@ export default function SocConsole() {
                           )
                         )}
                       </div>
-                      <Show
-                        when={{ permission: 'org:responses:approve' }}
-                        fallback={
-                          <div className="permission-notice">
-                            A responder or administrator must review these
-                            actions.
-                          </div>
-                        }
-                      >
-                        <div className="approval-form">
-                          <div className="field field-full">
-                            <label htmlFor="modified-actions">
-                              Modified actions JSON
-                            </label>
-                            <textarea
-                              id="modified-actions"
-                              value={modifiedActions}
-                              onChange={(event) =>
-                                setModifiedActions(event.target.value)
-                              }
-                              rows={6}
-                            />
-                          </div>
-                          <div className="approval-buttons field-full">
-                            <button
-                              className="button button-danger"
-                              onClick={() => void handleApproval('reject')}
-                              disabled={investigationBusy}
-                            >
-                              <X size={16} />
-                              Reject all
-                            </button>
-                            <button
-                              className="button button-secondary"
-                              onClick={() => void handleApproval('modify')}
-                              disabled={investigationBusy}
-                            >
-                              <ListChecks size={16} />
-                              Save changes for re-review
-                            </button>
-                            <button
-                              className="button button-primary"
-                              onClick={() => void handleApproval('approve')}
-                              disabled={investigationBusy}
-                            >
-                              <Check size={16} />
-                              Approve and execute
-                            </button>
-                          </div>
+                      <div className="approval-form">
+                        <div className="field field-full">
+                          <label htmlFor="modified-actions">
+                            Modified actions JSON
+                          </label>
+                          <textarea
+                            id="modified-actions"
+                            value={modifiedActions}
+                            onChange={(event) =>
+                              setModifiedActions(event.target.value)
+                            }
+                            rows={6}
+                          />
                         </div>
-                      </Show>
+                        <div className="approval-buttons field-full">
+                          <button
+                            className="button button-danger"
+                            onClick={() => void handleApproval('reject')}
+                            disabled={investigationBusy}
+                          >
+                            <X size={16} />
+                            Reject all
+                          </button>
+                          <button
+                            className="button button-secondary"
+                            onClick={() => void handleApproval('modify')}
+                            disabled={investigationBusy}
+                          >
+                            <ListChecks size={16} />
+                            Save changes for re-review
+                          </button>
+                          <button
+                            className="button button-primary"
+                            onClick={() => void handleApproval('approve')}
+                            disabled={investigationBusy}
+                          >
+                            <Check size={16} />
+                            Approve response
+                          </button>
+                        </div>
+                      </div>
+                    </Panel>
+                  )}
+
+                {investigation.approval_request &&
+                  investigation.pending_nodes.includes(
+                    'execution_authorization'
+                  ) && (
+                    <Panel
+                      title="Approved response"
+                      icon={<ShieldAlert size={17} />}
+                      action={<StatusBadge value="approved" />}
+                      className="approval-panel"
+                    >
+                      <div className="approval-actions">
+                        {investigation.approval_request.proposed_actions.map(
+                          (action) => (
+                            <article
+                              key={`${action.action_type}-${action.target}`}
+                            >
+                              <div>
+                                <strong>{titleCase(action.action_type)}</strong>
+                                <StatusBadge value={action.risk_level} />
+                              </div>
+                              <span>{action.target}</span>
+                              <code>{action.execution_preview}</code>
+                              <p>{action.reason}</p>
+                            </article>
+                          )
+                        )}
+                      </div>
+                      <div className="approval-buttons">
+                        <button
+                          className="button button-danger"
+                          onClick={() => void handleExecution()}
+                          disabled={investigationBusy}
+                        >
+                          <Terminal size={16} />
+                          Execute approved response
+                        </button>
+                      </div>
                     </Panel>
                   )}
 

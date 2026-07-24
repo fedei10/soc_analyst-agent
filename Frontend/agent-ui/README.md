@@ -12,14 +12,13 @@ corepack pnpm install
 corepack pnpm dev
 ```
 
-Open `http://localhost:3000`, sign in, and select a Clerk organization. The
-server-side Next.js proxy obtains the session token with `await auth()`, removes
-caller authorization, and forwards the verified token to FastAPI.
+Open `http://localhost:3000` and sign in. The server-side Next.js proxy obtains
+the session token with `await auth()`, removes caller authorization, and
+forwards the verified token to FastAPI.
 
-The console shows `UserButton`, `OrganizationSwitcher`, live tool activity, SOC
-specialist progress, investigation history, reports, and human approval
-controls. Permission-sensitive controls use the active organization's Clerk
-permissions.
+The console shows `UserButton`, live tool activity, SOC specialist progress,
+investigation history, reports, and human approval controls. Data is isolated
+by the signed-in Clerk user.
 
 Validation:
 
