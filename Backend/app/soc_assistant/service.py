@@ -3,21 +3,42 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
+from langsmith import traceable
+from opensearchpy import exceptions as opensearch_exc
+
+from app.config import settings
 from app.coreAgents.orchestration.investigation_service import (
     InvestigationNotFoundError,
     InvestigationService,
     get_investigation_service,
 )
+from app.coreAgents.tools.wazuh._common import failure as wazuh_tool_failure
 from app.db.session import database_url
+from app.db.repositories.alert_memory import get_alert_memory_repository
+from app.db.repositories.findings import get_finding_repository
+from app.services.wazuh.exceptions import (
+    WazuhAPIError,
+    WazuhAuthError,
+    WazuhPermissionError,
+)
 from app.services.wazuh.gateway import WazuhGateway
 from app.services.wazuh.normalization.serializers import (
     compact_alert_search_result,
+    serialize_for_trace,
     serialize_for_agent,
 )
+from app.services.wazuh.triage.service import run_triage
 from app.soc_assistant.catalog import public_catalog
 from app.soc_assistant.router import AssistantIntentRouter
+from app.soc_assistant.references import (
+    InvestigationReferenceError,
+    resolve_investigation_reference,
+)
 from app.soc_assistant.schemas import (
     AssistantActivity,
     AssistantCommandName,
@@ -28,6 +49,10 @@ from app.soc_assistant.schemas import (
 
 INDICATOR_TYPES = {"ip", "domain", "hash", "process", "user", "path", "other"}
 RUNNING_ACTIVITY = {
+    AssistantCommandName.CHAT: (
+        None,
+        "Reading the message",
+    ),
     AssistantCommandName.ALERTS: (
         "search_alerts",
         "Searching and correlating bounded Wazuh alerts",
@@ -39,6 +64,10 @@ RUNNING_ACTIVITY = {
     AssistantCommandName.HUNT: (
         "hunt_ioc_telemetry",
         "Searching Wazuh alert and archive telemetry",
+    ),
+    AssistantCommandName.TRIAGE: (
+        "run_triage",
+        "Grouping alerts into findings and generating evidence-backed verdicts",
     ),
     AssistantCommandName.INVESTIGATE: (
         "start_investigation",
@@ -57,6 +86,97 @@ RUNNING_ACTIVITY = {
         "Loading the SOC capability catalog",
     ),
 }
+WAZUH_BACKED_COMMANDS = {
+    AssistantCommandName.ALERTS,
+    AssistantCommandName.SUMMARY,
+    AssistantCommandName.HUNT,
+    AssistantCommandName.TRIAGE,
+    AssistantCommandName.INVESTIGATE,
+    AssistantCommandName.HEALTH,
+}
+WAZUH_RETRY_HINTS = {
+    "WAZUH_UNAVAILABLE": (
+        "Wazuh is unreachable right now. Check that the Wazuh indexer/API tunnel "
+        "is running, then retry `/health` or your original request."
+    ),
+    "WAZUH_TIMEOUT": (
+        "Wazuh did not answer before the tool timeout. Check service load and "
+        "retry with a smaller time window."
+    ),
+    "WAZUH_AUTH_FAILED": (
+        "Wazuh rejected the configured service credentials. Check the backend "
+        "Wazuh environment variables."
+    ),
+    "WAZUH_FORBIDDEN": (
+        "Wazuh denied the configured service account. Check the account's API "
+        "permissions."
+    ),
+}
+
+
+def _is_wazuh_runtime_error(error: Exception) -> bool:
+    return isinstance(
+        error,
+        (
+            httpx.TimeoutException,
+            httpx.TransportError,
+            opensearch_exc.ConnectionTimeout,
+            opensearch_exc.ConnectionError,
+            WazuhAPIError,
+            WazuhAuthError,
+            WazuhPermissionError,
+        ),
+    )
+
+
+def _trace_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
+    return serialize_for_trace(
+        {
+            key: value
+            for key, value in inputs.items()
+            if key not in {"self", "fn"}
+        }
+    )
+
+
+def _trace_outputs(outputs: Any) -> Any:
+    if isinstance(outputs, AssistantResponse):
+        return {
+            "conversation_id": outputs.conversation_id,
+            "selected_command": outputs.selected_command,
+            "tools_used": outputs.tools_used,
+            "activity_statuses": [
+                {
+                    "tool": activity.tool,
+                    "label": activity.label,
+                    "status": activity.status,
+                }
+                for activity in outputs.activities
+            ],
+            "active_investigation_id": outputs.active_investigation_id,
+            "response": serialize_for_trace(outputs.response),
+        }
+    if isinstance(outputs, tuple) and len(outputs) == 4:
+        assistant_message, payload, tools, active = outputs
+        return serialize_for_trace(
+            {
+                "assistant_message": assistant_message,
+                "payload": payload,
+                "tools_used": tools,
+                "active_context": active,
+            }
+        )
+    return serialize_for_trace(outputs)
+
+
+def _langsmith_metadata() -> dict[str, Any]:
+    return {
+        "service": settings.SERVICE_NAME,
+        "environment": settings.ENVIRONMENT,
+        "revision_id": settings.REVISION_ID,
+        "llm_provider": settings.LLM_PROVIDER,
+        "llm_model": settings.LLM_MODEL,
+    }
 
 
 def _bounded_int(
@@ -73,6 +193,29 @@ def _bounded_int(
     if not minimum <= parsed <= maximum:
         raise ValueError(f"Value must be between {minimum} and {maximum}.")
     return parsed
+
+
+def _duration_hours(value: Any, *, default: int = 24) -> int:
+    if value in (None, ""):
+        return default
+    text = str(value).strip().lower()
+    multipliers = {"m": 1 / 60, "h": 1, "d": 24}
+    try:
+        amount = int(text[:-1])
+        hours = amount * multipliers[text[-1]]
+    except (KeyError, TypeError, ValueError):
+        raise ValueError(
+            "--since must use a duration such as 15m, 6h, or 2d."
+        )
+    return max(1, min(168, int(hours) + int(hours % 1 > 0)))
+
+
+def _as_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 class SOCAssistant:
@@ -108,6 +251,21 @@ class SOCAssistant:
     ) -> tuple[AssistantIntent, dict[str, int]]:
         return self.router.route(message)
 
+    @traceable(
+        run_type="chain",
+        name="soc_assistant.route",
+        process_inputs=_trace_inputs,
+        process_outputs=_trace_outputs,
+        metadata=_langsmith_metadata(),
+        tags=["tsage", "soc-assistant", "router"],
+    )
+    def _trace_route(
+        self,
+        *,
+        message: str,
+    ) -> tuple[AssistantIntent, dict[str, int]]:
+        return self.route(message)
+
     @staticmethod
     def running_activity(command: AssistantCommandName) -> AssistantActivity:
         tool, label = RUNNING_ACTIVITY[command]
@@ -117,6 +275,30 @@ class SOCAssistant:
             label=label,
             status="running",
         )
+
+    @staticmethod
+    def _wazuh_failure_response(
+        *,
+        command: AssistantCommandName,
+        error: Exception,
+    ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
+        tool, _ = RUNNING_ACTIVITY[command]
+        failed = wazuh_tool_failure(error)["error"]
+        code = str(failed.get("code") or "WAZUH_TOOL_ERROR")
+        message = WAZUH_RETRY_HINTS.get(
+            code,
+            "The selected Wazuh-backed capability could not complete.",
+        )
+        payload = {
+            "status": "unavailable",
+            "error": failed,
+            "next_steps": [
+                "Run `/health` to see which Wazuh service is failing.",
+                "Confirm the Wazuh indexer is reachable on the configured host and port.",
+                "Retry with a smaller window, for example `/alerts --hours 1 --limit 10`.",
+            ],
+        }
+        return message, payload, [tool] if tool else [], {}
 
     @staticmethod
     def _persist(
@@ -154,7 +336,7 @@ class SOCAssistant:
                 content=user_message,
                 sender_user_id=user_id,
             )
-            repository.append_message(
+            assistant_record = repository.append_message(
                 conversation_id=conversation_id,
                 organization_id=organization_id,
                 role="assistant",
@@ -165,6 +347,35 @@ class SOCAssistant:
                     "active_investigation_id": response.active_investigation_id,
                 },
             )
+            references: list[tuple[str, str]] = []
+            if response.active_alert_id:
+                references.append(("wazuh_alert", response.active_alert_id))
+            if response.active_investigation_id:
+                references.append(
+                    ("investigation", response.active_investigation_id)
+                )
+            for finding in response.response.get("findings", []):
+                if isinstance(finding, dict) and finding.get("finding_id"):
+                    references.append(("finding", str(finding["finding_id"])))
+                if (
+                    isinstance(finding, dict)
+                    and finding.get("representative_alert_id")
+                ):
+                    references.append(
+                        (
+                            "wazuh_alert",
+                            str(finding["representative_alert_id"]),
+                        )
+                    )
+            memory = get_alert_memory_repository()
+            for reference_type, reference_value in dict.fromkeys(references):
+                memory.add_conversation_reference(
+                    conversation_id=conversation_id,
+                    message_id=assistant_record["message_id"],
+                    organization_id=organization_id,
+                    reference_type=reference_type,
+                    reference_value=reference_value,
+                )
         except Exception:
             # Conversation persistence must not hide a successful SOC operation.
             return
@@ -176,7 +387,28 @@ class SOCAssistant:
         *,
         organization_id: str,
         user_id: str,
+        recent_context: dict[str, str] | None = None,
     ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
+        if command == AssistantCommandName.CHAT:
+            return (
+                (
+                    "Hi. I can route SOC requests to the right Wazuh tools. "
+                    "Ask for recent alerts, alert summaries, threat hunting, "
+                    "triage findings, investigation status, or a full investigation."
+                ),
+                {
+                    "display_mode": "conversation",
+                    "examples": [
+                        "give me the latest alerts",
+                        "triage high severity alerts from the last 6 hours",
+                        "hunt for 192.0.2.10",
+                        "investigate the alert returned by the previous search",
+                    ],
+                },
+                [],
+                {},
+            )
+
         if command == AssistantCommandName.HELP:
             catalog = public_catalog()
             return (
@@ -187,36 +419,319 @@ class SOCAssistant:
             )
 
         if command == AssistantCommandName.ALERTS:
-            result = self.gateway.search_alerts(
-                min_level=_bounded_int(
-                    arguments.get("min_level"),
-                    default=0,
-                    minimum=0,
-                    maximum=16,
+            checked_at = datetime.now(UTC)
+            memory = get_alert_memory_repository()
+            previous_check = memory.get_user_cursor(user_id)
+            severity_levels = {
+                "informational": 0,
+                "low": 4,
+                "medium": 7,
+                "high": 10,
+                "critical": 13,
+            }
+            severity = str(arguments.get("severity") or "").lower()
+            if severity and severity not in severity_levels:
+                raise ValueError("Unsupported severity filter.")
+            tool_inputs = {
+                "min_level": (
+                    severity_levels[severity]
+                    if severity
+                    else _bounded_int(
+                        arguments.get("min_level"),
+                        default=0,
+                        minimum=0,
+                        maximum=16,
+                    )
                 ),
-                hours=_bounded_int(
-                    arguments.get("hours"),
-                    default=24,
-                    minimum=1,
-                    maximum=168,
+                "hours": (
+                    _duration_hours(arguments.get("since"))
+                    if arguments.get("since")
+                    else _bounded_int(
+                        arguments.get("hours"),
+                        default=24,
+                        minimum=1,
+                        maximum=168,
+                    )
                 ),
-                limit=_bounded_int(
-                    arguments.get("limit"),
-                    default=20,
-                    minimum=1,
-                    maximum=50,
+                "limit": _bounded_int(
+                    arguments.get("limit"), default=20, minimum=1, maximum=50
                 ),
-                agent_id=arguments.get("agent_id"),
-                text=arguments.get("text"),
+                "agent_id": arguments.get("agent_id"),
+                "text": arguments.get("text"),
+            }
+            if getattr(memory, "durable", False):
+                explicit_window = bool(
+                    arguments.get("since") or "hours" in arguments
+                )
+                window_hours = (
+                    _duration_hours(arguments.get("since"))
+                    if arguments.get("since")
+                    else _bounded_int(
+                        arguments.get("hours"),
+                        default=24,
+                        minimum=1,
+                        maximum=168,
+                    )
+                )
+                effective_since = (
+                    checked_at - timedelta(hours=window_hours)
+                    if explicit_window or previous_check is None
+                    else previous_check
+                )
+                finding_scope = settings.WAZUH_INGESTION_ORGANIZATION_ID
+                records = get_finding_repository().list(
+                    organization_id=finding_scope,
+                    limit=tool_inputs["limit"],
+                    severity=severity or None,
+                    status=(
+                        "open" if arguments.get("open_only") else None
+                    ),
+                )
+                if tool_inputs["agent_id"]:
+                    finding_ids = memory.finding_ids_for_agent(
+                        tool_inputs["agent_id"]
+                    )
+                    records = [
+                        record
+                        for record in records
+                        if record["finding_id"] in finding_ids
+                    ]
+                text_filter = str(tool_inputs["text"] or "").strip().lower()
+                if text_filter:
+                    records = [
+                        record
+                        for record in records
+                        if text_filter
+                        in " ".join(
+                            (
+                                str(record["finding"].get("title") or ""),
+                                str(record["finding"].get("summary") or ""),
+                                str(record.get("event_type") or ""),
+                            )
+                        ).lower()
+                    ]
+
+                new_records = [
+                    record
+                    for record in records
+                    if _as_datetime(record["created_at"]) > effective_since
+                ]
+                updated_records = [
+                    record
+                    for record in records
+                    if _as_datetime(record["created_at"]) <= effective_since
+                    and _as_datetime(record["updated_at"]) > effective_since
+                ]
+                changed_ids = {
+                    record["finding_id"]
+                    for record in [*new_records, *updated_records]
+                }
+                if arguments.get("new_only"):
+                    visible = new_records
+                elif arguments.get("all_results") or arguments.get(
+                    "open_only"
+                ):
+                    visible = records
+                else:
+                    visible = [
+                        record
+                        for record in records
+                        if record["finding_id"] in changed_ids
+                    ]
+
+                findings = []
+                for record in visible:
+                    finding = dict(record["finding"])
+                    finding.update(
+                        {
+                            "finding_id": record["finding_id"],
+                            "status": record["status"],
+                            "version": record["version"],
+                            "verdict": record["verdict"].get("verdict"),
+                            "verdict_confidence": record[
+                                "verdict"
+                            ].get("confidence"),
+                        }
+                    )
+                    findings.append(finding)
+                new_alerts = memory.count_alerts_since(
+                    effective_since,
+                    agent_id=tool_inputs["agent_id"],
+                    min_level=tool_inputs["min_level"],
+                )
+                payload = {
+                    "raw_alert_count": new_alerts,
+                    "finding_count": len(findings),
+                    "findings": findings,
+                    "new_alerts": new_alerts,
+                    "new_findings": len(new_records),
+                    "updated_findings": len(updated_records),
+                    "unchanged_findings": (
+                        len(records) - len(changed_ids)
+                    ),
+                    "since": (
+                        effective_since.isoformat()
+                        if explicit_window or previous_check
+                        else None
+                    ),
+                    "checked_at": checked_at.isoformat(),
+                    "new_since_last_check": (
+                        previous_check.isoformat()
+                        if previous_check
+                        else None
+                    ),
+                    "mode": (
+                        "new"
+                        if arguments.get("new_only")
+                        else "open"
+                        if arguments.get("open_only")
+                        else "all"
+                        if arguments.get("all_results")
+                        else "updated_since_last_check"
+                    ),
+                    "source": "postgresql",
+                }
+                memory.advance_user_cursor(
+                    user_id,
+                    checked_at,
+                    finding_version=max(
+                        (
+                            int(record.get("version") or 0)
+                            for record in records
+                        ),
+                        default=None,
+                    ),
+                )
+                return (
+                    (
+                        f"Found {new_alerts} new alert"
+                        f"{'' if new_alerts == 1 else 's'}, "
+                        f"{len(new_records)} new finding"
+                        f"{'' if len(new_records) == 1 else 's'}, and "
+                        f"{len(updated_records)} updated finding"
+                        f"{'' if len(updated_records) == 1 else 's'}."
+                    ),
+                    payload,
+                    ["query_alert_memory"],
+                    {},
+                )
+            result = self._run_tool(
+                tool_name="search_alerts",
+                inputs=tool_inputs,
+                fn=lambda: self.gateway.search_alerts(**tool_inputs),
             )
             compact = compact_alert_search_result(result)
+            new_alerts = (
+                sum(
+                    alert.timestamp > previous_check
+                    for alert in result.alerts
+                )
+                if previous_check
+                else result.returned
+            )
+            new_findings = 0
+            updated_findings = 0
+            unchanged_findings = 0
+            for finding in compact["findings"]:
+                first_seen = datetime.fromisoformat(
+                    str(finding["first_seen"]).replace("Z", "+00:00")
+                )
+                last_seen = datetime.fromisoformat(
+                    str(finding["last_seen"]).replace("Z", "+00:00")
+                )
+                if previous_check is None or first_seen > previous_check:
+                    new_findings += 1
+                elif last_seen > previous_check:
+                    updated_findings += 1
+                else:
+                    unchanged_findings += 1
+            compact.update(
+                {
+                    "new_alerts": new_alerts,
+                    "new_findings": new_findings,
+                    "updated_findings": updated_findings,
+                    "unchanged_findings": unchanged_findings,
+                    "since": (
+                        previous_check.isoformat()
+                        if previous_check
+                        else None
+                    ),
+                    "checked_at": checked_at.isoformat(),
+                    "new_since_last_check": (
+                        previous_check.isoformat()
+                        if previous_check
+                        else None
+                    ),
+                }
+            )
+            if arguments.get("new_only") and previous_check:
+                compact["findings"] = [
+                    finding
+                    for finding in compact["findings"]
+                    if datetime.fromisoformat(
+                        str(finding["last_seen"]).replace("Z", "+00:00")
+                    )
+                    > previous_check
+                ]
+                compact["finding_count"] = len(compact["findings"])
+            compact["mode"] = (
+                "new"
+                if arguments.get("new_only")
+                else "open"
+                if arguments.get("open_only")
+                else "all"
+                if arguments.get("all_results")
+                else "updated_since_last_check"
+            )
+            memory.advance_user_cursor(user_id, checked_at)
             return (
                 (
-                    f"Found {compact['total_raw_alerts']} matching Wazuh alerts "
-                    f"and grouped them into {compact['finding_count']} findings."
+                    f"Found {new_alerts} new alert"
+                    f"{'' if new_alerts == 1 else 's'} since your previous check. "
+                    f"The current window contains {compact['finding_count']} findings."
                 ),
                 compact,
                 ["search_alerts"],
+                {},
+            )
+
+        if command == AssistantCommandName.TRIAGE:
+            tool_inputs = {
+                "hours": _bounded_int(
+                    arguments.get("hours"), default=24, minimum=1, maximum=168
+                ),
+                "min_level": _bounded_int(
+                    arguments.get("min_level"), default=0, minimum=0, maximum=16
+                ),
+                "limit": _bounded_int(
+                    arguments.get("limit"), default=20, minimum=1, maximum=200
+                ),
+                "organization_id": settings.WAZUH_INGESTION_ORGANIZATION_ID,
+            }
+            triaged = self._run_tool(
+                tool_name="run_triage",
+                inputs=tool_inputs,
+                fn=lambda: run_triage(gateway=self.gateway, **tool_inputs),
+            )
+            payload = {
+                "finding_count": len(triaged),
+                "findings": [
+                    {
+                        "finding_id": item.finding.finding_id,
+                        "title": item.finding.title,
+                        "severity": item.finding.severity,
+                        "verdict": item.verdict.verdict,
+                        "verdict_confidence": item.verdict.confidence,
+                        "escalation_recommended": item.verdict.escalation_recommended,
+                        "summary": item.verdict.summary,
+                    }
+                    for item in triaged
+                ],
+            }
+            return (
+                f"Triaged {len(triaged)} finding(s) from recent Wazuh alerts.",
+                payload,
+                ["run_triage"],
                 {},
             )
 
@@ -227,7 +742,13 @@ class SOCAssistant:
                 minimum=1,
                 maximum=168,
             )
-            summary = serialize_for_agent(self.gateway.alert_summary(hours=hours))
+            summary = serialize_for_agent(
+                self._run_tool(
+                    tool_name="alert_summary",
+                    inputs={"hours": hours},
+                    fn=lambda: self.gateway.alert_summary(hours=hours),
+                )
+            )
             return (
                 f"Loaded the Wazuh alert overview for the last {hours} hours.",
                 {"hours": hours, "summary": summary},
@@ -247,22 +768,21 @@ class SOCAssistant:
             indicator_type = str(arguments.get("indicator_type") or "other")
             if indicator_type not in INDICATOR_TYPES:
                 raise ValueError(f"Unsupported indicator type: {indicator_type}")
-            hunt = self.gateway.hunt_ioc_telemetry(
-                indicator=indicator,
-                indicator_type=indicator_type,
-                hours=_bounded_int(
-                    arguments.get("hours"),
-                    default=24,
-                    minimum=1,
-                    maximum=168,
+            tool_inputs = {
+                "indicator": indicator,
+                "indicator_type": indicator_type,
+                "hours": _bounded_int(
+                    arguments.get("hours"), default=24, minimum=1, maximum=168
                 ),
-                limit=_bounded_int(
-                    arguments.get("limit"),
-                    default=10,
-                    minimum=1,
-                    maximum=20,
+                "limit": _bounded_int(
+                    arguments.get("limit"), default=10, minimum=1, maximum=20
                 ),
-                agent_id=arguments.get("agent_id"),
+                "agent_id": arguments.get("agent_id"),
+            }
+            hunt = self._run_tool(
+                tool_name="hunt_ioc_telemetry",
+                inputs=tool_inputs,
+                fn=lambda: self.gateway.hunt_ioc_telemetry(**tool_inputs),
             )
             payload = serialize_for_agent(hunt)
             alert_count = (
@@ -287,18 +807,66 @@ class SOCAssistant:
             alert_id = str(arguments.get("alert_id") or "").strip()
             if not alert_id:
                 return (
-                    "Provide the Wazuh alert document ID, for example `/investigate ALERT-ID --agent 001`.",
+                    "Run `/alerts`, then pass a returned alert document ID to `/investigate`.",
                     {"required": ["alert_id"]},
                     [],
                     {},
                 )
-            snapshot = self.investigations.start(
-                alert_id=alert_id,
-                agent_id=arguments.get("agent_id"),
-                initiated_by=user_id,
-                initiation_reason="Started from the SOC assistant.",
-                organization_id=organization_id,
-                owner_user_id=user_id,
+            try:
+                resolved = resolve_investigation_reference(
+                    alert_id,
+                    agent_id=arguments.get("agent_id"),
+                    organization_id=organization_id,
+                    gateway=self.gateway,
+                    investigations=self.investigations,
+                    suggested_alert_id=(recent_context or {}).get(
+                        "wazuh_alert"
+                    ),
+                )
+            except InvestigationReferenceError as exc:
+                return (
+                    str(exc),
+                    exc.payload(),
+                    [],
+                    {},
+                )
+            if resolved.existing_investigation is not None:
+                snapshot = resolved.existing_investigation
+                return (
+                    (
+                        f"Investigation {snapshot['investigation_id']} already "
+                        f"tracks this reference. Current stage: "
+                        f"{snapshot['current_stage']}."
+                    ),
+                    {
+                        "investigation_id": snapshot["investigation_id"],
+                        "status": snapshot["status"],
+                        "current_stage": snapshot["current_stage"],
+                        "existing": True,
+                    },
+                    ["get_investigation"],
+                    {
+                        "active_investigation_id": snapshot[
+                            "investigation_id"
+                        ],
+                        "active_alert_id": resolved.alert_id,
+                        "active_agent_id": snapshot.get("agent_id"),
+                        "investigation": snapshot,
+                    },
+                )
+            tool_inputs = {
+                "alert_id": resolved.alert_id,
+                "finding_id": resolved.finding_id,
+                "agent_id": resolved.agent_id,
+                "initiated_by": user_id,
+                "initiation_reason": "Started from the SOC assistant.",
+                "organization_id": organization_id,
+                "owner_user_id": user_id,
+            }
+            snapshot = self._run_tool(
+                tool_name="start_investigation",
+                inputs=tool_inputs,
+                fn=lambda: self.investigations.start(**tool_inputs),
             )
             return (
                 (
@@ -315,7 +883,7 @@ class SOCAssistant:
                 ["start_investigation"],
                 {
                     "active_investigation_id": snapshot["investigation_id"],
-                    "active_alert_id": alert_id,
+                    "active_alert_id": resolved.alert_id,
                     "active_agent_id": snapshot.get("agent_id"),
                     "investigation": snapshot,
                 },
@@ -326,6 +894,17 @@ class SOCAssistant:
                 arguments.get("investigation_id") or ""
             ).strip()
             if not investigation_id:
+                alert_reference = (recent_context or {}).get("wazuh_alert")
+                if alert_reference:
+                    active = self.investigations.active_for_alert(
+                        alert_reference,
+                        organization_id=organization_id,
+                    )
+                    if active is not None:
+                        investigation_id = str(
+                            active["investigation_id"]
+                        )
+            if not investigation_id:
                 return (
                     "Provide an investigation ID, for example `/status INV-ABC123`.",
                     {"required": ["investigation_id"]},
@@ -333,9 +912,16 @@ class SOCAssistant:
                     {},
                 )
             try:
-                snapshot = self.investigations.snapshot(
-                    investigation_id,
-                    organization_id=organization_id,
+                snapshot = self._run_tool(
+                    tool_name="get_investigation",
+                    inputs={
+                        "investigation_id": investigation_id,
+                        "organization_id": organization_id,
+                    },
+                    fn=lambda: self.investigations.snapshot(
+                        investigation_id,
+                        organization_id=organization_id,
+                    ),
                 )
             except InvestigationNotFoundError as exc:
                 raise LookupError(
@@ -365,12 +951,16 @@ class SOCAssistant:
 
         if command == AssistantCommandName.HEALTH:
             checks: dict[str, dict[str, Any]] = {}
-            for name, operation in (
-                ("indexer", self.gateway.indexer_health),
-                ("manager", self.gateway.validate_server),
+            for name, tool_name, operation in (
+                ("indexer", "indexer_health", self.gateway.indexer_health),
+                ("manager", "validate_server", self.gateway.validate_server),
             ):
                 try:
-                    operation()
+                    self._run_tool(
+                        tool_name=tool_name,
+                        inputs={},
+                        fn=operation,
+                    )
                     checks[name] = {"status": "healthy"}
                 except Exception as exc:
                     checks[name] = {
@@ -391,6 +981,56 @@ class SOCAssistant:
 
         raise ValueError(f"Unsupported assistant command: {command}")
 
+    @traceable(
+        run_type="tool",
+        name="soc_assistant.tool_call",
+        process_inputs=_trace_inputs,
+        process_outputs=_trace_outputs,
+        metadata=_langsmith_metadata(),
+        tags=["tsage", "soc-assistant", "tool"],
+    )
+    def _run_tool(
+        self,
+        *,
+        tool_name: str,
+        inputs: dict[str, Any],
+        fn: Callable[[], Any],
+    ) -> Any:
+        return fn()
+
+    @traceable(
+        run_type="chain",
+        name="soc_assistant.execute",
+        process_inputs=_trace_inputs,
+        process_outputs=_trace_outputs,
+        metadata=_langsmith_metadata(),
+        tags=["tsage", "soc-assistant", "execute"],
+    )
+    def _execute_traced(
+        self,
+        command: AssistantCommandName,
+        arguments: dict[str, Any],
+        *,
+        organization_id: str,
+        user_id: str,
+        recent_context: dict[str, str] | None = None,
+    ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
+        return self._execute(
+            command,
+            arguments,
+            organization_id=organization_id,
+            user_id=user_id,
+            recent_context=recent_context,
+        )
+
+    @traceable(
+        run_type="chain",
+        name="soc_assistant.respond",
+        process_inputs=_trace_inputs,
+        process_outputs=_trace_outputs,
+        metadata=_langsmith_metadata(),
+        tags=["tsage", "soc-assistant"],
+    )
     def respond(
         self,
         *,
@@ -401,7 +1041,33 @@ class SOCAssistant:
         routed: tuple[AssistantIntent, dict[str, int]] | None = None,
     ) -> AssistantResponse:
         active_conversation_id = conversation_id or uuid.uuid4().hex
-        intent, usage = routed or self.route(message)
+        recent_context: dict[str, str] = {}
+        if database_url():
+            try:
+                recent_context = (
+                    get_alert_memory_repository()
+                    .recent_conversation_references(
+                        conversation_id=active_conversation_id,
+                        organization_id=organization_id,
+                    )
+                )
+            except Exception:
+                recent_context = {}
+        intent, usage = routed or self._trace_route(message=message)
+        if intent.command == AssistantCommandName.INVESTIGATE and not intent.arguments.get(
+            "alert_id"
+        ):
+            if "finding" in message.lower() and recent_context.get("finding"):
+                intent.arguments["alert_id"] = recent_context["finding"]
+            elif recent_context.get("wazuh_alert"):
+                intent.arguments["alert_id"] = recent_context["wazuh_alert"]
+        if intent.command == AssistantCommandName.STATUS and not intent.arguments.get(
+            "investigation_id"
+        ):
+            if recent_context.get("investigation"):
+                intent.arguments["investigation_id"] = recent_context[
+                    "investigation"
+                ]
         activities = [
             self._activity(
                 1,
@@ -410,11 +1076,12 @@ class SOCAssistant:
             )
         ]
         try:
-            assistant_message, payload, tools, active = self._execute(
+            assistant_message, payload, tools, active = self._execute_traced(
                 intent.command,
                 intent.arguments,
                 organization_id=organization_id,
                 user_id=user_id,
+                recent_context=recent_context,
             )
             activities.append(
                 self._activity(
@@ -423,15 +1090,21 @@ class SOCAssistant:
                     tool=tools[-1] if tools else None,
                 )
             )
-        except Exception:
+        except Exception as exc:
             activities.append(
                 self._activity(
                     2,
                     f"{intent.command.value} failed",
+                    tool=RUNNING_ACTIVITY[intent.command][0],
                     status="failed",
                 )
             )
-            raise
+            if intent.command not in WAZUH_BACKED_COMMANDS or not _is_wazuh_runtime_error(exc):
+                raise
+            assistant_message, payload, tools, active = self._wazuh_failure_response(
+                command=intent.command,
+                error=exc,
+            )
 
         response = AssistantResponse(
             conversation_id=active_conversation_id,
@@ -444,6 +1117,13 @@ class SOCAssistant:
                     "confidence": intent.confidence,
                 },
                 "token_usage": usage,
+                "recent_context": {
+                    "last_alert_id": recent_context.get("wazuh_alert"),
+                    "last_finding_id": recent_context.get("finding"),
+                    "last_investigation_id": recent_context.get(
+                        "investigation"
+                    ),
+                },
             },
             tools_used=tools,
             activities=activities,

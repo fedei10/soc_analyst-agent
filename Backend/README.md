@@ -29,6 +29,19 @@ source venv/bin/activate
 uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
+Run the checkpointed Wazuh ingestion and correlation worker in a second local
+terminal:
+
+```bash
+make ingest-worker
+```
+
+Use `make ingest-once` for one bounded cycle during setup or troubleshooting.
+The worker pages through `wazuh-alerts-*`, inserts raw alerts idempotently,
+normalizes new rows, links correlated findings, and advances its PostgreSQL
+checkpoint only with committed pages. Set `WAZUH_INGESTION_ORGANIZATION_ID` to
+the Clerk user ID that owns this personal deployment's findings.
+
 Only `GET /health` is public. Application requests require a verified Clerk
 session token. Investigations and evidence are isolated by the verified Clerk
 user ID.
@@ -36,6 +49,7 @@ user ID.
 Useful authenticated endpoints:
 
 - `GET /api/v1/health/storage`
+- `GET /api/v1/health/ingestion`
 - `GET /api/v1/health/wazuh`
 - `GET /api/v1/soc/assistant/commands`
 - `POST /api/v1/soc/orchestrator/chat`
@@ -58,6 +72,24 @@ The SOC assistant accepts deterministic slash commands and natural-language
 requests. Its server-owned capability catalog is exposed to the frontend for
 autocomplete. Ambiguous requests may use Oxy only for typed intent
 classification; provider failure does not disable known commands.
+
+## LangSmith
+
+Set `LANGSMITH_API_KEY`, `LANGSMITH_TRACING=true`, and
+`LANGSMITH_PROJECT=tsage`, then restart FastAPI. The SOC assistant records
+LangSmith runs for:
+
+- `soc_assistant.respond`
+- `soc_assistant.route`
+- `soc_assistant.execute`
+- `soc_assistant.tool_call`
+- LangChain/Oxy structured-output calls
+
+The traced tool calls show selected capability, tool name, bounded inputs,
+sanitized outputs, activity status, and active investigation IDs. Keep
+`LANGSMITH_HIDE_INPUTS=true` and `LANGSMITH_HIDE_OUTPUTS=true` for normal SOC
+use. In a local lab, set both to `false` when you need to inspect full prompt
+and response payloads.
 
 See [`docs/mape-k-workflow.md`](docs/mape-k-workflow.md) for the migration map,
 state machine, Oxy configuration, and current production boundary.

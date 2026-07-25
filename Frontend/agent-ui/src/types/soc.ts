@@ -1,4 +1,18 @@
-export type WorkspaceView = 'chat' | 'alert-triage' | 'investigations'
+export type WorkspaceView =
+  | 'overview'
+  | 'chat'
+  | 'alerts'
+  | 'alert-triage'
+  | 'investigations'
+  | 'threat-hunting'
+  | 'assets'
+  | 'playbooks'
+  | 'approvals'
+  | 'executions'
+  | 'integrations'
+  | 'ai-models'
+  | 'audit-log'
+  | 'settings'
 export type ApprovalDecision = 'approve' | 'reject'
 
 export interface ChatActivity {
@@ -80,6 +94,142 @@ export interface AlertSummary {
   by_level?: Record<string, number>
   by_agent?: Record<string, number>
   by_rule_group?: Record<string, number>
+}
+
+export interface OverviewMetric {
+  value: number | null
+  trend?: string | null
+}
+
+export interface OverviewPipelineStage {
+  stage:
+    | 'monitor'
+    | 'analyze'
+    | 'plan'
+    | 'approval'
+    | 'execute'
+    | 'verify'
+    | 'complete'
+    | 'failed'
+  count: number
+}
+
+export interface SOCOverview {
+  generated_at: string
+  window_hours: number
+  wazuh_status: 'available' | 'unavailable'
+  metrics: Record<string, OverviewMetric>
+  pipeline: OverviewPipelineStage[]
+  severity_distribution: Record<string, number>
+  alert_reduction: {
+    raw_alerts: number | null
+    represented_alerts: number
+    findings: number
+    reduction_percent: number | null
+  }
+  recent_investigations: Array<{
+    investigation_id: string
+    alert_id: string
+    status: string
+    current_stage: string
+    severity?: string | null
+    confidence?: number | null
+    updated_at?: string | null
+  }>
+  recent_findings: Array<{
+    finding_id: string
+    title?: string | null
+    severity: string
+    verdict?: string | null
+    confidence?: number | null
+    alert_count: number
+    last_seen?: string | null
+  }>
+}
+
+export interface WazuhAlert {
+  alert_id: string
+  timestamp: string
+  agent_id?: string | null
+  agent_name?: string | null
+  rule_id: string
+  rule_level: number
+  description: string
+  source_ip?: string | null
+  target_user?: string | null
+  mitre_ids: string[]
+  event_outcome?: string | null
+}
+
+export interface WazuhAgent {
+  id: string
+  name?: string | null
+  ip?: string | null
+  status?: string | null
+  version?: string | null
+  lastKeepAlive?: string | null
+  os?: {
+    name?: string | null
+    platform?: string | null
+    version?: string | null
+  }
+}
+
+export interface WazuhCollection<T> {
+  affected_items: T[]
+  total_affected_items: number
+}
+
+export interface ServiceHealth {
+  status: string
+  error_code?: string | number
+  detail?: string
+  meaning?: string
+  fix?: string
+}
+
+export interface ServicesHealth {
+  status: 'healthy' | 'unhealthy'
+  services: Record<string, ServiceHealth>
+}
+
+export interface StorageHealth {
+  service: 'storage'
+  status: 'healthy' | 'degraded' | 'unhealthy'
+  postgresql: string
+  redis: string
+  durable_memory: boolean
+  detail?: string | null
+}
+
+export interface SOCPlatform {
+  generated_at: string
+  pending_approvals: Array<{
+    investigation_id: string
+    approval_id: string
+    incident_id: string
+    expires_at: string
+    required_role?: string | null
+    status: string
+    proposed_actions: ProposedAction[]
+  }>
+  response_actions: Array<{
+    investigation_id: string
+    action_id?: string | null
+    action_type?: string | null
+    target?: string | null
+    risk_level?: number | null
+    status: string
+    evidence_refs: string[]
+  }>
+  audit_events: Array<AuditEvent>
+  model_assignments: Array<{
+    role: string
+    provider: string
+    model?: string | null
+  }>
+  response_policy: Record<string, boolean | number | string>
+  retention: Record<string, number | string>
 }
 
 export interface ProposedAction {
@@ -183,4 +333,96 @@ export interface ApprovalInput {
   decision: ApprovalDecision
   approval_id: string
   modified_actions?: Record<string, unknown>[]
+}
+
+export type VerdictLabel =
+  | 'benign'
+  | 'suspicious'
+  | 'malicious'
+  | 'inconclusive'
+
+export interface TriageVerdict {
+  verdict: VerdictLabel
+  confidence: number
+  severity: string
+  summary: string
+  evidence_refs: string[]
+  false_positive_indicators: string[]
+  escalation_recommended: boolean
+  missing_evidence: string[]
+  deterministic: boolean
+  reason_code?: string | null
+}
+
+export interface EnrichmentResult {
+  indicator: string
+  indicator_type: 'ip' | 'domain' | 'hash'
+  is_internal: boolean
+  reputation: 'unknown' | 'malicious' | 'suspicious' | 'clean'
+  known_asset: boolean
+  asset_owner?: string | null
+  allowlisted: boolean
+  previous_incidents: number
+  source: string
+}
+
+export interface SecurityFindingSummary {
+  finding_id: string
+  title: string
+  summary: string
+  severity: string
+  confidence: number
+  first_seen: string
+  last_seen: string
+  affected_assets: string[]
+  source_ips: string[]
+  target_users: string[]
+  mitre_techniques: string[]
+  alert_count: number
+  representative_alert_id: string
+  evidence_refs: string[]
+  investigation_recommended: boolean
+}
+
+export type FeedbackDisposition =
+  | 'confirmed_malicious'
+  | 'confirmed_benign'
+  | 'expected_admin_activity'
+  | 'wrong_asset_context'
+  | 'wrong_severity'
+  | 'duplicate_incident'
+  | 'insufficient_evidence'
+
+export interface FindingFeedback {
+  feedback_id: string
+  finding_id: string
+  reviewer_user_id: string
+  disposition: FeedbackDisposition
+  notes?: string | null
+  created_at: string
+}
+
+export interface Finding {
+  finding_id: string
+  category: string
+  attack_family: string
+  event_type: string
+  severity: string
+  severity_score: number
+  first_seen: string
+  last_seen: string
+  alert_count: number
+  representative_alert_id: string
+  evidence_refs: string[]
+  finding: SecurityFindingSummary
+  verdict: TriageVerdict
+  enrichment: EnrichmentResult[]
+  created_at: string
+  updated_at: string
+  feedback: FindingFeedback[]
+}
+
+export interface FindingList {
+  items: Finding[]
+  count: number
 }

@@ -8,6 +8,7 @@ from typing import Any
 
 from langgraph.types import Command
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 
 from app.mape_k.graph import (
     create_mape_k_graph,
@@ -62,6 +63,7 @@ class InvestigationService:
         investigation_id: str,
         *,
         alert_id: str,
+        finding_id: str | None = None,
         agent_id: str | None = None,
         initiated_by: str | None = None,
         initiation_reason: str | None = None,
@@ -75,6 +77,7 @@ class InvestigationService:
             "stage": "created",
             "current_stage": "created",
             "alert_id": alert_id,
+            "finding_id": finding_id,
             "agent_id": agent_id,
             "initiated_by": initiated_by,
             "initiation_reason": initiation_reason,
@@ -95,35 +98,53 @@ class InvestigationService:
         self,
         *,
         alert_id: str,
+        finding_id: str | None = None,
         agent_id: str | None = None,
         initiated_by: str = "api",
         initiation_reason: str | None = None,
         organization_id: str = "local",
         owner_user_id: str | None = None,
     ) -> dict[str, Any]:
-        investigation_id = f"INV-{uuid.uuid4().hex[:12].upper()}"
-        state = self.initial_state(
-            investigation_id,
-            alert_id=alert_id,
-            agent_id=agent_id,
-            initiated_by=initiated_by,
-            initiation_reason=initiation_reason,
-            organization_id=organization_id,
-            owner_user_id=owner_user_id,
-        )
-        self.repository.save_snapshot(
-            {
-                **state,
-                "pending_nodes": [],
-                "specialist_runs": [],
-                "final_report": None,
-            }
-        )
-        self.graph.invoke(
-            state,
-            config=investigation_config(investigation_id),
-        )
-        return self.snapshot(investigation_id)
+        with self._lock:
+            existing = self.repository.get_active_for_alert(
+                alert_id,
+                organization_id=organization_id,
+            )
+            if existing is not None:
+                return existing
+            investigation_id = f"INV-{uuid.uuid4().hex[:12].upper()}"
+            state = self.initial_state(
+                investigation_id,
+                alert_id=alert_id,
+                finding_id=finding_id,
+                agent_id=agent_id,
+                initiated_by=initiated_by,
+                initiation_reason=initiation_reason,
+                organization_id=organization_id,
+                owner_user_id=owner_user_id,
+            )
+            try:
+                self.repository.save_snapshot(
+                    {
+                        **state,
+                        "pending_nodes": [],
+                        "specialist_runs": [],
+                        "final_report": None,
+                    }
+                )
+            except IntegrityError:
+                existing = self.repository.get_active_for_alert(
+                    alert_id,
+                    organization_id=organization_id,
+                )
+                if existing is not None:
+                    return existing
+                raise
+            self.graph.invoke(
+                state,
+                config=investigation_config(investigation_id),
+            )
+            return self.snapshot(investigation_id)
 
     def snapshot(
         self,
@@ -152,6 +173,7 @@ class InvestigationService:
             "incident_id": state["incident_id"],
             "investigation_id": state["investigation_id"],
             "alert_id": state["alert_id"],
+            "finding_id": state.get("finding_id"),
             "agent_id": state.get("agent_id"),
             "initiated_by": state.get("initiated_by"),
             "initiation_reason": state.get("initiation_reason"),
@@ -191,6 +213,19 @@ class InvestigationService:
             "llm_output_tokens": state.get("llm_output_tokens", 0),
             "estimated_cost_usd": state.get("estimated_cost_usd", 0),
             "errors": state.get("errors", []),
+            "failure_code": (
+                (state.get("errors") or [{}])[-1].get("code")
+                if state.get("errors")
+                and isinstance((state.get("errors") or [{}])[-1], dict)
+                else None
+            ),
+            "failure_reason": (
+                (state.get("errors") or [{}])[-1].get("message")
+                or (state.get("errors") or [{}])[-1].get("error")
+                if state.get("errors")
+                and isinstance((state.get("errors") or [{}])[-1], dict)
+                else None
+            ),
             "audit_events": state.get("audit_events", []),
             "specialist_runs": [],
             "pending_nodes": list(snapshot.next),
@@ -202,6 +237,17 @@ class InvestigationService:
                 organization_id=state_organization,
             )
         return result
+
+    def active_for_alert(
+        self,
+        alert_id: str,
+        *,
+        organization_id: str,
+    ) -> dict[str, Any] | None:
+        return self.repository.get_active_for_alert(
+            alert_id,
+            organization_id=organization_id,
+        )
 
     def resume(
         self,

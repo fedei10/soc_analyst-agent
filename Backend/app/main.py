@@ -19,6 +19,8 @@ from fastapi.responses import JSONResponse
 from opensearchpy import exceptions as opensearch_exc
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.api.v1.endpoints.findings import read as finding_read_router
+from app.api.v1.endpoints.findings import write as finding_write_router
 from app.api.v1.endpoints.health import router as health_router
 from app.api.v1.endpoints.investigations import read as investigation_read_router
 from app.api.v1.endpoints.investigations import write as investigation_write_router
@@ -29,6 +31,8 @@ from app.coreAgents.orchestration.investigation_service import (
     close_investigation_service,
 )
 from app.db.session import close_database
+from app.db.repositories.findings import close_finding_repository
+from app.db.repositories.alert_memory import close_alert_memory_repository
 from app.db.repositories.investigations import close_investigation_repository
 from app.services.wazuh.exceptions import (
     WazuhAPIError,
@@ -49,6 +53,8 @@ async def lifespan(_: FastAPI):
     close_investigation_service()
     close_wazuh_dependencies()
     close_investigation_repository()
+    close_finding_repository()
+    close_alert_memory_repository()
     close_database()
     close_redis_connection()
 
@@ -58,6 +64,8 @@ app.include_router(wazuh_read_router, prefix="/api/v1")
 app.include_router(wazuh_write_router, prefix="/api/v1")
 app.include_router(investigation_read_router, prefix="/api/v1")
 app.include_router(investigation_write_router, prefix="/api/v1")
+app.include_router(finding_read_router, prefix="/api/v1")
+app.include_router(finding_write_router, prefix="/api/v1")
 
 _HTTP_ERROR_CODES = {
     401: "unauthorized",
@@ -95,7 +103,26 @@ def error_envelope(
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     code = _HTTP_ERROR_CODES.get(exc.status_code, "error")
-    return error_envelope(request, exc.status_code, code, str(exc.detail), headers=exc.headers)
+    detail = exc.detail
+    if isinstance(detail, dict) and detail.get("message"):
+        code = str(detail.get("error") or code)
+        message = str(detail["message"])
+        extra = {
+            key: value
+            for key, value in detail.items()
+            if key not in {"error", "message"}
+        } or None
+    else:
+        message = str(detail)
+        extra = None
+    return error_envelope(
+        request,
+        exc.status_code,
+        code,
+        message,
+        detail=extra,
+        headers=exc.headers,
+    )
 
 
 @app.exception_handler(RequestValidationError)

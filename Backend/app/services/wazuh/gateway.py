@@ -6,6 +6,7 @@ from typing import Any, Literal
 from app.services.wazuh.indexer_client import WazuhIndexerClient
 from app.services.wazuh.models import (
     AgentSummary,
+    AlertIngestionPage,
     AlertEvidence,
     AlertSearchResult,
     ArchivedLogSearchResult,
@@ -94,6 +95,19 @@ class WazuhGateway:
 
     def get_raw_alert_by_id(self, alert_id: str) -> RawAlertDocument | None:
         return self.indexer.get_raw_alert_by_id(alert_id)
+
+    def search_alert_page(
+        self,
+        *,
+        size: int = 500,
+        since: datetime | None = None,
+        search_after: list[Any] | None = None,
+    ) -> AlertIngestionPage:
+        return self.indexer.search_alert_page(
+            size=size,
+            since=since,
+            search_after=search_after,
+        )
 
     def search_alerts_by_agent_and_time(
         self,

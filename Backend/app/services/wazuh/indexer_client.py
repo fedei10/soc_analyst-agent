@@ -11,6 +11,8 @@ from app.config import settings
 from app.core.observability.wazuh import observe_wazuh_call
 from app.services.wazuh.models import (
     AlertEvidence,
+    AlertIngestionDocument,
+    AlertIngestionPage,
     AlertSearchResult,
     ArchivedLogSearchResult,
     RawAlertDocument,
@@ -298,6 +300,59 @@ class WazuhIndexerClient:
             alert_id=str(hit.get("_id") or alert_id),
             normalized=self._normalize_alert(hit),
             raw_document=_bounded_raw_source(source),
+        )
+
+    def search_alert_page(
+        self,
+        *,
+        size: int = 500,
+        since: datetime | None = None,
+        search_after: list[Any] | None = None,
+    ) -> AlertIngestionPage:
+        """Read a stable ascending page for idempotent background ingestion."""
+
+        if not 1 <= size <= 1000:
+            raise ValueError("size must be between 1 and 1000.")
+        timestamp_range = (
+            {"gte": since.isoformat()} if since is not None else {"gte": "now-24h"}
+        )
+        body: dict[str, Any] = {
+            "size": size,
+            "sort": [
+                {"@timestamp": {"order": "asc", "unmapped_type": "date"}},
+                {"_id": {"order": "asc"}},
+            ],
+            "track_total_hits": True,
+            "query": {"range": {"@timestamp": timestamp_range}},
+        }
+        if search_after:
+            body["search_after"] = search_after
+        response = self._search(
+            index=self.ALERT_INDEX,
+            operation="ingest_alerts",
+            body=body,
+        )
+        hits = response.get("hits", {}).get("hits", [])
+        documents = []
+        for hit in hits:
+            source = hit.get("_source")
+            if not isinstance(source, dict):
+                source = {}
+            documents.append(
+                AlertIngestionDocument(
+                    document_id=str(hit.get("_id") or ""),
+                    index_name=str(hit.get("_index") or self.ALERT_INDEX),
+                    sort_values=list(hit.get("sort") or []),
+                    normalized=self._normalize_alert(hit),
+                    raw_document=_bounded_raw_source(source),
+                )
+            )
+        return AlertIngestionPage(
+            documents=documents,
+            search_after=(
+                documents[-1].sort_values if documents else search_after
+            ),
+            total=self._total(response),
         )
 
     def search_archived_logs(

@@ -188,6 +188,7 @@ class IncidentWorkflowState(BaseModel):
     incident_id: str
     investigation_id: str
     alert_id: str
+    finding_id: str | None = None
     organization_id: str = "local"
     owner_user_id: str | None = None
     initiated_by: str | None = None

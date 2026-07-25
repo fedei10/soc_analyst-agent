@@ -4,8 +4,19 @@ import type {
   ApprovalInput,
   AssistantCommandCatalog,
   ChatActivity,
+  FeedbackDisposition,
+  Finding,
+  FindingFeedback,
+  FindingList,
   Investigation,
   InvestigationHistory,
+  ServicesHealth,
+  SOCOverview,
+  SOCPlatform,
+  StorageHealth,
+  WazuhAgent,
+  WazuhAlert,
+  WazuhCollection,
   WazuhHealth
 } from '@/types/soc'
 
@@ -73,6 +84,57 @@ export async function getWazuhHealth(): Promise<WazuhHealth> {
 
 export function getAlertSummary(hours = 24): Promise<AlertSummary> {
   return request(`/api/v1/alerts/summary?hours=${hours}`)
+}
+
+export function getSOCOverview(hours = 24): Promise<SOCOverview> {
+  return request(`/api/v1/soc/overview?hours=${hours}`)
+}
+
+export function getSOCPlatform(): Promise<SOCPlatform> {
+  return request('/api/v1/soc/platform')
+}
+
+export function getAlerts(
+  hours = 24,
+  minLevel = 0,
+  limit = 50,
+  query?: string
+): Promise<WazuhCollection<WazuhAlert>> {
+  const params = new URLSearchParams({
+    hours: String(hours),
+    min_level: String(minLevel),
+    limit: String(limit)
+  })
+  if (query) params.set('q', query)
+  return request(`/api/v1/alerts?${params.toString()}`)
+}
+
+export function getAgents(
+  limit = 50,
+  query?: string
+): Promise<WazuhCollection<WazuhAgent>> {
+  const params = new URLSearchParams({ limit: String(limit), offset: '0' })
+  if (query) params.set('q', query)
+  return request(`/api/v1/agents?${params.toString()}`)
+}
+
+async function healthRequest<T>(path: string): Promise<T> {
+  const response = await fetch(`${BACKEND_ROOT}${path}`, { cache: 'no-store' })
+  const body = await response.json().catch(() => ({}))
+  if (body?.status) return body as T
+  throw new APIError(
+    body?.error?.message || `Request failed (${response.status})`,
+    response.status,
+    body?.error?.code
+  )
+}
+
+export function getServicesHealth(): Promise<ServicesHealth> {
+  return healthRequest('/api/v1/health/services')
+}
+
+export function getStorageHealth(): Promise<StorageHealth> {
+  return healthRequest('/api/v1/health/storage')
 }
 
 export function getAssistantCommands(): Promise<AssistantCommandCatalog> {
@@ -219,6 +281,34 @@ export function submitApproval(
       body: JSON.stringify(input)
     }
   )
+}
+
+export function getFindings(
+  hours = 24,
+  minLevel = 0,
+  limit = 50
+): Promise<FindingList> {
+  const query = new URLSearchParams({
+    hours: String(hours),
+    min_level: String(minLevel),
+    limit: String(limit)
+  })
+  return request(`/api/v1/findings?${query.toString()}`)
+}
+
+export function getFinding(findingId: string): Promise<Finding> {
+  return request(`/api/v1/findings/${encodeURIComponent(findingId)}`)
+}
+
+export function submitFindingFeedback(
+  findingId: string,
+  disposition: FeedbackDisposition,
+  notes?: string
+): Promise<FindingFeedback> {
+  return request(`/api/v1/findings/${encodeURIComponent(findingId)}/feedback`, {
+    method: 'POST',
+    body: JSON.stringify({ disposition, notes: notes || undefined })
+  })
 }
 
 export function executeApprovedResponse(

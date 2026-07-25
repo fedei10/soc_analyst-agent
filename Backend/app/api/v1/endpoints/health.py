@@ -15,6 +15,7 @@ from app.api.v1.schemas.health import (
     WazuhHealthResponse,
 )
 from app.db.session import check_database, database_url
+from app.db.repositories.alert_memory import get_alert_memory_repository
 from app.config import settings
 from app.mape_k.llm import effective_llm_api_key
 from app.services.wazuh.dependencies import get_wazuh_gateway
@@ -239,6 +240,36 @@ def storage_health(response: Response) -> StorageHealthResponse:
         redis="healthy",
         durable_memory=True,
     )
+
+
+@router.get("/ingestion")
+def ingestion_health(response: Response):
+    repository = get_alert_memory_repository()
+    if not getattr(repository, "durable", False):
+        return {
+            "status": "disabled",
+            "durable": False,
+            "detail": "PostgreSQL alert memory is not configured.",
+        }
+    checkpoint = repository.checkpoint("wazuh-indexer")
+    if checkpoint is None:
+        return {
+            "status": "not_started",
+            "durable": True,
+            "detail": "Start the worker with `make ingest-worker`.",
+        }
+    if checkpoint["status"] == "failed":
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    return {
+        "status": checkpoint["status"],
+        "durable": True,
+        "last_event_timestamp": checkpoint["last_event_timestamp"],
+        "last_document_id": checkpoint["last_document_id"],
+        "last_run_started_at": checkpoint["last_run_started_at"],
+        "last_run_completed_at": checkpoint["last_run_completed_at"],
+        "last_alert_count": checkpoint["last_alert_count"],
+        "error_message": checkpoint["error_message"],
+    }
 
 
 @router.get(

@@ -450,8 +450,15 @@ def test_service_persists_the_controlled_snapshot():
         snapshot["investigation_id"],
         organization_id="user-1",
     )
+    repeated = service.start(
+        alert_id="alert-0",
+        agent_id="001",
+        organization_id="user-1",
+        owner_user_id="user-1",
+    )
 
     assert snapshot["pending_nodes"] == ["human_approval"]
+    assert repeated["investigation_id"] == snapshot["investigation_id"]
     assert stored["diagnosis"]["incident_type"] == "ssh_brute_force"
     assert len(stored["evidence_records"]) == 2
 

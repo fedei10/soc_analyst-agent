@@ -18,8 +18,15 @@ OPTION_NAMES = {
     "--limit": "limit",
     "--agent": "agent_id",
     "--type": "indicator_type",
+    "--since": "since",
+    "--severity": "severity",
 }
 INTEGER_OPTIONS = {"hours", "min_level", "limit"}
+FLAG_OPTIONS = {
+    "--new": "new_only",
+    "--open": "open_only",
+    "--all": "all_results",
+}
 
 
 class AssistantIntentRouter:
@@ -33,6 +40,11 @@ class AssistantIntentRouter:
         index = 0
         while index < len(tokens):
             token = tokens[index]
+            flag = FLAG_OPTIONS.get(token)
+            if flag is not None:
+                options[flag] = True
+                index += 1
+                continue
             key = OPTION_NAMES.get(token)
             if key is None:
                 if token.startswith("--"):
@@ -99,6 +111,7 @@ class AssistantIntentRouter:
 
     def deterministic(self, message: str) -> AssistantIntent | None:
         lower = message.lower()
+        stripped = re.sub(r"[^\w\s]", "", lower).strip()
         normalized = re.sub(r"\bmape-?k\b", "mapek", lower)
         investigation = re.search(r"\bINV-[A-Za-z0-9-]+\b", message, re.I)
         alert = re.search(
@@ -106,11 +119,26 @@ class AssistantIntentRouter:
             message,
             re.I,
         )
+        if stripped in {
+            "hi",
+            "hello",
+            "hey",
+            "yo",
+            "good morning",
+            "good afternoon",
+            "good evening",
+        }:
+            return AssistantIntent(command=AssistantCommandName.CHAT)
         if investigation and any(word in lower for word in ("status", "check", "show")):
             return AssistantIntent(
                 command=AssistantCommandName.STATUS,
                 arguments={"investigation_id": investigation.group(0).upper()},
             )
+        if "investigation id" in lower and any(
+            phrase in lower
+            for phrase in ("this alert", "that alert", "previous alert")
+        ):
+            return AssistantIntent(command=AssistantCommandName.STATUS)
         if any(
             phrase in normalized
             for phrase in (
@@ -119,6 +147,9 @@ class AssistantIntentRouter:
                 "whole mapek",
                 "start investigation",
                 "investigate alert",
+                "investigate it",
+                "investigate this",
+                "investigate that",
             )
         ):
             return AssistantIntent(
@@ -134,7 +165,22 @@ class AssistantIntentRouter:
                     "indicator_type": indicator_type,
                 },
             )
-        if any(phrase in lower for phrase in ("get only alerts", "show alerts", "recent alerts", "wazuh alerts")):
+        if any(
+            phrase in lower
+            for phrase in ("triage findings", "triage alerts", "show findings")
+        ):
+            return AssistantIntent(command=AssistantCommandName.TRIAGE)
+        if any(
+            phrase in lower
+            for phrase in (
+                "get only alerts",
+                "show alerts",
+                "recent alerts",
+                "latest alerts",
+                "newest alerts",
+                "wazuh alerts",
+            )
+        ):
             return AssistantIntent(command=AssistantCommandName.ALERTS)
         if any(phrase in lower for phrase in ("alert summary", "alert overview", "how many alerts")):
             return AssistantIntent(command=AssistantCommandName.SUMMARY)

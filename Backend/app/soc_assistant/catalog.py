@@ -10,7 +10,11 @@ COMMANDS = (
         aliases=["/alert", "/recent"],
         title="Get Wazuh alerts",
         description="Return compact correlated Wazuh findings without starting remediation.",
-        usage="/alerts [--hours 24] [--min-level 7] [--limit 20] [--agent 001] [text]",
+        usage=(
+            "/alerts [--new|--open|--all] [--since 15m] "
+            "[--severity high] [--hours 24] [--min-level 7] "
+            "[--limit 20] [--agent 001] [text]"
+        ),
         category="Monitor",
         examples=["/alerts --min-level 10", "/alerts ssh --hours 6"],
     ),
@@ -33,6 +37,16 @@ COMMANDS = (
         usage="/hunt <indicator> [--type ip|domain|hash|process|user|path|other] [--hours 24] [--agent 001]",
         category="Investigate",
         examples=["/hunt 192.0.2.10 --type ip", "/hunt powershell.exe --type process"],
+    ),
+    AssistantCommand(
+        name=AssistantCommandName.TRIAGE,
+        slash="/triage",
+        aliases=["/findings"],
+        title="Triage findings",
+        description="Group recent Wazuh alerts into findings with an evidence-backed verdict.",
+        usage="/triage [--hours 24] [--min-level 7] [--limit 20]",
+        category="Monitor",
+        examples=["/triage --min-level 10", "/triage --hours 6"],
     ),
     AssistantCommand(
         name=AssistantCommandName.INVESTIGATE,
@@ -85,4 +99,3 @@ COMMAND_BY_SLASH = {
 
 def public_catalog() -> list[dict]:
     return [command.model_dump(mode="json") for command in COMMANDS]
-

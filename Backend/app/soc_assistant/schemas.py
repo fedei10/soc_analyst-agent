@@ -13,10 +13,12 @@ class StrictModel(BaseModel):
 
 
 class AssistantCommandName(StrEnum):
+    CHAT = "chat"
     HELP = "help"
     ALERTS = "alerts"
     SUMMARY = "summary"
     HUNT = "hunt"
+    TRIAGE = "triage"
     INVESTIGATE = "investigate"
     STATUS = "status"
     HEALTH = "health"

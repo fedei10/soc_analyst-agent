@@ -56,6 +56,14 @@ class InvestigationRecord(Base):
     )
     owner_user_id: Mapped[str | None] = mapped_column(String(128), index=True)
     alert_id: Mapped[str] = mapped_column(String(256), index=True)
+    primary_alert_id: Mapped[int | None] = mapped_column(
+        ForeignKey("soc_wazuh_alerts.id", ondelete="SET NULL"),
+        index=True,
+    )
+    finding_id: Mapped[str | None] = mapped_column(
+        ForeignKey("soc_findings.finding_id", ondelete="SET NULL"),
+        index=True,
+    )
     agent_id: Mapped[str | None] = mapped_column(String(32), index=True)
     status: Mapped[str] = mapped_column(String(32), index=True)
     current_stage: Mapped[str] = mapped_column(String(64), index=True)
@@ -67,6 +75,9 @@ class InvestigationRecord(Base):
         index=True,
     )
     initiation_reason: Mapped[str | None] = mapped_column(Text)
+    failure_code: Mapped[str | None] = mapped_column(String(128), index=True)
+    failure_reason: Mapped[str | None] = mapped_column(Text)
+    last_successful_stage: Mapped[str | None] = mapped_column(String(64))
     snapshot: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

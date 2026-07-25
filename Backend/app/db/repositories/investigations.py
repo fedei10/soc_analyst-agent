@@ -24,6 +24,8 @@ from app.db.models.investigation import (
     TierReportRecord,
     ToolExecutionRecord,
 )
+from app.db.models.alert_memory import InvestigationStepRecord
+from app.db.models.alert_memory import WazuhAlertRecord
 from app.coreAgents.orchestration.reporting import build_tier_report
 from app.coreAgents.orchestration.schemas import AgentTier
 from app.db.sanitization import bounded_excerpt, sanitize_for_storage
@@ -106,6 +108,13 @@ class InvestigationRepository(Protocol):
         organization_id: str,
         status: str | None = None,
     ) -> int: ...
+
+    def get_active_for_alert(
+        self,
+        alert_id: str,
+        *,
+        organization_id: str,
+    ) -> dict[str, Any] | None: ...
 
     def get_report(
         self,
@@ -229,6 +238,23 @@ class InMemoryInvestigationRepository:
             values = [item for item in values if item.get("status") == status]
         values.reverse()
         return deepcopy(values[offset:offset + limit])
+
+    def get_active_for_alert(
+        self,
+        alert_id: str,
+        *,
+        organization_id: str,
+    ) -> dict[str, Any] | None:
+        active = {"created", "queued", "running", "awaiting_approval"}
+        with self._lock:
+            matches = [
+                item
+                for (org_id, _), item in self._snapshots.items()
+                if org_id == organization_id
+                and item.get("alert_id") == alert_id
+                and item.get("status") in active
+            ]
+        return deepcopy(matches[-1]) if matches else None
 
     def get_report(
         self,
@@ -471,6 +497,20 @@ class SQLAlchemyInvestigationRepository:
         if not organization_id:
             raise ValueError("organization_id is required.")
         now = datetime.now(UTC)
+        errors = [
+            item
+            for item in data.get("errors", [])
+            if isinstance(item, dict)
+        ]
+        last_error = errors[-1] if errors else {}
+        successful_stages = [
+            str(item.get("stage"))
+            for item in data.get("audit_events", [])
+            if isinstance(item, dict)
+            and str(item.get("event") or "").endswith(
+                ("completed", "succeeded")
+            )
+        ]
 
         with self._session_factory.begin() as session:
             record = session.get(
@@ -479,11 +519,24 @@ class SQLAlchemyInvestigationRepository:
                 with_for_update=True,
             )
             if record is None:
+                alert_record = session.scalar(
+                    select(WazuhAlertRecord)
+                    .where(
+                        WazuhAlertRecord.wazuh_document_id
+                        == str(data["alert_id"])
+                    )
+                    .order_by(WazuhAlertRecord.event_timestamp.desc())
+                    .limit(1)
+                )
                 record = InvestigationRecord(
                     investigation_id=investigation_id,
                     organization_id=organization_id,
                     owner_user_id=data.get("owner_user_id"),
                     alert_id=str(data["alert_id"]),
+                    primary_alert_id=(
+                        alert_record.id if alert_record is not None else None
+                    ),
+                    finding_id=data.get("finding_id"),
                     agent_id=data.get("agent_id"),
                     status=str(data["status"]),
                     current_stage=str(data["current_stage"]),
@@ -495,6 +548,14 @@ class SQLAlchemyInvestigationRepository:
                         data.get("owner_user_id"),
                     ),
                     initiation_reason=data.get("initiation_reason"),
+                    failure_code=last_error.get("code"),
+                    failure_reason=(
+                        last_error.get("message")
+                        or last_error.get("error")
+                    ),
+                    last_successful_stage=(
+                        successful_stages[-1] if successful_stages else None
+                    ),
                     snapshot=data,
                     created_at=now,
                     updated_at=now,
@@ -508,6 +569,9 @@ class SQLAlchemyInvestigationRepository:
                 record.owner_user_id = (
                     data.get("owner_user_id") or record.owner_user_id
                 )
+                record.finding_id = (
+                    data.get("finding_id") or record.finding_id
+                )
                 record.agent_id = data.get("agent_id")
                 record.status = str(data["status"])
                 record.current_stage = str(data["current_stage"])
@@ -516,6 +580,15 @@ class SQLAlchemyInvestigationRepository:
                 record.initiated_by_user_id = (
                     data.get("initiated_by_user_id")
                     or record.initiated_by_user_id
+                )
+                record.failure_code = last_error.get("code")
+                record.failure_reason = (
+                    last_error.get("message") or last_error.get("error")
+                )
+                record.last_successful_stage = (
+                    successful_stages[-1]
+                    if successful_stages
+                    else record.last_successful_stage
                 )
                 record.snapshot = data
                 record.updated_at = now
@@ -534,6 +607,83 @@ class SQLAlchemyInvestigationRepository:
             self._save_audit_events(session, data)
             self._save_approval(session, data)
             self._save_actions(session, data)
+            self._save_steps(session, data)
+
+    def get_active_for_alert(
+        self,
+        alert_id: str,
+        *,
+        organization_id: str,
+    ) -> dict[str, Any] | None:
+        active = ("created", "queued", "running", "awaiting_approval")
+        statement = (
+            select(InvestigationRecord)
+            .where(
+                InvestigationRecord.organization_id == organization_id,
+                InvestigationRecord.alert_id == alert_id,
+                InvestigationRecord.status.in_(active),
+            )
+            .order_by(InvestigationRecord.updated_at.desc())
+            .limit(1)
+        )
+        with self._session_factory() as session:
+            record = session.scalar(statement)
+            return deepcopy(record.snapshot) if record else None
+
+    @staticmethod
+    def _save_steps(
+        session: Session,
+        snapshot: dict[str, Any],
+    ) -> None:
+        investigation_id = snapshot["investigation_id"]
+        existing = {
+            (record.stage, record.started_at.isoformat())
+            for record in session.scalars(
+                select(InvestigationStepRecord).where(
+                    InvestigationStepRecord.investigation_id
+                    == investigation_id
+                )
+            ).all()
+        }
+        errors_by_stage = {
+            str(item.get("stage") or snapshot.get("current_stage")): item
+            for item in snapshot.get("errors", [])
+            if isinstance(item, dict)
+        }
+        for event in snapshot.get("audit_events", []):
+            if not isinstance(event, dict) or not event.get("timestamp"):
+                continue
+            stage = str(event.get("stage") or "unknown")
+            started_at = _parse_datetime(event["timestamp"])
+            key = (stage, started_at.isoformat())
+            if key in existing:
+                continue
+            name = str(event.get("event") or "")
+            status = (
+                "failed"
+                if "failed" in name
+                else "completed"
+                if name.endswith(("completed", "succeeded"))
+                else "started"
+            )
+            error = errors_by_stage.get(stage, {})
+            session.add(
+                InvestigationStepRecord(
+                    investigation_id=investigation_id,
+                    stage=stage,
+                    status=status,
+                    input_data={},
+                    output_data=_json_value(event),
+                    error_code=error.get("code"),
+                    error_message=(
+                        error.get("message") or error.get("error")
+                    ),
+                    started_at=started_at,
+                    completed_at=(
+                        started_at if status in {"completed", "failed"} else None
+                    ),
+                )
+            )
 
     def _save_agent_runs(
         self,

@@ -21,18 +21,28 @@ from app.api.v1.schemas.investigation import (
     InvestigationCreate,
     ResponseExecutionInput,
 )
+from app.config import settings
 from app.coreAgents.orchestration.investigation_service import (
     InvestigationNotFoundError,
     get_investigation_service,
 )
 from app.db.repositories.investigations import ResponseExecutionConflictError
+from app.db.repositories.findings import (
+    FindingRepository,
+    get_finding_repository,
+)
 from app.db.session import database_url
 from app.services.redis.ephemeral import EphemeralRedis
 from app.services.wazuh.dependencies import get_wazuh_gateway
 from app.services.wazuh.gateway import WazuhGateway
 from app.soc_assistant.catalog import public_catalog
+from app.soc_assistant.overview import build_soc_overview, build_soc_platform
 from app.soc_assistant.schemas import AssistantRequest
 from app.soc_assistant.service import SOCAssistant
+from app.soc_assistant.references import (
+    InvestigationReferenceError,
+    resolve_investigation_reference,
+)
 
 
 read = APIRouter(dependencies=[Depends(require_read)])
@@ -46,6 +56,7 @@ InvestigatorPrincipal = Annotated[
 ApproverPrincipal = Annotated[AuthPrincipal, Depends(require_approve)]
 ExecutorPrincipal = Annotated[AuthPrincipal, Depends(require_execute)]
 AssistantGateway = Annotated[WazuhGateway, Depends(get_wazuh_gateway)]
+FindingRepo = Annotated[FindingRepository, Depends(get_finding_repository)]
 activity_store = EphemeralRedis()
 
 
@@ -165,15 +176,40 @@ def _initial_state(
 def create_investigation(
     request: InvestigationCreate,
     principal: InvestigatorPrincipal,
+    gateway: AssistantGateway,
 ):
     _enforce_rate_limit(
         principal,
         operation="create-investigation",
         limit=10,
     )
-    snapshot = get_investigation_service().start(
-        alert_id=request.alert_id,
-        agent_id=request.agent_id,
+    service = get_investigation_service()
+    try:
+        resolved = resolve_investigation_reference(
+            request.alert_id,
+            agent_id=request.agent_id,
+            organization_id=principal.scope_id,
+            gateway=gateway,
+            investigations=service,
+        )
+    except InvestigationReferenceError as exc:
+        raise HTTPException(status_code=422, detail=exc.payload()) from exc
+    if resolved.existing_investigation is not None:
+        return {
+            "data": _public_data(
+                {
+                    **resolved.existing_investigation,
+                    "existing": True,
+                    "message": (
+                        "An active investigation already exists for this alert."
+                    ),
+                }
+            )
+        }
+    snapshot = service.start(
+        alert_id=resolved.alert_id,
+        finding_id=resolved.finding_id,
+        agent_id=resolved.agent_id,
         initiated_by=principal.user_id,
         organization_id=principal.scope_id,
         owner_user_id=principal.user_id,
@@ -615,6 +651,86 @@ def chat_with_soc_orchestrator(
 def get_soc_assistant_commands(_: ReadPrincipal):
     commands = public_catalog()
     return {"data": {"items": commands, "count": len(commands)}}
+
+
+@read.get("/soc/overview", tags=["assistant"])
+def get_soc_overview(
+    principal: ReadPrincipal,
+    gateway: AssistantGateway,
+    finding_repository: FindingRepo,
+    hours: int = Query(default=24, ge=1, le=168),
+):
+    service = get_investigation_service()
+    snapshots = service.list_history(
+        limit=100,
+        organization_id=principal.scope_id,
+    )
+    findings = finding_repository.list(
+        organization_id=settings.WAZUH_INGESTION_ORGANIZATION_ID,
+        limit=100,
+    )
+    try:
+        alert_summary = gateway.alert_summary(hours=hours)
+    except Exception as exc:
+        logger.warning(
+            "soc_overview_wazuh_unavailable",
+            error_type=type(exc).__name__,
+        )
+        alert_summary = None
+    overview = build_soc_overview(
+        investigations=snapshots,
+        investigation_total=service.history_count(
+            organization_id=principal.scope_id,
+        ),
+        findings=findings,
+        alert_summary=alert_summary,
+        window_hours=hours,
+    )
+    return {"data": _public_data(overview.model_dump(mode="json"))}
+
+
+@read.get("/soc/platform", tags=["assistant"])
+def get_soc_platform(principal: ReadPrincipal):
+    snapshots = get_investigation_service().list_history(
+        limit=100,
+        organization_id=principal.scope_id,
+    )
+    assignments = [
+        {"role": "chat", "provider": "oxy", "model": None},
+        {"role": "l1", "provider": "cerebras", "model": None},
+        {"role": "l2", "provider": "groq", "model": None},
+        {"role": "l3", "provider": "oxy", "model": None},
+    ]
+    assignments.append(
+        {
+            "role": "mape_k",
+            "provider": settings.LLM_PROVIDER,
+            "model": settings.LLM_MODEL,
+        }
+    )
+    platform = build_soc_platform(
+        investigations=snapshots,
+        model_assignments=assignments,
+        response_policy={
+            "wazuh_read_only": settings.WAZUH_READ_ONLY,
+            "dangerous_tools_enabled": settings.WAZUH_ALLOW_DANGEROUS_TOOLS,
+            "dry_run": settings.MAPEK_DRY_RUN,
+            "real_execution_enabled": settings.MAPEK_REAL_EXECUTION_ENABLED,
+            "self_healing_enabled": settings.SELF_HEALING_ENABLED,
+            "human_approval_required": True,
+            "max_tool_calls_per_stage": settings.MAPEK_MAX_TOOL_CALLS_PER_STAGE,
+        },
+        retention={
+            "messages_days": settings.RETENTION_MESSAGES_DAYS,
+            "tool_payload_days": settings.RETENTION_TOOL_PAYLOAD_DAYS,
+            "checkpoint_days": settings.RETENTION_CHECKPOINT_DAYS,
+            "investigation_days": settings.RETENTION_INVESTIGATION_DAYS,
+            "reports": "indefinite",
+            "approvals": "indefinite",
+            "actions": "indefinite",
+        },
+    )
+    return {"data": _public_data(platform.model_dump(mode="json"))}
 
 
 def _sse(event: str, payload: dict[str, Any]) -> str:

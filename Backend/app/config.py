@@ -108,6 +108,10 @@ class Settings(BaseSettings):
     MAX_FINDINGS_PER_AGENT_RESPONSE: int = 10
     MAX_EVIDENCE_REFS_PER_FINDING: int = 20
     MAX_NORMALIZED_ALERTS_PER_RESPONSE: int = 50
+    WAZUH_INGESTION_INTERVAL_SECONDS: int = 20
+    WAZUH_INGESTION_PAGE_SIZE: int = 500
+    WAZUH_INGESTION_MAX_PAGES_PER_RUN: int = 20
+    WAZUH_INGESTION_ORGANIZATION_ID: str = "system"
 
     # Durable investigations and LangGraph checkpoints. Leave empty for the
     # in-memory development fallback.

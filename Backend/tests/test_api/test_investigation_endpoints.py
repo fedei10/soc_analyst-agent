@@ -61,12 +61,32 @@ def test_investigation_and_chat_routes_are_registered():
     assert "/api/v1/investigations/{investigation_id}/events" in paths
     assert "/api/v1/health/database" in paths
     assert "/api/v1/health/storage" in paths
+    assert "/api/v1/health/ingestion" in paths
     assert "/api/v1/soc/chat" in paths
     assert "/api/v1/soc/conversations" in paths
     assert "/api/v1/soc/conversations/{conversation_id}/messages" in paths
     assert "/api/v1/soc/orchestrator/chat" in paths
     assert "/api/v1/soc/orchestrator/chat/stream" in paths
     assert "/api/v1/soc/assistant/commands" in paths
+    assert "/api/v1/soc/overview" in paths
+    assert "/api/v1/soc/platform" in paths
+
+
+def test_soc_platform_metadata_does_not_initialize_model_providers(monkeypatch):
+    service = SimpleNamespace(list_history=lambda **_: [])
+    monkeypatch.setattr(investigations, "get_investigation_service", lambda: service)
+
+    response = investigations.get_soc_platform(PRINCIPAL)
+
+    assignments = response["data"]["model_assignments"]
+    assert [(item["role"], item["provider"]) for item in assignments] == [
+        ("chat", "oxy"),
+        ("l1", "cerebras"),
+        ("l2", "groq"),
+        ("l3", "oxy"),
+        ("mape_k", "oxy"),
+    ]
+    assert response["data"]["response_policy"]["human_approval_required"] is True
 
 
 def test_initial_investigation_state_matches_graph_contract():
@@ -154,3 +174,53 @@ def test_orchestrator_stream_returns_event_stream(monkeypatch):
     )
     assert response.media_type == "text/event-stream"
     assert response.headers["cache-control"] == "no-cache"
+
+
+def test_soc_overview_is_scoped_and_survives_wazuh_outage(monkeypatch):
+    class FakeService:
+        def list_history(self, *, limit, organization_id):
+            assert limit == 100
+            assert organization_id == PRINCIPAL.scope_id
+            return [
+                {
+                    "investigation_id": "INV-1",
+                    "alert_id": "alert-1",
+                    "status": "running",
+                    "current_stage": "l1",
+                    "executed_actions": [],
+                }
+            ]
+
+        def history_count(self, *, organization_id):
+            assert organization_id == PRINCIPAL.scope_id
+            return 1
+
+    class FakeFindingRepository:
+        def list(self, *, organization_id, limit):
+            assert (
+                organization_id
+                == investigations.settings.WAZUH_INGESTION_ORGANIZATION_ID
+            )
+            assert limit == 100
+            return []
+
+    class UnavailableGateway:
+        def alert_summary(self, *, hours):
+            assert hours == 24
+            raise ConnectionError("tunnel unavailable")
+
+    monkeypatch.setattr(
+        investigations,
+        "get_investigation_service",
+        lambda: FakeService(),
+    )
+    response = investigations.get_soc_overview(
+        PRINCIPAL,
+        UnavailableGateway(),
+        FakeFindingRepository(),
+        24,
+    )
+
+    assert response["data"]["wazuh_status"] == "unavailable"
+    assert response["data"]["metrics"]["active_investigations"]["value"] == 1
+    assert response["data"]["metrics"]["wazuh_alerts"]["value"] is None

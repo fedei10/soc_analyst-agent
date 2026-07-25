@@ -32,6 +32,22 @@ class RawAlertDocument(BaseModel):
     raw_document: dict[str, Any]
 
 
+class AlertIngestionDocument(BaseModel):
+    """One stable, sortable Wazuh document returned to the ingestion worker."""
+
+    document_id: str
+    index_name: str
+    sort_values: list[Any] = Field(default_factory=list)
+    normalized: AlertEvidence
+    raw_document: dict[str, Any]
+
+
+class AlertIngestionPage(BaseModel):
+    documents: list[AlertIngestionDocument]
+    search_after: list[Any] | None = None
+    total: int = Field(ge=0)
+
+
 class ArchivedLogSearchResult(BaseModel):
     index_pattern: str
     archive_status: Literal[
