@@ -2,6 +2,7 @@ import type {
   AgentChatResponse,
   AlertSummary,
   ApprovalInput,
+  AssistantCommandCatalog,
   ChatActivity,
   Investigation,
   InvestigationHistory,
@@ -72,6 +73,10 @@ export async function getWazuhHealth(): Promise<WazuhHealth> {
 
 export function getAlertSummary(hours = 24): Promise<AlertSummary> {
   return request(`/api/v1/alerts/summary?hours=${hours}`)
+}
+
+export function getAssistantCommands(): Promise<AssistantCommandCatalog> {
+  return request('/api/v1/soc/assistant/commands')
 }
 
 export async function streamAgentMessage(

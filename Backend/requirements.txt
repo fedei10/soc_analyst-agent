@@ -19,10 +19,7 @@ pytest
 pytest-asyncio
 langchain
 langchain-core
-langchain-groq
 langchain-openai>=1.1,<2
-langchain-cerebras>=0.8,<1
-langchain-google-genai>=4,<5
 langsmith
 requests
 opensearch-py

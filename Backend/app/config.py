@@ -31,20 +31,27 @@ class Settings(BaseSettings):
     SLOW_TOOL_THRESHOLD_MS: int = 2000
     SLOW_MODEL_THRESHOLD_MS: int = 10000
 
-    # API Keys
-    GROQ_API_KEY: SecretStr = SecretStr("")
-    GROQ_AGENT_MODEL: str = "openai/gpt-oss-20b"
-    GROQ_STRUCTURED_MODEL: str = "openai/gpt-oss-20b"
-    OXYY_API_KEY: SecretStr = SecretStr("")
-    OXYY_BASE_URL: str = "https://api.oxyy.ai/v1"
-    OXYY_AGENT_MODEL: str = "gpt-oss-120b"
-    OXYY_STRUCTURED_MODEL: str = "gpt-oss-120b"
-    CEREBRAS_API_KEY: SecretStr = SecretStr("")
-    CEREBRAS_AGENT_MODEL: str = "gpt-oss-120b"
-    CEREBRAS_STRUCTURED_MODEL: str = "gpt-oss-120b"
-    GOOGLE_API_KEY: SecretStr = SecretStr("")
-    GEMINI_AGENT_MODEL: str = "gemini-2.5-flash"
-    GEMINI_STRUCTURED_MODEL: str = "gemini-2.5-flash"
+    # Single MAPE-K reasoning provider. Only Analyze and Plan may use it.
+    LLM_PROVIDER: str = "oxy"
+    LLM_API_KEY: SecretStr = SecretStr("")
+    LLM_BASE_URL: str = "https://api.oxyy.ai/v1"
+    LLM_MODEL: str = "gpt-oss-120b"
+    LLM_TIMEOUT_SECONDS: int = 30
+    MAPEK_ANALYSIS_CONFIDENCE_THRESHOLD: float = 0.75
+    MAPEK_MAX_ANALYSIS_ATTEMPTS: int = 2
+    MAPEK_MAX_PLANNING_RETRIES: int = 1
+    MAPEK_MAX_INPUT_TOKENS: int = 8000
+    MAPEK_MAX_TOOL_CALLS_PER_STAGE: int = 4
+    MAPEK_CORRELATION_WINDOW_SECONDS: int = 600
+    MAPEK_DRY_RUN: bool = True
+    MAPEK_REAL_EXECUTION_ENABLED: bool = False
+    MAPEK_TEMPORARY_BLOCK_TTL_SECONDS: int = 900
+    MAPEK_PROTECTED_IPS: str = ""
+    MAPEK_APPROVED_ADMIN_IPS: str = ""
+    MAPEK_PROTECTED_ACCOUNTS: str = "root,wazuh"
+    MAPEK_PROTECTED_PROCESSES: str = "sshd,wazuh-agentd"
+    MAPEK_PROTECTED_PORTS: str = "22,55000,9200"
+    MAPEK_MAINTENANCE_WINDOW_ACTIVE: bool = False
 
     # Clerk authenticates every application API request. The secret and
     # optional PEM JWT key are server-only and must never be exposed through a
@@ -55,6 +62,10 @@ class Settings(BaseSettings):
     # Comma-separated Clerk user IDs allowed to execute approved responses.
     # Empty means no user can execute, while approval remains a separate step.
     CLERK_EXECUTOR_USER_IDS: str = ""
+    CLERK_SOC_L2_USER_IDS: str = ""
+    CLERK_SOC_L3_USER_IDS: str = ""
+    CLERK_SECURITY_ADMIN_USER_IDS: str = ""
+    CLERK_AUDITOR_USER_IDS: str = ""
 
     # LangSmith tracing
     LANGSMITH_API_KEY: SecretStr = SecretStr("")

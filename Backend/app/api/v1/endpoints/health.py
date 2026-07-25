@@ -3,7 +3,6 @@ import time
 from typing import Annotated, Callable
 
 import httpx
-import requests
 from fastapi import APIRouter, Depends, Response, status
 from opensearchpy import exceptions as opensearch_exc
 
@@ -16,9 +15,8 @@ from app.api.v1.schemas.health import (
     WazuhHealthResponse,
 )
 from app.db.session import check_database, database_url
-from app.services.cerebras.connection import test_cerebras_connection
-from app.services.groq.connection import test_groq_connection
-from app.services.oxy.connection import oxy_connection
+from app.config import settings
+from app.mape_k.llm import effective_llm_api_key
 from app.services.wazuh.dependencies import get_wazuh_gateway
 from app.services.wazuh.exceptions import WazuhAPIError, WazuhAuthError, WazuhPermissionError
 from app.services.wazuh.gateway import WazuhGateway
@@ -259,24 +257,15 @@ def services_health(response: Response, gateway: GatewayDep) -> ServicesHealthRe
 def _build_services_health(gateway: WazuhGateway) -> tuple[ServicesHealthResponse, int]:
     results: dict[str, ServiceCheck] = {}
 
-    for name, check in {
-        "groq": test_groq_connection,
-        "cerebras": test_cerebras_connection,
-    }.items():
-        try:
-            check()
-            results[name] = ServiceCheck(status="healthy")
-        except requests.HTTPError as e:
-            results[name] = ServiceCheck(
-                status="unhealthy",
-                error_code=e.response.status_code,
-                detail="401 = bad API key in .env" if e.response.status_code == 401 else str(e),
-            )
-        except Exception as e:
-            results[name] = ServiceCheck(status="unhealthy", detail=str(e))
-
-    # ponytail: oxy_connection swallows its own errors and returns bool
-    results["oxy"] = ServiceCheck(status="healthy" if oxy_connection() else "unhealthy")
+    llm_configured = bool(effective_llm_api_key())
+    results["central_llm"] = ServiceCheck(
+        status="healthy" if llm_configured else "unhealthy",
+        detail=(
+            f"Configured model: {settings.LLM_MODEL}"
+            if llm_configured
+            else "LLM_API_KEY is not configured. Deterministic playbooks still work."
+        ),
+    )
 
     try:
         gateway.indexer_health()

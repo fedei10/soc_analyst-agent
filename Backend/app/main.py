@@ -28,9 +28,6 @@ from app.services.wazuh.dependencies import close_wazuh_dependencies
 from app.coreAgents.orchestration.investigation_service import (
     close_investigation_service,
 )
-from app.coreAgents.orchestration.conversation_agent import (
-    close_soc_chat_agent,
-)
 from app.db.session import close_database
 from app.db.repositories.investigations import close_investigation_repository
 from app.services.wazuh.exceptions import (
@@ -49,7 +46,6 @@ logger = structlog.get_logger("tsage.api")
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     yield
-    close_soc_chat_agent()
     close_investigation_service()
     close_wazuh_dependencies()
     close_investigation_repository()

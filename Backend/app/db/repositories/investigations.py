@@ -35,7 +35,7 @@ from app.db.session import (
 )
 
 
-TERMINAL_STATUSES = {"completed", "failed", "rejected"}
+TERMINAL_STATUSES = {"completed", "failed", "rejected", "escalated"}
 
 
 class ResponseExecutionConflictError(RuntimeError):

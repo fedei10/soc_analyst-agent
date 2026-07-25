@@ -24,6 +24,7 @@ class AuthPrincipal:
     user_id: str
     session_id: str | None
     scope_id: str
+    roles: tuple[str, ...] = ("soc_l1",)
 
 
 def _secret(value) -> str | None:
@@ -81,10 +82,31 @@ def _principal_from_payload(payload: dict[str, Any]) -> AuthPrincipal:
     user_id = str(payload.get("sub") or "").strip()
     if not user_id:
         raise HTTPException(401, "Clerk session token has no subject.")
+    roles = {"soc_l1"}
+    role_settings = {
+        "soc_l2": settings.CLERK_SOC_L2_USER_IDS,
+        "soc_l3": settings.CLERK_SOC_L3_USER_IDS,
+        "security_admin": settings.CLERK_SECURITY_ADMIN_USER_IDS,
+        "auditor": settings.CLERK_AUDITOR_USER_IDS,
+    }
+    for role, configured_users in role_settings.items():
+        if user_id in {
+            value.strip()
+            for value in configured_users.split(",")
+            if value.strip()
+        }:
+            roles.add(role)
+    if user_id in {
+        value.strip()
+        for value in settings.CLERK_EXECUTOR_USER_IDS.split(",")
+        if value.strip()
+    }:
+        roles.add("soc_l3")
     return AuthPrincipal(
         user_id=user_id,
         session_id=str(payload.get("sid") or "").strip() or None,
         scope_id=user_id,
+        roles=tuple(sorted(roles)),
     )
 
 
@@ -150,7 +172,17 @@ async def require_authenticated(
 
 require_read = require_authenticated
 require_investigate = require_authenticated
-require_approve = require_authenticated
+
+
+async def require_approve(
+    principal: AuthPrincipal = Depends(require_principal),
+) -> AuthPrincipal:
+    if not {"soc_l2", "soc_l3", "security_admin"} & set(principal.roles):
+        raise HTTPException(
+            403,
+            "SOC L2, SOC L3, or security administrator approval is required.",
+        )
+    return principal
 
 
 async def require_execute(

@@ -6,7 +6,7 @@ services:
       POSTGRES_USER: ${TSAGE_POSTGRES_USER:-tsage}
       POSTGRES_PASSWORD: ${TSAGE_POSTGRES_PASSWORD:-tsage-local-dev-only}
     ports:
-      - "${TSAGE_POSTGRES_PORT:-5432}:5432"
+      - "${TSAGE_POSTGRES_PORT:-5434}:5432"
     volumes:
       - tsage-postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -27,7 +27,7 @@ services:
         exec redis-server --save '' --appendonly no
         --requirepass "$${TSAGE_REDIS_PASSWORD}"
     ports:
-      - "${TSAGE_REDIS_PORT:-6379}:6379"
+      - "${TSAGE_REDIS_PORT:-6380}:6379"
     healthcheck:
       test:
         - CMD-SHELL

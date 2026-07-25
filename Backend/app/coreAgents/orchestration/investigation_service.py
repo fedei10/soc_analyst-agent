@@ -1,14 +1,16 @@
 """Reusable application service around the formal investigation graph."""
 
 import uuid
+from enum import Enum
 from functools import lru_cache
 from threading import RLock
 from typing import Any
 
 from langgraph.types import Command
+from pydantic import BaseModel
 
-from app.coreAgents.orchestration.graph import (
-    create_investigation_graph,
+from app.mape_k.graph import (
+    create_mape_k_graph,
     investigation_config,
 )
 from app.db.checkpointer import (
@@ -26,6 +28,18 @@ class InvestigationNotFoundError(LookupError):
     pass
 
 
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
 class InvestigationService:
     def __init__(
         self,
@@ -37,9 +51,8 @@ class InvestigationService:
         self.repository = repository or get_investigation_repository()
         if graph is None:
             self._checkpointer = create_investigation_checkpointer()
-            graph = create_investigation_graph(
+            graph = create_mape_k_graph(
                 checkpointer=self._checkpointer.saver,
-                tier_report_writer=self.repository.save_tier_report,
             )
         self.graph = graph
         self._lock = RLock()
@@ -56,8 +69,10 @@ class InvestigationService:
         owner_user_id: str | None = None,
     ) -> dict[str, Any]:
         return {
+            "incident_id": f"INC-{investigation_id.removeprefix('INV-')}",
             "investigation_id": investigation_id,
             "status": "created",
+            "stage": "created",
             "current_stage": "created",
             "alert_id": alert_id,
             "agent_id": agent_id,
@@ -65,10 +80,12 @@ class InvestigationService:
             "initiation_reason": initiation_reason,
             "organization_id": organization_id,
             "owner_user_id": owner_user_id,
+            "normalized_alerts": [],
             "evidence": [],
-            "timeline": [],
-            "affected_assets": [],
+            "evidence_records": [],
+            "findings": [],
             "proposed_actions": [],
+            "execution_results": [],
             "executed_actions": [],
             "audit_events": [],
             "errors": [],
@@ -124,7 +141,7 @@ class InvestigationService:
                 raise InvestigationNotFoundError(investigation_id)
             return stored
 
-        state = dict(snapshot.values)
+        state = _json_safe(dict(snapshot.values))
         state_organization = str(state.get("organization_id") or "local")
         if (
             organization_id is not None
@@ -132,6 +149,7 @@ class InvestigationService:
         ):
             raise InvestigationNotFoundError(investigation_id)
         result = {
+            "incident_id": state["incident_id"],
             "investigation_id": state["investigation_id"],
             "alert_id": state["alert_id"],
             "agent_id": state.get("agent_id"),
@@ -140,23 +158,41 @@ class InvestigationService:
             "organization_id": state_organization,
             "owner_user_id": state.get("owner_user_id"),
             "status": state["status"],
+            "stage": state.get("stage"),
             "current_stage": state["current_stage"],
-            "severity": state.get("severity"),
-            "confidence": state.get("confidence"),
-            "l1_result": state.get("l1_result"),
-            "l2_result": state.get("l2_result"),
-            "l3_result": state.get("l3_result"),
-            "l1_report": state.get("l1_report"),
-            "l2_report": state.get("l2_report"),
-            "l3_report": state.get("l3_report"),
+            "severity": (
+                (state.get("findings") or [{}])[0].get("severity")
+                if state.get("findings")
+                else None
+            ),
+            "confidence": (
+                state.get("diagnosis", {}).get("confidence")
+                if isinstance(state.get("diagnosis"), dict)
+                else getattr(state.get("diagnosis"), "confidence", None)
+            ),
+            "normalized_alerts": state.get("normalized_alerts", []),
+            "evidence": state.get("evidence", []),
+            "evidence_records": state.get("evidence_records", []),
+            "findings": state.get("findings", []),
+            "incident_fingerprint": state.get("incident_fingerprint"),
+            "evidence_version": state.get("evidence_version"),
+            "diagnosis": state.get("diagnosis"),
+            "remediation_plan": state.get("remediation_plan"),
+            "policy_decision": state.get("policy_decision"),
             "proposed_actions": state.get("proposed_actions", []),
             "approval_request": state.get("approval_request"),
             "approval_decision": state.get("approval_decision"),
+            "execution_results": state.get("execution_results", []),
             "executed_actions": state.get("executed_actions", []),
+            "verification": state.get("verification"),
+            "rollback": state.get("rollback"),
             "final_report": state.get("final_report"),
+            "llm_input_tokens": state.get("llm_input_tokens", 0),
+            "llm_output_tokens": state.get("llm_output_tokens", 0),
+            "estimated_cost_usd": state.get("estimated_cost_usd", 0),
             "errors": state.get("errors", []),
             "audit_events": state.get("audit_events", []),
-            "specialist_runs": state.get("specialist_runs", []),
+            "specialist_runs": [],
             "pending_nodes": list(snapshot.next),
         }
         with self._lock:

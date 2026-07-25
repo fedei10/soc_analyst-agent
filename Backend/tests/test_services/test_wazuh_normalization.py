@@ -4,7 +4,6 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from app.coreAgents.orchestration.conversation_tools import build_soc_chat_tools
 from app.services.wazuh.models import AlertEvidence, AlertSearchResult
 from app.services.wazuh.normalization.aggregation import (
     aggregate_alerts,
@@ -348,42 +347,6 @@ def test_raw_api_serializer_is_explicit_but_agent_trace_is_sanitized():
     assert "provider-signature" not in trace
     assert "Bearer secret" not in trace
     assert '"secret"' not in trace
-
-
-def test_conversation_alert_tool_defaults_to_compact_findings():
-    result = AlertSearchResult(
-        total=1,
-        returned=1,
-        truncated=False,
-        alerts=[
-            AlertEvidence(
-                alert_id="alert-1",
-                timestamp=BASE_TIME,
-                agent_id="001",
-                rule_id="5712",
-                rule_level=10,
-                description="sshd brute force",
-                decoder_name="sshd",
-                full_log="must not reach state",
-                rule_groups=["sshd", "authentication_failures"],
-                event_outcome="failure",
-            )
-        ],
-    )
-
-    class Gateway:
-        def search_alerts(self, **kwargs):
-            return result
-
-    tools = {
-        item.name: item
-        for item in build_soc_chat_tools(gateway=Gateway())
-    }
-    payload = tools["get_recent_wazuh_alerts"].invoke({})
-    assert payload["ok"] is True
-    assert payload["data"]["finding_count"] == 1
-    assert "alerts" not in payload["data"]
-    assert "must not reach state" not in json.dumps(payload)
 
 
 def test_compact_payload_is_at_least_seventy_percent_smaller():

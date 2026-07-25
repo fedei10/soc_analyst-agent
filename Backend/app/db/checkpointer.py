@@ -8,6 +8,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from app.config import settings
 from app.db.session import database_url
+from app.mape_k.serde import create_checkpoint_serializer
 
 
 def _postgres_uri(value: str) -> str:
@@ -32,12 +33,15 @@ class CheckpointerHandle:
 def create_investigation_checkpointer() -> CheckpointerHandle:
     url = database_url()
     if not url:
-        return CheckpointerHandle(saver=InMemorySaver())
+        return CheckpointerHandle(
+            saver=InMemorySaver(serde=create_checkpoint_serializer())
+        )
 
     from langgraph.checkpoint.postgres import PostgresSaver
 
     context = PostgresSaver.from_conn_string(_postgres_uri(url))
     saver = context.__enter__()
+    saver.serde = create_checkpoint_serializer()
     if settings.DATABASE_AUTO_CREATE:
         saver.setup()
     return CheckpointerHandle(saver=saver, context=context)

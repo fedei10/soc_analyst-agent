@@ -25,12 +25,14 @@ def _principal(monkeypatch, state):
     return asyncio.run(deps.require_principal(request, None))
 
 
-def test_authenticated_user_can_use_soc_dependencies(monkeypatch):
+def test_authenticated_l1_user_cannot_approve(monkeypatch):
     principal = _principal(monkeypatch, _state())
 
     assert asyncio.run(deps.require_read(principal)) == principal
     assert asyncio.run(deps.require_investigate(principal)) == principal
-    assert asyncio.run(deps.require_approve(principal)) == principal
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(deps.require_approve(principal))
+    assert error.value.status_code == 403
 
 
 def test_approval_does_not_grant_response_execution(monkeypatch):

@@ -36,6 +36,7 @@ import {
   createInvestigation,
   executeApprovedResponse,
   getAlertSummary,
+  getAssistantCommands,
   getInvestigation,
   getInvestigationHistory,
   getLiveness,
@@ -46,6 +47,7 @@ import {
 import type {
   AlertSummary,
   ApprovalDecision,
+  AssistantCommand,
   ChatActivity,
   ChatMessage,
   Investigation,
@@ -55,10 +57,10 @@ import type {
 } from '@/types/soc'
 
 const SUGGESTED_PROMPTS = [
-  'Use Wazuh to review current high-severity alerts.',
-  'Investigate failed logins followed by a successful login on agent 001.',
-  'Search archived Wazuh logs for suspicious SSH or PowerShell activity.',
-  'Review detection gaps and propose safe response steps for alert ID '
+  '/alerts --min-level 10 --hours 24',
+  '/summary --hours 24',
+  '/hunt 192.0.2.10 --type ip',
+  '/investigate ALERT-ID --agent 001'
 ]
 
 function createMessage(
@@ -260,6 +262,11 @@ export default function SocConsole() {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [chatInput, setChatInput] = useState('')
   const [chatBusy, setChatBusy] = useState(false)
+  const [assistantCommands, setAssistantCommands] = useState<
+    AssistantCommand[]
+  >([])
+  const [selectedCommandIndex, setSelectedCommandIndex] = useState(0)
+  const [slashMenuDismissed, setSlashMenuDismissed] = useState(false)
   const [conversationId, setConversationId] = useState('')
   const [liveActivities, setLiveActivities] = useState<ChatActivity[]>([])
   const [liveAnswer, setLiveAnswer] = useState('')
@@ -277,7 +284,6 @@ export default function SocConsole() {
   const [investigationBusy, setInvestigationBusy] = useState(false)
   const [alertId, setAlertId] = useState('')
   const [agentId, setAgentId] = useState('')
-  const [modifiedActions, setModifiedActions] = useState('')
   const userId = user?.id
   const conversationStorageKey = `tsage_conversation_id:${userId || 'none'}`
   const investigationStorageKey = `tsage_investigation_id:${userId || 'none'}`
@@ -297,6 +303,28 @@ export default function SocConsole() {
         ),
     [messages]
   )
+  const slashMatches = useMemo(() => {
+    const input = chatInput.trim().toLowerCase()
+    if (
+      slashMenuDismissed ||
+      !input.startsWith('/') ||
+      input.slice(1).includes(' ')
+    ) {
+      return []
+    }
+    return assistantCommands.filter((command) => {
+      const searchable = [
+        command.slash,
+        ...command.aliases,
+        command.title,
+        command.description,
+        command.category
+      ]
+        .join(' ')
+        .toLowerCase()
+      return input === '/' || searchable.includes(input)
+    })
+  }, [assistantCommands, chatInput, slashMenuDismissed])
 
   async function refreshEnvironment() {
     setEnvironmentBusy(true)
@@ -354,6 +382,9 @@ export default function SocConsole() {
     sessionStorage.setItem(conversationStorageKey, storedConversation)
     void refreshEnvironment()
     void refreshInvestigationHistory()
+    void getAssistantCommands()
+      .then((catalog) => setAssistantCommands(catalog.items))
+      .catch(() => setAssistantCommands([]))
 
     if (storedInvestigation) {
       void getInvestigation(storedInvestigation)
@@ -374,7 +405,14 @@ export default function SocConsole() {
     setConversationId(nextConversationId)
     setLiveActivities([])
     setLiveAnswer('')
+    setSlashMenuDismissed(false)
     sessionStorage.setItem(conversationStorageKey, nextConversationId)
+  }
+
+  function selectAssistantCommand(command: AssistantCommand) {
+    setChatInput(`${command.slash} `)
+    setSlashMenuDismissed(true)
+    setSelectedCommandIndex(0)
   }
 
   async function handleChatSubmit(event?: FormEvent) {
@@ -441,6 +479,29 @@ export default function SocConsole() {
   }
 
   function handleChatKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (slashMatches.length > 0) {
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault()
+        const direction = event.key === 'ArrowDown' ? 1 : -1
+        setSelectedCommandIndex(
+          (current) =>
+            (current + direction + slashMatches.length) % slashMatches.length
+        )
+        return
+      }
+      if (event.key === 'Tab' || event.key === 'Enter') {
+        event.preventDefault()
+        selectAssistantCommand(
+          slashMatches[selectedCommandIndex] || slashMatches[0]
+        )
+        return
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        setSlashMenuDismissed(true)
+        return
+      }
+    }
     if (
       event.key === 'Enter' &&
       !event.shiftKey &&
@@ -463,11 +524,6 @@ export default function SocConsole() {
       setInvestigation(result)
       sessionStorage.setItem(investigationStorageKey, result.investigation_id)
       void refreshInvestigationHistory()
-      if (result.approval_request) {
-        setModifiedActions(
-          JSON.stringify(result.approval_request.proposed_actions, null, 2)
-        )
-      }
       toast.success(`Investigation ${result.investigation_id} started.`)
     } catch (error) {
       toast.error(
@@ -520,23 +576,11 @@ export default function SocConsole() {
     const request = investigation?.approval_request
     if (!investigation || !request) return
 
-    let changes: Record<string, unknown>[] | undefined
-    if (decision === 'modify') {
-      try {
-        changes = JSON.parse(modifiedActions) as Record<string, unknown>[]
-        if (!Array.isArray(changes)) throw new Error('Expected an array')
-      } catch {
-        toast.error('Modified actions must be a valid JSON array.')
-        return
-      }
-    }
-
     setInvestigationBusy(true)
     try {
       const result = await submitApproval(investigation.investigation_id, {
         decision,
-        approval_id: request.approval_id,
-        ...(changes ? { modified_actions: changes } : {})
+        approval_id: request.approval_id
       })
       setInvestigation(result)
       void refreshInvestigationHistory()
@@ -595,7 +639,7 @@ export default function SocConsole() {
             onClick={() => setView('chat')}
           >
             <MessageSquare size={17} />
-            Agent workspace
+            SOC Assistant
           </button>
           <button
             className={view === 'alert-triage' ? 'active' : ''}
@@ -646,7 +690,7 @@ export default function SocConsole() {
             <span className="eyebrow">SOC operations console</span>
             <h1>
               {view === 'chat'
-                ? 'Agent workspace'
+                ? 'SOC Assistant'
                 : view === 'alert-triage'
                   ? 'Alert Triage'
                   : 'Investigation workflow'}
@@ -683,8 +727,8 @@ export default function SocConsole() {
                 <div className="orchestrator-node">
                   <Bot size={17} />
                   <div>
-                    <strong>SOC conversational analyst</strong>
-                    <span>Conversation memory and read-only Wazuh tools</span>
+                    <strong>Bounded SOC command router</strong>
+                    <span>Slash commands or natural-language requests</span>
                   </div>
                 </div>
                 <ChevronRight size={16} />
@@ -703,11 +747,11 @@ export default function SocConsole() {
                     <div className="empty-icon">
                       <ShieldAlert size={26} />
                     </div>
-                    <span>Conversational SOC</span>
-                    <h2>Analyst ready</h2>
+                    <span>SOC Assistant</span>
+                    <h2>Choose a capability</h2>
                     <p>
-                      Ask about current Wazuh evidence or continue an active
-                      investigation in the same conversation.
+                      Type <strong>/</strong> for commands or describe the SOC
+                      task in your own words.
                     </p>
                     <div className="prompt-list">
                       {SUGGESTED_PROMPTS.map((prompt) => (
@@ -751,19 +795,62 @@ export default function SocConsole() {
               </div>
 
               <form className="chat-composer" onSubmit={handleChatSubmit}>
+                {slashMatches.length > 0 && (
+                  <div
+                    className="slash-command-menu"
+                    id="soc-command-menu"
+                    role="listbox"
+                    aria-label="SOC assistant commands"
+                  >
+                    <div className="slash-command-heading">
+                      <span>Commands</span>
+                      <kbd>↑↓ select</kbd>
+                      <kbd>Enter insert</kbd>
+                    </div>
+                    {slashMatches.map((command, index) => (
+                      <button
+                        key={command.name}
+                        type="button"
+                        role="option"
+                        aria-selected={index === selectedCommandIndex}
+                        className={
+                          index === selectedCommandIndex ? 'selected' : ''
+                        }
+                        onMouseDown={(event) => event.preventDefault()}
+                        onClick={() => selectAssistantCommand(command)}
+                      >
+                        <Terminal size={16} />
+                        <div>
+                          <div>
+                            <strong>{command.slash}</strong>
+                            <span>{command.title}</span>
+                          </div>
+                          <p>{command.description}</p>
+                          <code>{command.usage}</code>
+                        </div>
+                        <small>{command.category}</small>
+                      </button>
+                    ))}
+                  </div>
+                )}
                 <textarea
                   value={chatInput}
-                  onChange={(event) => setChatInput(event.target.value)}
+                  onChange={(event) => {
+                    setChatInput(event.target.value)
+                    setSlashMenuDismissed(false)
+                    setSelectedCommandIndex(0)
+                  }}
                   onKeyDown={handleChatKeyDown}
-                  placeholder="Ask the SOC analyst to inspect Wazuh or continue an investigation..."
+                  placeholder="Type / for commands or describe a SOC task..."
                   rows={3}
                   disabled={chatBusy}
+                  aria-controls="soc-command-menu"
                 />
                 <div className="composer-footer">
                   <div>
                     <span className="read-only-indicator">
                       <Shield size={13} />
-                      Agent tools are read-only
+                      Commands are allowlisted; actions require approval
                     </span>
                     {messages.length > 0 && (
                       <button
@@ -798,9 +885,9 @@ export default function SocConsole() {
                     detail="Last 24 hours"
                   />
                   <Metric
-                    label="Agent"
-                    value="Conversational"
-                    detail="Tool loop + memory"
+                    label="Commands"
+                    value={assistantCommands.length || '-'}
+                    detail="Server-managed catalog"
                   />
                 </div>
                 <div className="connection-list">
@@ -1026,12 +1113,17 @@ export default function SocConsole() {
                 </div>
 
                 <div className="investigation-columns">
-                  <Panel title="Agent results" icon={<Bot size={17} />}>
+                  <Panel
+                    title="MAPE-K analysis"
+                    icon={<CircleGauge size={17} />}
+                  >
                     <div className="agent-result-list">
                       {[
-                        ['L1 triage', investigation.l1_result],
-                        ['L2 investigation', investigation.l2_result],
-                        ['L3 analysis', investigation.l3_result]
+                        ['Diagnosis', investigation.diagnosis],
+                        ['Remediation plan', investigation.remediation_plan],
+                        ['Policy decision', investigation.policy_decision],
+                        ['Verification', investigation.verification],
+                        ['Rollback', investigation.rollback]
                       ].map(([label, result]) =>
                         result ? (
                           <details key={label as string} open>
@@ -1045,10 +1137,10 @@ export default function SocConsole() {
                           </details>
                         ) : null
                       )}
-                      {!investigation.l1_result && (
+                      {!investigation.diagnosis && (
                         <div className="panel-empty">
-                          <Bot size={20} />
-                          <span>No agent result was produced</span>
+                          <CircleGauge size={20} />
+                          <span>No workflow analysis was produced</span>
                         </div>
                       )}
                     </div>
@@ -1131,30 +1223,24 @@ export default function SocConsole() {
                             >
                               <div>
                                 <strong>{titleCase(action.action_type)}</strong>
-                                <StatusBadge value={action.risk_level} />
+                                <StatusBadge
+                                  value={String(action.risk_level)}
+                                />
                               </div>
                               <span>{action.target}</span>
-                              <code>{action.execution_preview}</code>
-                              <p>{action.reason}</p>
-                              <small>{action.operational_impact}</small>
+                              <code>
+                                TTL {action.ttl_seconds ?? 'not applicable'}{' '}
+                                seconds
+                              </code>
+                              <p>
+                                Evidence:{' '}
+                                {action.evidence_refs.join(', ') || 'none'}
+                              </p>
                             </article>
                           )
                         )}
                       </div>
                       <div className="approval-form">
-                        <div className="field field-full">
-                          <label htmlFor="modified-actions">
-                            Modified actions JSON
-                          </label>
-                          <textarea
-                            id="modified-actions"
-                            value={modifiedActions}
-                            onChange={(event) =>
-                              setModifiedActions(event.target.value)
-                            }
-                            rows={6}
-                          />
-                        </div>
                         <div className="approval-buttons field-full">
                           <button
                             className="button button-danger"
@@ -1163,14 +1249,6 @@ export default function SocConsole() {
                           >
                             <X size={16} />
                             Reject all
-                          </button>
-                          <button
-                            className="button button-secondary"
-                            onClick={() => void handleApproval('modify')}
-                            disabled={investigationBusy}
-                          >
-                            <ListChecks size={16} />
-                            Save changes for re-review
                           </button>
                           <button
                             className="button button-primary"
@@ -1203,11 +1281,19 @@ export default function SocConsole() {
                             >
                               <div>
                                 <strong>{titleCase(action.action_type)}</strong>
-                                <StatusBadge value={action.risk_level} />
+                                <StatusBadge
+                                  value={String(action.risk_level)}
+                                />
                               </div>
                               <span>{action.target}</span>
-                              <code>{action.execution_preview}</code>
-                              <p>{action.reason}</p>
+                              <code>
+                                TTL {action.ttl_seconds ?? 'not applicable'}{' '}
+                                seconds
+                              </code>
+                              <p>
+                                Evidence:{' '}
+                                {action.evidence_refs.join(', ') || 'none'}
+                              </p>
                             </article>
                           )
                         )}

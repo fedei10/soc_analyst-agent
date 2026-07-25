@@ -1,11 +1,27 @@
 export type WorkspaceView = 'chat' | 'alert-triage' | 'investigations'
-export type ApprovalDecision = 'approve' | 'reject' | 'modify'
+export type ApprovalDecision = 'approve' | 'reject'
 
 export interface ChatActivity {
   id?: string | null
   tool: string | null
   label: string
   status: 'running' | 'completed' | 'failed'
+}
+
+export interface AssistantCommand {
+  name: string
+  slash: string
+  aliases: string[]
+  title: string
+  description: string
+  usage: string
+  category: string
+  examples: string[]
+}
+
+export interface AssistantCommandCatalog {
+  items: AssistantCommand[]
+  count: number
 }
 
 export interface AgentChatResponse {
@@ -67,23 +83,23 @@ export interface AlertSummary {
 }
 
 export interface ProposedAction {
+  action_id: string
   action_type: string
   target: string
-  reason: string
-  risk_level: 'low' | 'medium' | 'high' | 'critical'
-  operational_impact: string
-  requires_approval: boolean
-  execution_preview: string
+  parameters?: Record<string, unknown>
+  timeout_seconds: number
+  ttl_seconds?: number | null
+  risk_level: number
   evidence_refs: string[]
 }
 
 export interface ApprovalRequest {
   investigation_id: string
+  incident_id: string
   approval_id: string
   expires_at: string
-  status: 'awaiting_approval'
+  required_role?: 'soc_l2' | 'soc_l3' | 'security_admin' | null
   proposed_actions: ProposedAction[]
-  allowed_decisions: ApprovalDecision[]
 }
 
 export interface AuditEvent {
@@ -114,21 +130,25 @@ export interface TierReport {
 }
 
 export interface Investigation {
+  incident_id: string
   investigation_id: string
   alert_id?: string
   agent_id?: string | null
   status: string
+  stage?: string
   current_stage: string
   severity?: string | null
   confidence?: number | null
-  l1_result?: Record<string, unknown> | null
-  l2_result?: Record<string, unknown> | null
-  l3_result?: Record<string, unknown> | null
+  diagnosis?: Record<string, unknown> | null
+  remediation_plan?: Record<string, unknown> | null
+  policy_decision?: Record<string, unknown> | null
   proposed_actions: ProposedAction[]
   approval_request?: ApprovalRequest | null
   approval_decision?: Record<string, unknown> | null
   executed_actions: Record<string, unknown>[]
-  verification_results?: Record<string, unknown>[]
+  execution_results?: Record<string, unknown>[]
+  verification?: Record<string, unknown> | null
+  rollback?: Record<string, unknown> | null
   final_report?: Record<string, unknown> | null
   tier_reports?: TierReport[]
   errors: Array<Record<string, unknown>>

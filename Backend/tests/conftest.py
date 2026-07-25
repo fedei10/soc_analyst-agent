@@ -4,13 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 
-os.environ.setdefault("GROQ_API_KEY", "test")
-os.environ.setdefault("OXYY_API_KEY", "test")
-os.environ.setdefault("CEREBRAS_API_KEY", "test")
-os.environ.setdefault("GOOGLE_API_KEY", "test")
+os.environ.setdefault("LLM_API_KEY", "test")
 os.environ["CLERK_SECRET_KEY"] = "sk_test_unit"
 os.environ["CLERK_AUTHORIZED_PARTIES"] = "http://testserver"
 os.environ["CLERK_EXECUTOR_USER_IDS"] = "user_responder"
+os.environ["CLERK_SOC_L2_USER_IDS"] = "user_analyst"
 os.environ["LANGSMITH_TRACING"] = "false"
 os.environ["LANGCHAIN_TRACING_V2"] = "false"
 os.environ["DATABASE_URL"] = ""

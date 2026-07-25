@@ -2,13 +2,11 @@
 
 import json
 import hashlib
-import uuid
 from typing import Annotated, Any
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
 
 from app.api.auth.deps import (
     AuthPrincipal,
@@ -21,22 +19,20 @@ from app.api.v1.schemas.investigation import (
     AgentChatRequest,
     ApprovalDecisionInput,
     InvestigationCreate,
-    OrchestratorChatRequest,
     ResponseExecutionInput,
-)
-from app.coreAgents.orchestration.agent_runner import invoke_validated_agent
-from app.coreAgents.orchestration.conversation_runner import (
-    run_soc_conversation,
-    stream_soc_conversation,
 )
 from app.coreAgents.orchestration.investigation_service import (
     InvestigationNotFoundError,
     get_investigation_service,
 )
 from app.db.repositories.investigations import ResponseExecutionConflictError
-from app.coreAgents.orchestration.schemas import L1Result, L2Result, L3Result
 from app.db.session import database_url
 from app.services.redis.ephemeral import EphemeralRedis
+from app.services.wazuh.dependencies import get_wazuh_gateway
+from app.services.wazuh.gateway import WazuhGateway
+from app.soc_assistant.catalog import public_catalog
+from app.soc_assistant.schemas import AssistantRequest
+from app.soc_assistant.service import SOCAssistant
 
 
 read = APIRouter(dependencies=[Depends(require_read)])
@@ -49,6 +45,7 @@ InvestigatorPrincipal = Annotated[
 ]
 ApproverPrincipal = Annotated[AuthPrincipal, Depends(require_approve)]
 ExecutorPrincipal = Annotated[AuthPrincipal, Depends(require_execute)]
+AssistantGateway = Annotated[WazuhGateway, Depends(get_wazuh_gateway)]
 activity_store = EphemeralRedis()
 
 
@@ -127,7 +124,9 @@ def _publish_activity(snapshot: dict[str, Any]) -> None:
         )
         alias = {
             "approval_required": "awaiting_approval",
+            "approval_requested": "awaiting_approval",
             "investigation_completed": "report_ready",
+            "knowledge_updated": "report_ready",
         }.get(event_name)
         if alias:
             activity_store.append_activity(
@@ -223,7 +222,7 @@ def list_investigations(
         default=None,
         pattern=(
             "^(created|running|awaiting_approval|approved|rejected|"
-            "completed|failed)$"
+            "completed|escalated|failed)$"
         ),
     ),
 ):
@@ -290,6 +289,7 @@ def decide_investigation(
         {
             **request.model_dump(mode="json", exclude_none=True),
             "approved_by": principal.user_id,
+            "approver_roles": list(principal.roles),
         },
         organization_id=principal.scope_id,
     )
@@ -562,37 +562,6 @@ def list_conversation_messages(
     }
 
 
-def _agent_for_tier(tier: str):
-    if tier == "l1":
-        from app.coreAgents.Agents.soc_level1_agent import agent
-        result_model = L1Result
-    elif tier == "l2":
-        from app.coreAgents.Agents.soc_level2_agent import agent
-        result_model = L2Result
-    else:
-        from app.coreAgents.Agents.soc_level3_agent import agent
-        result_model = L3Result
-    return agent, result_model
-
-
-def _structured_data(value):
-    if isinstance(value, BaseModel):
-        return value.model_dump(mode="json")
-    if isinstance(value, dict):
-        return value
-    raise ValueError("Agent did not return validated structured output.")
-
-
-def _tool_names(result: dict) -> list[str]:
-    names: list[str] = []
-    for message in result.get("messages", []):
-        for call in getattr(message, "tool_calls", []) or []:
-            name = call.get("name")
-            if name and name not in names:
-                names.append(name)
-    return names
-
-
 @read.post(
     "/soc/chat",
     tags=["agents"],
@@ -602,66 +571,50 @@ def chat_with_soc_agent(
     request: AgentChatRequest,
     principal: InvestigatorPrincipal,
 ):
-    _enforce_rate_limit(principal, operation="tier-chat", limit=30)
-    messages = [
-        item.model_dump(mode="json")
-        for item in request.history
-    ]
-    messages.append({"role": "user", "content": request.message})
-
-    try:
-        agent, result_model = _agent_for_tier(request.tier)
-        result, validated = invoke_validated_agent(
-            agent,
-            messages=messages,
-            result_model=result_model,
-        )
-        structured = _structured_data(validated)
-    except Exception as exc:
-        raise HTTPException(
-            503,
-            "SOC agent is unavailable. Check the LLM and Wazuh connections.",
-        ) from exc
-
-    return {
-        "data": {
-            "tier": request.tier,
-            "response": structured,
-            "tools_used": _tool_names(result),
-            "assistant_message": json.dumps(structured, indent=2),
-        }
-    }
+    raise HTTPException(
+        410,
+        "SOC agent chat was retired. Start a controlled MAPE-K investigation.",
+    )
 
 
 @read.post(
     "/soc/orchestrator/chat",
-    tags=["agents"],
+    tags=["assistant"],
     dependencies=[Depends(require_investigate)],
 )
 def chat_with_soc_orchestrator(
-    request: OrchestratorChatRequest,
+    request: AssistantRequest,
     principal: InvestigatorPrincipal,
+    gateway: AssistantGateway,
 ):
-    _enforce_rate_limit(principal, operation="orchestrator-chat", limit=30)
-    conversation_id = request.conversation_id or uuid.uuid4().hex
+    _enforce_rate_limit(principal, operation="soc-assistant", limit=30)
     try:
-        result = run_soc_conversation(
+        result = SOCAssistant(gateway=gateway).respond(
             message=request.message,
-            conversation_id=conversation_id,
+            conversation_id=request.conversation_id,
             organization_id=principal.scope_id,
             user_id=principal.user_id,
         )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except LookupError as exc:
+        raise HTTPException(404, str(exc))
     except Exception as exc:
         logger.exception(
-            "soc_agent_run_failed",
-            agent_role="chat",
+            "soc_assistant_failed",
             error_type=type(exc).__name__,
         )
         raise HTTPException(
             503,
-            "SOC conversation is unavailable. Check the LLM and Wazuh connections.",
+            "The requested SOC capability could not be completed.",
         ) from exc
-    return {"data": _public_data(result)}
+    return {"data": _public_data(result.model_dump(mode="json"))}
+
+
+@read.get("/soc/assistant/commands", tags=["assistant"])
+def get_soc_assistant_commands(_: ReadPrincipal):
+    commands = public_catalog()
+    return {"data": {"items": commands, "count": len(commands)}}
 
 
 def _sse(event: str, payload: dict[str, Any]) -> str:
@@ -674,28 +627,65 @@ def _sse(event: str, payload: dict[str, Any]) -> str:
 
 @read.post(
     "/soc/orchestrator/chat/stream",
-    tags=["agents"],
+    tags=["assistant"],
     dependencies=[Depends(require_investigate)],
 )
 def stream_with_soc_orchestrator(
-    request: OrchestratorChatRequest,
+    request: AssistantRequest,
     principal: InvestigatorPrincipal,
+    gateway: AssistantGateway,
 ):
-    _enforce_rate_limit(
-        principal,
-        operation="orchestrator-stream",
-        limit=30,
-    )
-    conversation_id = request.conversation_id or uuid.uuid4().hex
+    _enforce_rate_limit(principal, operation="soc-assistant-stream", limit=30)
 
     def events():
-        for event, payload in stream_soc_conversation(
-            message=request.message,
-            conversation_id=conversation_id,
-            organization_id=principal.scope_id,
-            user_id=principal.user_id,
-        ):
-            yield _sse(event, payload)
+        yield _sse(
+            "activity",
+            {
+                "id": "activity-routing",
+                "tool": "intent_router",
+                "label": "Routing the request to a bounded SOC capability",
+                "status": "running",
+            },
+        )
+        try:
+            assistant = SOCAssistant(gateway=gateway)
+            routed = assistant.route(request.message)
+            intent, _ = routed
+            yield _sse(
+                "activity",
+                {
+                    "id": "activity-selected",
+                    "tool": "intent_router",
+                    "label": f"Selected {intent.command.value} capability",
+                    "status": "completed",
+                },
+            )
+            yield _sse(
+                "activity",
+                assistant.running_activity(intent.command).model_dump(
+                    mode="json"
+                ),
+            )
+            result = assistant.respond(
+                message=request.message,
+                conversation_id=request.conversation_id,
+                organization_id=principal.scope_id,
+                user_id=principal.user_id,
+                routed=routed,
+            )
+        except Exception as exc:
+            yield _sse(
+                "error",
+                {
+                    "code": type(exc).__name__,
+                    "message": str(exc)[:500],
+                },
+            )
+            return
+        for activity in result.activities:
+            yield _sse("activity", activity.model_dump(mode="json"))
+        yield _sse("token", {"content": result.assistant_message})
+        yield _sse("final", result.model_dump(mode="json"))
 
     return StreamingResponse(
         events(),

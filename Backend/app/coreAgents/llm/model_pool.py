@@ -40,12 +40,12 @@ STRUCTURED_MODELS = {
 }
 
 AGENT_PROVIDER: dict[AgentRole, ProviderName] = {
-    "chat": "oxy",
+    "chat": "gemini",
     "l1": "cerebras",
     "l2": "groq",
     "l3": "oxy",
 }
-ROUTER_PROVIDER_ORDER: tuple[ProviderName, ...] = ("oxy",)
+ROUTER_PROVIDER_ORDER: tuple[ProviderName, ...] = ("gemini",)
 FORMATTER_PROVIDER_ORDER: tuple[ProviderName, ...] = ("gemini",)
 
 
@@ -54,13 +54,9 @@ def _retryable_model_error(exc: Exception) -> bool:
     message = str(exc).lower()
     retryable = (
         "ratelimit" in name
-        or "internalserver" in name
         or "timeout" in name
         or "429" in message
         or "queue_exceeded" in message
-        or "provider_error" in message
-        or "server_error" in message
-        or "something went wrong" in message
         or "temporarily unavailable" in message
         or "service unavailable" in message
     )
@@ -101,10 +97,7 @@ def get_agent_middleware(role: AgentRole) -> list:
 def _structured_runnable(model, schema: type[BaseModel]):
     method = (
         "function_calling"
-        if (
-            model is cerebras_structured_llm
-            or model is oxy_structured_llm
-        )
+        if model in {cerebras_structured_llm, oxy_structured_llm}
         else "json_schema"
     )
     return model.with_structured_output(schema, method=method)
