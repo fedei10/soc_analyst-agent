@@ -13,6 +13,7 @@ from app.services.wazuh.models import (
 )
 from app.soc_assistant.router import AssistantIntentRouter
 from app.soc_assistant.schemas import AssistantCommandName, AssistantIntent
+from app.soc_assistant.schemas import QuestionAnswer
 from app.soc_assistant.service import SOCAssistant
 from app.db.repositories.alert_memory import InMemoryAlertMemoryRepository
 
@@ -30,6 +31,22 @@ class RoutedLLM:
                 confidence=0.9,
             ),
             {"input_tokens": 10, "output_tokens": 4},
+        )
+
+
+class FakeQuestionAgent:
+    def __init__(self):
+        self.calls = []
+
+    def answer(self, **kwargs):
+        self.calls.append(kwargs)
+        return (
+            QuestionAnswer(
+                answer="Block the source only after validating it is not an approved scanner.",
+                confidence=0.86,
+                limitations=["No firewall state was provided."],
+            ),
+            {"input_tokens": 40, "output_tokens": 18},
         )
 
 
@@ -164,6 +181,9 @@ def test_slash_commands_are_strict_and_typed():
     assert router.parse_slash("/mapek alert-1").command == (
         AssistantCommandName.INVESTIGATE
     )
+    question = router.parse_slash("/ask how should I contain this alert?")
+    assert question.command == AssistantCommandName.CHAT
+    assert question.arguments["question"] == "how should I contain this alert?"
     with pytest.raises(ValueError, match="Unsupported option"):
         router.parse_slash("/alerts --write yes")
     with pytest.raises(ValueError, match="Unknown command"):
@@ -182,6 +202,7 @@ def test_slash_commands_are_strict_and_typed():
             AssistantCommandName.INVESTIGATE,
         ),
         ("investigate it", AssistantCommandName.INVESTIGATE),
+        ("how do I fix these alerts?", AssistantCommandName.CHAT),
         ("check status INV-ABC123", AssistantCommandName.STATUS),
     ],
 )
@@ -259,6 +280,48 @@ def test_greeting_is_conversational_and_does_not_call_tools(monkeypatch):
     assert response.tools_used == []
     assert response.response["display_mode"] == "conversation"
     assert gateway.calls == []
+
+
+def test_question_agent_answers_read_only_soc_questions(monkeypatch):
+    monkeypatch.setattr("app.soc_assistant.service.database_url", lambda: None)
+    question_agent = FakeQuestionAgent()
+    gateway = FakeGateway()
+    service = SOCAssistant(
+        gateway=gateway,
+        investigations=FakeInvestigations(),
+        router=AssistantIntentRouter(llm=FailingLLM()),
+        question_agent=question_agent,
+    )
+
+    response = respond(service, "how do I fix these alerts?")
+
+    assert response.selected_command == AssistantCommandName.CHAT
+    assert response.response["display_mode"] == "conversation"
+    assert response.response["answer_type"] == "soc_question"
+    assert response.tools_used == ["soc_question_agent"]
+    assert "Block the source" in response.assistant_message
+    assert question_agent.calls[0]["question"] == "how do I fix these alerts?"
+    assert gateway.calls == []
+
+
+def test_question_agent_failure_does_not_break_commands(monkeypatch):
+    class FailingQuestionAgent:
+        def answer(self, **kwargs):
+            raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr("app.soc_assistant.service.database_url", lambda: None)
+    service = SOCAssistant(
+        gateway=FakeGateway(),
+        investigations=FakeInvestigations(),
+        router=AssistantIntentRouter(llm=FailingLLM()),
+        question_agent=FailingQuestionAgent(),
+    )
+
+    response = respond(service, "why is this finding suspicious?")
+
+    assert response.response["answer_type"] == "model_unavailable"
+    assert response.response["display_mode"] == "conversation"
+    assert response.tools_used == []
 
 
 def test_triage_groups_alerts_and_returns_evidence_backed_verdicts(monkeypatch):
@@ -480,7 +543,7 @@ def test_help_and_health_are_available_without_llm(monkeypatch):
     service, _, _ = assistant()
 
     help_response = respond(service, "/help")
-    assert len(help_response.response["commands"]) == 8
+    assert len(help_response.response["commands"]) == 9
     assert help_response.tools_used == []
 
     health = respond(service, "/health")

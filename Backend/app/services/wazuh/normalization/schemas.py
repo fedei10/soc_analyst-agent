@@ -136,6 +136,9 @@ class AlertEnvelope(BaseModel):
     attack_details: dict[str, Any] = Field(default_factory=dict)
     evidence_refs: list[str] = Field(default_factory=list)
     raw_document_ref: str | None = None
+    normalizer_name: str
+    normalizer_version: str = "1.0"
+    normalized_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     normalization_quality: NormalizationQuality
     missing_fields: list[str] = Field(default_factory=list)
 

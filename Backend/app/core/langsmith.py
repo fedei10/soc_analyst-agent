@@ -26,6 +26,9 @@ def configure_langsmith(settings: Any) -> bool:
     os.environ["LANGSMITH_INCLUDE_FULL_LOG"] = str(
         getattr(settings, "LANGSMITH_INCLUDE_FULL_LOG", False)
     ).lower()
+    os.environ["LANGSMITH_INCLUDE_FULL_INVENTORY"] = str(
+        getattr(settings, "LANGSMITH_INCLUDE_FULL_INVENTORY", False)
+    ).lower()
 
     if settings.LANGSMITH_ENDPOINT:
         os.environ["LANGSMITH_ENDPOINT"] = settings.LANGSMITH_ENDPOINT

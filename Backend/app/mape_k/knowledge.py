@@ -49,10 +49,19 @@ def build_final_report(state: IncidentWorkflowState) -> dict[str, Any]:
         ),
         "evidence_ids": [item.evidence_id for item in state.evidence],
         "token_usage": {
-            "input": state.llm_input_tokens,
-            "output": state.llm_output_tokens,
+            "compatibility_input": state.llm_input_tokens,
+            "compatibility_output": state.llm_output_tokens,
+            "estimated_input": state.estimated_input_tokens,
+            "estimated_output": state.estimated_output_tokens,
+            "actual_input": state.actual_input_tokens,
+            "actual_output": state.actual_output_tokens,
+            "cached_input": state.cached_input_tokens,
+            "model_calls": state.model_calls,
+            "retries": state.model_retries,
+            "provider": state.model_provider,
+            "model": state.model_name,
             "estimated_cost_usd": state.estimated_cost_usd,
+            "actual_cost_usd": state.actual_cost_usd,
         },
         "generated_at": datetime.now(UTC).isoformat(),
     }
-

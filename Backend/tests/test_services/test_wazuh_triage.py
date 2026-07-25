@@ -60,7 +60,7 @@ def auth_raw(alert_id: str, *, offset: int = 0) -> dict:
         description="sshd: brute force trying to get access to the system",
         level=10,
         data={"srcip": "192.168.100.9", "srcuser": "lab"},
-        full_log="Failed password for invalid user lab from 192.168.100.9 port 4422 ssh2",
+        full_log="Failed password for lab from 192.168.100.9 port 4422 ssh2",
     )
     raw["_source"]["rule"]["id"] = "5712"
     raw["_source"]["rule"]["mitre"] = {"id": ["T1110"]}
@@ -266,7 +266,7 @@ class FakeGateway:
                     source_ip="192.168.100.9",
                     target_user="lab",
                     decoder_name="sshd",
-                    full_log="Failed password for invalid user lab",
+                    full_log="Failed password for lab",
                     rule_groups=["sshd", "authentication_failures"],
                     mitre_ids=["T1110"],
                     event_outcome="failure",

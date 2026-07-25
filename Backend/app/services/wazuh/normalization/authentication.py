@@ -22,10 +22,19 @@ class AuthenticationNormalizer(AlertNormalizer):
 
     def matches(self, raw: dict[str, Any]) -> bool:
         value = combined_text(raw)
-        return any(
+        is_ssh = any(
             marker in value
             for marker in (
                 "sshd",
+                "openssh",
+                "ssh ",
+                "ssh_",
+                "ssh2",
+            )
+        )
+        return is_ssh and any(
+            marker in value
+            for marker in (
                 "authentication_fail",
                 "authentication_success",
                 "failed password",
@@ -38,6 +47,9 @@ class AuthenticationNormalizer(AlertNormalizer):
     def normalize(self, raw: dict[str, Any]):
         value = combined_text(raw)
         outcome = outcome_from_text(value)
+        invalid_user = any(
+            marker in value for marker in ("invalid user", "non-existent user")
+        )
         repeated = any(
             marker in value
             for marker in ("brute force", "multiple", "more than one time", "t1110")
@@ -45,6 +57,9 @@ class AuthenticationNormalizer(AlertNormalizer):
         if outcome == "success":
             event_type = "ssh_login_success"
             attack_family = "initial_access"
+        elif invalid_user:
+            event_type = "ssh_invalid_user_attempt"
+            attack_family = "credential_access"
         elif repeated:
             event_type = "ssh_brute_force"
             attack_family = "credential_access"
@@ -79,7 +94,7 @@ class AuthenticationNormalizer(AlertNormalizer):
             ),
             failure_reason=(
                 "invalid_user"
-                if "invalid user" in value or "non-existent user" in value
+                if invalid_user
                 else ("authentication_failed" if outcome == "failure" else None)
             ),
         ).model_dump(mode="json", exclude_none=True)

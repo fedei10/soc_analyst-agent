@@ -9,23 +9,38 @@ from pydantic import ValidationError
 
 from app.config import settings
 from app.coreAgents.orchestration.investigation_service import InvestigationService
-from app.db.repositories.investigations import InMemoryInvestigationRepository
+from app.db.repositories.investigations import (
+    InMemoryInvestigationRepository,
+    ResponseExecutionConflictError,
+)
 from app.mape_k.analyze import IncidentAnalyzer
 from app.mape_k.executor import RestrictedExecutor
-from app.mape_k.graph import create_mape_k_graph, investigation_config
+from app.mape_k.graph import (
+    _validate_approval_binding,
+    create_mape_k_graph,
+    investigation_config,
+)
 from app.mape_k.llm import LLMInputLimitError, LLMProvider
 from app.mape_k.monitor import WazuhMonitor
 from app.mape_k.policy import PolicyEngine, role_allows
+from app.mape_k.utils import response_resource_namespace
 from app.mape_k.schemas import (
     ActionType,
+    ApprovalRequestRecord,
     Diagnosis,
     EvidenceReference,
+    ExecutionAuthorization,
+    ExecutionResult,
     IncidentWorkflowState,
+    MAX_CHECKPOINT_AUDIT_EVENTS,
     RemediationAction,
     RemediationPlan,
+    VerificationOutcome,
     VerificationResult,
     WorkflowStatus,
+    merge_bounded_audit_events,
 )
+from app.mape_k.verify import verification_observation_ready_at
 from app.services.redis.ephemeral import EphemeralRedis
 from app.services.wazuh.models import AlertEvidence, AlertSearchResult, EndpointInventory
 
@@ -52,7 +67,7 @@ class FakeWazuhGateway:
                 mitre_ids=["T1110"],
                 event_outcome="failure",
             )
-            for index in range(2)
+            for index in range(5)
         ]
 
     def get_alert_by_id(self, alert_id):
@@ -60,8 +75,8 @@ class FakeWazuhGateway:
 
     def get_related_alerts(self, **_kwargs):
         return AlertSearchResult(
-            total=1,
-            returned=1,
+            total=4,
+            returned=4,
             truncated=False,
             alerts=self.alerts[1:],
         )
@@ -158,11 +173,18 @@ def planned_state(cache=None):
 def test_monitor_normalizes_deduplicates_and_correlates_alerts():
     state = monitored_state()
 
-    assert len(state.normalized_alerts) == 2
+    assert len(state.normalized_alerts) == 5
     assert len(state.findings) == 1
-    assert state.findings[0]["alert_count"] == 2
-    assert len(state.evidence) == 2
+    assert state.findings[0]["alert_count"] == 5
+    assert len(state.evidence) == 5
     assert state.incident_fingerprint.startswith("FP-")
+    assert "payload" not in state.evidence_records[0]
+    assert (
+        state.evidence_records[0]["raw_source_document_id"]
+        == state.normalized_alerts[0].alert_id
+    )
+    assert state.evidence_records[0]["normalizer_name"]
+    assert state.evidence_records[0]["normalized_document_hash"]
 
 
 def test_known_ssh_incident_is_deterministic_and_evidence_bound():
@@ -267,6 +289,68 @@ def test_approval_roles_are_hierarchical():
     assert not role_allows(["soc_l1"], "soc_l2")
 
 
+def approval_request_for(state, **updates):
+    plan = state.remediation_plan
+    values = {
+        "approval_id": "APR-TEST",
+        "investigation_id": state.investigation_id,
+        "incident_id": state.incident_id,
+        "plan_id": plan.plan_id,
+        "plan_version": plan.plan_version,
+        "plan_hash": plan.plan_hash,
+        "evidence_version": state.evidence_version,
+        "policy_version": plan.policy_version,
+        "action_catalogue_version": plan.action_catalogue_version,
+        "action_ids": [action.action_id for action in plan.actions],
+        "required_role": "soc_l2",
+        "requested_at": datetime.now(UTC),
+        "expires_at": datetime.now(UTC) + timedelta(minutes=5),
+    }
+    values.update(updates)
+    return ApprovalRequestRecord(**values)
+
+
+@pytest.mark.parametrize(
+    "updates",
+    (
+        {"incident_id": "INC-OTHER"},
+        {"plan_hash": "0" * 64},
+        {"evidence_version": "stale-evidence"},
+        {"action_ids": ["ACT-WRONG"]},
+    ),
+)
+def test_approval_binding_rejects_stale_or_wrong_scope(updates):
+    state = planned_state()
+
+    with pytest.raises(ValueError, match="stale"):
+        _validate_approval_binding(
+            state,
+            approval_request_for(state, **updates),
+        )
+
+
+def test_expired_approval_binding_is_rejected():
+    state = planned_state()
+    request = approval_request_for(
+        state,
+        expires_at=datetime.now(UTC) - timedelta(seconds=1),
+    )
+
+    with pytest.raises(ValueError, match="expired"):
+        _validate_approval_binding(state, request)
+
+
+def test_execution_authorization_rejects_duplicate_action_ids():
+    with pytest.raises(ValidationError, match="unique"):
+        ExecutionAuthorization(
+            approval_id="APR-TEST",
+            execution_id="EXE-TEST",
+            action_ids=["ACT-1", "ACT-1"],
+            actor_user_id="user-1",
+            actor_roles=["soc_l3"],
+        )
+
+
 def test_dry_run_executor_is_idempotent_and_never_calls_responder():
     class ForbiddenResponder:
         def run_active_response(self, **_kwargs):
@@ -287,24 +371,123 @@ def test_dry_run_executor_is_idempotent_and_never_calls_responder():
 
 
 def test_executor_timeout_is_recorded_without_retrying():
+    class DurableActionRepository:
+        durable = True
+
+        def __init__(self):
+            self.preflight = None
+            self.completed = None
+
+        def begin_response_action(self, *_args, **kwargs):
+            self.preflight = kwargs
+            return True
+
+        def complete_response_action(self, *_args, **kwargs):
+            self.completed = kwargs
+            return None
+
     class TimeoutResponder:
         def run_active_response(self, **_kwargs):
+            assert repository.preflight is not None
             raise TimeoutError("response timed out")
 
     real_settings = SimpleNamespace(
+        MAPEK_EXECUTION_MODE="enabled",
         MAPEK_REAL_EXECUTION_ENABLED=True,
         MAPEK_DRY_RUN=False,
         WAZUH_READ_ONLY=False,
         WAZUH_ALLOW_DANGEROUS_TOOLS=True,
     )
+    repository = DurableActionRepository()
     result = RestrictedExecutor(
         responder=TimeoutResponder(),
         cache=MemoryCache(),
+        action_repository=repository,
+        before_state_provider=lambda **_kwargs: {
+            "target": "192.0.2.10",
+            "action_present": False,
+            "wazuh_agent_status": "active",
+            "management_connectivity": True,
+        },
         settings_obj=real_settings,
     ).run(planned_state())
 
-    assert result[0].status == "timed_out"
-    assert result[0].result == {"error": "executor_timeout"}
+    assert result[0].status == "outcome_unknown"
+    assert result[0].result["error"] == "executor_timeout"
+    assert result[0].result["outcome"] == "unknown"
+    assert repository.preflight["before_state"]["action_present"] is False
+    assert repository.preflight["intended_expires_at"] is not None
+    assert repository.preflight["idempotency_key"] == result[0].idempotency_key
+    assert repository.completed["status"] == "outcome_unknown"
+    assert repository.completed["expires_at"] is not None
+
+
+@pytest.mark.parametrize(
+    ("action_type", "action_present", "expected_reason"),
+    (
+        (ActionType.BLOCK_IP, True, "block_already_present"),
+        (ActionType.UNBLOCK_IP, False, "block_already_absent"),
+    ),
+)
+def test_executor_skips_provider_when_firewall_state_is_already_satisfied(
+    action_type,
+    action_present,
+    expected_reason,
+):
+    class DurableActionRepository:
+        durable = True
+
+        def __init__(self):
+            self.preflight = None
+            self.completed = None
+
+        def begin_response_action(self, *_args, **kwargs):
+            self.preflight = kwargs
+            return True
+
+        def complete_response_action(self, *_args, **kwargs):
+            self.completed = kwargs
+
+    class ForbiddenResponder:
+        def run_active_response(self, **_kwargs):
+            raise AssertionError("A no-op must not call the response provider.")
+
+    state = planned_state()
+    action = state.remediation_plan.actions[0].model_copy(
+        update={"action_type": action_type}
+    )
+    plan = state.remediation_plan.model_copy(
+        update={"actions": [action]}
+    )
+    state = state.model_copy(update={"remediation_plan": plan})
+    repository = DurableActionRepository()
+    real_settings = SimpleNamespace(
+        MAPEK_EXECUTION_MODE="enabled",
+        MAPEK_REAL_EXECUTION_ENABLED=True,
+        MAPEK_DRY_RUN=False,
+        WAZUH_READ_ONLY=False,
+        WAZUH_ALLOW_DANGEROUS_TOOLS=True,
+    )
+
+    result = RestrictedExecutor(
+        responder=ForbiddenResponder(),
+        cache=MemoryCache(),
+        action_repository=repository,
+        before_state_provider=lambda **_kwargs: {
+            "target": "192.0.2.10",
+            "action_present": action_present,
+            "wazuh_agent_status": "active",
+            "management_connectivity": True,
+        },
+        settings_obj=real_settings,
+    ).run(state)
+
+    assert result[0].status == "no_op"
+    assert result[0].result["reason"] == expected_reason
+    assert result[0].result["provider_called"] is False
+    assert repository.preflight["intended_expires_at"] is None
+    assert repository.completed["status"] == "no_op"
+    assert repository.completed["expires_at"] is None
 
 
 def test_end_to_end_ssh_flow_waits_for_approval_and_execution():
@@ -317,16 +500,19 @@ def test_end_to_end_ssh_flow_waits_for_approval_and_execution():
 
     snapshot = graph.invoke(initial_state("INV-FLOW").model_dump(), config=config)
     assert snapshot["status"] == WorkflowStatus.AWAITING_APPROVAL
+    assert snapshot["proposed_actions"] == []
     assert graph.get_state(config).next == ("human_approval",)
 
-    approval_id = snapshot["approval_request"]["approval_id"]
+    approval_request = snapshot["approval_request"]
+    approval_id = approval_request.approval_id
+    action_ids = approval_request.action_ids
     snapshot = graph.invoke(
         Command(
             resume={
                 "approval_id": approval_id,
                 "decision": "approve",
-                "approved_by": "user-l2",
-                "approver_roles": ["soc_l2"],
+                "actor_user_id": "user-l2",
+                "actor_roles": ["soc_l2"],
             }
         ),
         config=config,
@@ -338,21 +524,144 @@ def test_end_to_end_ssh_flow_waits_for_approval_and_execution():
             resume={
                 "approval_id": approval_id,
                 "execution_id": "EXE-CLAIM",
-                "action_ids": ["ACT-CLAIM"],
-                "executed_by": "user-l3",
+                "action_ids": action_ids,
+                "actor_user_id": "user-l3",
+                "actor_roles": ["soc_l3"],
             }
         ),
         config=config,
     )
-    assert snapshot["status"] == WorkflowStatus.COMPLETED
-    assert snapshot["verification"].passed is True
+    assert snapshot["status"] == WorkflowStatus.ESCALATED
+    assert snapshot["verification"].outcome == VerificationOutcome.SIMULATED
+    assert snapshot["verification"].passed is False
     assert snapshot["execution_results"][0].status == "dry_run"
+    assert snapshot["executed_actions"] == []
+
+
+def test_real_execution_waits_durably_before_server_resumes_verification(
+    monkeypatch,
+):
+    class AcceptedExecutor:
+        def run(self, state):
+            action = state.remediation_plan.actions[0]
+            now = datetime.now(UTC)
+            return [
+                ExecutionResult(
+                    execution_id="EXE-REAL",
+                    action_id=action.action_id,
+                    incident_id=state.incident_id,
+                    idempotency_key="IDEM-REAL",
+                    action_type=action.action_type,
+                    target=action.target,
+                    status="accepted",
+                    started_at=now,
+                    completed_at=now,
+                )
+            ]
+
+        def rollback(self, _state):
+            return []
+
+    class PassingVerifier:
+        def observation_ready_at(self, state):
+            return verification_observation_ready_at(
+                list(state.execution_results),
+                observation_seconds=int(
+                    settings.MAPEK_VERIFICATION_OBSERVATION_SECONDS
+                ),
+            )
+
+        def run(self, _state):
+            return VerificationResult(
+                outcome=VerificationOutcome.PASSED,
+                security_checks_passed=True,
+                health_checks_passed=True,
+                checks=[],
+            )
+
+    monkeypatch.setattr(
+        settings,
+        "MAPEK_VERIFICATION_OBSERVATION_SECONDS",
+        60,
+    )
+    repository = InMemoryInvestigationRepository()
+    graph = create_mape_k_graph(
+        monitor=WazuhMonitor(gateway=FakeWazuhGateway(), cache=MemoryCache()),
+        analyzer=IncidentAnalyzer(llm=NoLLM(), cache=MemoryCache()),
+        executor=AcceptedExecutor(),
+        verifier=PassingVerifier(),
+    )
+    service = InvestigationService(graph=graph, repository=repository)
+    started = service.start(
+        alert_id="alert-0",
+        agent_id="001",
+        organization_id="user-1",
+        owner_user_id="user-1",
+    )
+    approval_id = started["approval_request"]["approval_id"]
+    service.submit_approval(
+        started["investigation_id"],
+        approval_id=approval_id,
+        decision="approve",
+        comment=None,
+        actor_user_id="user-l2",
+        actor_roles=["soc_l2"],
+        organization_id="user-1",
+    )
+
+    waiting = service.execute_approved(
+        started["investigation_id"],
+        approval_id=approval_id,
+        executed_by="user-l3",
+        executor_roles=["soc_l3"],
+        organization_id="user-1",
+    )
+
+    assert waiting["status"] == "waiting_verification"
+    assert waiting["pending_nodes"] == ["verification_wait"]
+    assert waiting["verification_not_before"] is not None
+    assert waiting["verification"] is None
+    assert waiting["final_report"] is None
+    with pytest.raises(
+        ResponseExecutionConflictError,
+        match="observation window is not complete",
+    ):
+        service.resume_verification(
+            started["investigation_id"],
+            resumed_by="worker-1",
+            executor_roles=["soc_l3"],
+            organization_id="user-1",
+        )
+
+    future = datetime.now(UTC) + timedelta(seconds=61)
+
+    class FutureDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return future if tz is not None else future.replace(tzinfo=None)
+
+    monkeypatch.setattr(
+        "app.coreAgents.orchestration.investigation_service.datetime",
+        FutureDateTime,
+    )
+    monkeypatch.setattr("app.mape_k.graph.datetime", FutureDateTime)
+    completed = service.resume_verification(
+        started["investigation_id"],
+        resumed_by="worker-1",
+        executor_roles=["soc_l3"],
+        organization_id="user-1",
+    )
+
+    assert completed["status"] == "completed"
+    assert completed["pending_nodes"] == []
+    assert completed["verification"]["outcome"] == "passed"
 
 
 def test_verification_failure_rolls_back_and_escalates():
     class FailingVerifier:
         def run(self, _state):
             return VerificationResult(
+                outcome=VerificationOutcome.FAILED,
                 security_checks_passed=False,
                 health_checks_passed=True,
                 checks=[{"check": "attempts_stopped", "passed": False}],
@@ -366,14 +675,16 @@ def test_verification_failure_rolls_back_and_escalates():
     )
     config = investigation_config("INV-ROLLBACK")
     snapshot = graph.invoke(initial_state("INV-ROLLBACK").model_dump(), config=config)
-    approval_id = snapshot["approval_request"]["approval_id"]
+    approval_request = snapshot["approval_request"]
+    approval_id = approval_request.approval_id
+    action_ids = approval_request.action_ids
     graph.invoke(
         Command(
             resume={
                 "approval_id": approval_id,
                 "decision": "approve",
-                "approved_by": "user-l2",
-                "approver_roles": ["soc_l2"],
+                "actor_user_id": "user-l2",
+                "actor_roles": ["soc_l2"],
             }
         ),
         config=config,
@@ -383,8 +694,9 @@ def test_verification_failure_rolls_back_and_escalates():
             resume={
                 "approval_id": approval_id,
                 "execution_id": "EXE-ROLLBACK",
-                "action_ids": ["ACT-CLAIM"],
-                "executed_by": "user-l3",
+                "action_ids": action_ids,
+                "actor_user_id": "user-l3",
+                "actor_roles": ["soc_l3"],
             }
         ),
         config=config,
@@ -405,7 +717,7 @@ def test_redis_failure_does_not_lose_monitor_evidence():
 
     state = monitored_state(EphemeralRedis(BrokenRedis()))
 
-    assert len(state.evidence_records) == 2
+    assert len(state.evidence_records) == 5
     assert state.incident_fingerprint
 
 
@@ -429,6 +741,16 @@ def test_api_key_is_not_part_of_workflow_state():
 
     assert settings.LLM_API_KEY.get_secret_value() not in rendered
     assert "api_key" not in rendered.lower()
+
+
+def test_checkpoint_audit_window_is_bounded():
+    events = [{"event": f"event-{index}"} for index in range(100)]
+
+    retained = merge_bounded_audit_events([], events)
+
+    assert len(retained) == MAX_CHECKPOINT_AUDIT_EVENTS
+    assert retained[0]["event"] == "event-36"
+    assert retained[-1]["event"] == "event-99"
 
 
 def test_service_persists_the_controlled_snapshot():
@@ -460,17 +782,17 @@ def test_service_persists_the_controlled_snapshot():
     assert snapshot["pending_nodes"] == ["human_approval"]
     assert repeated["investigation_id"] == snapshot["investigation_id"]
     assert stored["diagnosis"]["incident_type"] == "ssh_brute_force"
-    assert len(stored["evidence_records"]) == 2
+    assert len(stored["evidence_records"]) == 5
+    assert snapshot["proposed_actions"]
 
     approval_id = snapshot["approval_request"]["approval_id"]
-    approved = service.resume(
+    approved = service.submit_approval(
         snapshot["investigation_id"],
-        {
-            "approval_id": approval_id,
-            "decision": "approve",
-            "approved_by": "user-l2",
-            "approver_roles": ["soc_l2"],
-        },
+        approval_id=approval_id,
+        decision="approve",
+        comment=None,
+        actor_user_id="user-l2",
+        actor_roles=["soc_l2"],
         organization_id="user-1",
     )
     assert approved["pending_nodes"] == ["execution_authorization"]
@@ -479,7 +801,63 @@ def test_service_persists_the_controlled_snapshot():
         snapshot["investigation_id"],
         approval_id=approval_id,
         executed_by="user-l3",
+        executor_roles=["soc_l3"],
         organization_id="user-1",
     )
-    assert completed["status"] == "completed"
+    assert completed["status"] == "escalated"
+    assert completed["verification"]["outcome"] == "simulated"
     assert completed["verification"]["dry_run"] is True
+    assert completed["executed_actions"][0]["status"] == "dry_run"
+
+
+def test_service_rejects_execution_when_target_resource_is_locked():
+    repository = InMemoryInvestigationRepository()
+    graph = create_mape_k_graph(
+        monitor=WazuhMonitor(gateway=FakeWazuhGateway(), cache=MemoryCache()),
+        analyzer=IncidentAnalyzer(llm=NoLLM(), cache=MemoryCache()),
+        executor=RestrictedExecutor(cache=MemoryCache()),
+    )
+    service = InvestigationService(graph=graph, repository=repository)
+    snapshot = service.start(
+        alert_id="alert-0",
+        agent_id="001",
+        organization_id="user-1",
+        owner_user_id="user-1",
+    )
+    approval_id = snapshot["approval_request"]["approval_id"]
+    approved = service.submit_approval(
+        snapshot["investigation_id"],
+        approval_id=approval_id,
+        decision="approve",
+        comment=None,
+        actor_user_id="user-l2",
+        actor_roles=["soc_l2"],
+        organization_id="user-1",
+    )
+    lock_namespace = response_resource_namespace(settings)
+    repository.acquire_resource_lease(
+        organization_id=lock_namespace,
+        resource_type="ip",
+        resource_id="192.0.2.10",
+        owner_id="other-worker",
+        lease_seconds=60,
+    )
+
+    with pytest.raises(ResponseExecutionConflictError, match="resource lock"):
+        service.execute_approved(
+            snapshot["investigation_id"],
+            approval_id=approval_id,
+            executed_by="user-l3",
+            executor_roles=["soc_l3"],
+            organization_id="user-1",
+        )
+
+    assert approved["pending_nodes"] == ["execution_authorization"]
+    released_incident_lease = repository.acquire_resource_lease(
+        organization_id=lock_namespace,
+        resource_type="incident",
+        resource_id=snapshot["incident_id"],
+        owner_id="next-worker",
+        lease_seconds=60,
+    )
+    assert released_incident_lease["owner_id"] == "next-worker"

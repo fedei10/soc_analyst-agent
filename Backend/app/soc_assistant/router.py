@@ -90,6 +90,10 @@ class AssistantIntentRouter:
             if not positional:
                 raise ValueError("/status requires an investigation ID.")
             options["investigation_id"] = positional[0]
+        elif command.name == AssistantCommandName.CHAT:
+            if not positional:
+                raise ValueError("/ask requires a question.")
+            options["question"] = " ".join(positional)
         elif positional:
             raise ValueError(f"{command.slash} does not accept positional arguments.")
         return AssistantIntent(command=command.name, arguments=options)
@@ -188,6 +192,18 @@ class AssistantIntentRouter:
             return AssistantIntent(command=AssistantCommandName.HEALTH)
         if lower.strip() in {"help", "what can you do", "options", "commands"}:
             return AssistantIntent(command=AssistantCommandName.HELP)
+        if (
+            "?" in message
+            or re.match(
+                r"^\s*(what|why|how|explain|describe|should|can|could|does|"
+                r"is|are|tell me)\b",
+                lower,
+            )
+        ):
+            return AssistantIntent(
+                command=AssistantCommandName.CHAT,
+                arguments={"question": message},
+            )
         return None
 
     def route(self, message: str) -> tuple[AssistantIntent, dict[str, int]]:
@@ -216,7 +232,9 @@ class AssistantIntentRouter:
                         "role": "system",
                         "content": (
                             "Select exactly one SOC capability. Return only arguments "
-                            "explicitly present in the message. Use help when uncertain."
+                            "explicitly present in the message. Use chat for explanatory "
+                            "questions or requests for defensive guidance. Use help only "
+                            "when the user asks about available capabilities."
                         ),
                     },
                     {

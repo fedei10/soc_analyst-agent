@@ -17,6 +17,10 @@ class WazuhAPIError(WazuhError):
         self.status_code = status_code
 
 
+class WazuhTimeoutError(WazuhAPIError):
+    """A Wazuh operation exceeded its configured action timeout."""
+
+
 class WazuhPermissionError(WazuhError):
     """Forbidden by Wazuh RBAC (403) or blocked by WAZUH_READ_ONLY."""
 

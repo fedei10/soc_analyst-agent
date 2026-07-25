@@ -11,6 +11,8 @@ from app.db.repositories.identity import (
 from app.db.repositories.investigations import (
     InMemoryInvestigationRepository,
     InvestigationRepository,
+    InvestigationStateConflictError,
+    ResourceLeaseConflictError,
     SQLAlchemyInvestigationRepository,
     get_investigation_repository,
 )
@@ -20,6 +22,8 @@ __all__ = [
     "IdentityRepository",
     "InMemoryInvestigationRepository",
     "InvestigationRepository",
+    "InvestigationStateConflictError",
+    "ResourceLeaseConflictError",
     "SQLAlchemyInvestigationRepository",
     "get_conversation_repository",
     "get_identity_repository",

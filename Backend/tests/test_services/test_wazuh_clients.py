@@ -105,6 +105,42 @@ def test_server_api_limit_is_bounded():
         client.close()
 
 
+def test_transport_uses_client_default_timeout_unless_action_overrides_it():
+    class RecordingClient:
+        def __init__(self):
+            self.calls = []
+
+        def request(self, method, path, **kwargs):
+            self.calls.append((method, path, kwargs))
+            return httpx.Response(
+                200,
+                request=httpx.Request(method, f"https://wazuh.test{path}"),
+            )
+
+    client = WazuhServerClient(
+        base_url="https://wazuh.test",
+        username="reader",
+        password="secret",
+        verify_ssl=False,
+    )
+    client._transport._client.close()
+    recorder = RecordingClient()
+    client._transport._client = recorder
+
+    client._transport._send("GET", "/agents", None, None, "token")
+    client._transport._send(
+        "PUT",
+        "/active-response",
+        None,
+        {},
+        "token",
+        timeout_seconds=7,
+    )
+
+    assert "timeout" not in recorder.calls[0][2]
+    assert recorder.calls[1][2]["timeout"] == 7
+
+
 class FakeServer:
     def close(self):
         pass

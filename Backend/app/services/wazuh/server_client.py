@@ -13,6 +13,7 @@ from app.services.wazuh.exceptions import (
     WazuhAPIError,
     WazuhAuthError,
     WazuhPermissionError,
+    WazuhTimeoutError,
     WazuhValidationError,
 )
 
@@ -132,6 +133,7 @@ class _AuthenticatedWazuhTransport:
         params: dict[str, Any] | None = None,
         json: dict[str, Any] | None = None,
         allow_partial: bool = False,
+        timeout_seconds: float | None = None,
     ) -> httpx.Response:
         method = method.upper()
         path = "/" + path.lstrip("/")
@@ -141,7 +143,14 @@ class _AuthenticatedWazuhTransport:
             component=self.component,
         ):
             token = self._get_token()
-            response = self._send(method, path, params, json, token)
+            response = self._send(
+                method,
+                path,
+                params,
+                json,
+                token,
+                timeout_seconds,
+            )
             if response.status_code == 401:
                 response = self._send(
                     method,
@@ -149,6 +158,7 @@ class _AuthenticatedWazuhTransport:
                     params,
                     json,
                     self._get_token(force_refresh=True),
+                    timeout_seconds,
                 )
             self._raise_for_http_status(response, method, path)
             _validate_wazuh_envelope(
@@ -172,15 +182,21 @@ class _AuthenticatedWazuhTransport:
         params: dict[str, Any] | None,
         json: dict[str, Any] | None,
         token: str,
+        timeout_seconds: float | None = None,
     ) -> httpx.Response:
         try:
-            return self._client.request(
-                method,
-                path,
-                headers={"Authorization": f"Bearer {token}"},
-                params=params,
-                json=json,
-            )
+            request_kwargs: dict[str, Any] = {
+                "headers": {"Authorization": f"Bearer {token}"},
+                "params": params,
+                "json": json,
+            }
+            if timeout_seconds is not None:
+                request_kwargs["timeout"] = timeout_seconds
+            return self._client.request(method, path, **request_kwargs)
+        except httpx.TimeoutException as exc:
+            raise WazuhTimeoutError(
+                f"Wazuh API {method} {path} exceeded its configured timeout."
+            ) from exc
         except httpx.HTTPError as exc:
             raise WazuhAPIError(
                 f"Wazuh API {method} {path} transport error: {exc.__class__.__name__}"

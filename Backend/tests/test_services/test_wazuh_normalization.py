@@ -64,7 +64,7 @@ def auth_raw(alert_id: str, *, success: bool = False, offset: int = 0) -> dict:
     full_log = (
         "Accepted password for analyst from 192.168.100.9 port 4422 ssh2"
         if success
-        else "Failed password for invalid user lab from 192.168.100.9 port 4422 ssh2"
+        else "Failed password for lab from 192.168.100.9 port 4422 ssh2"
     )
     raw = raw_alert(
         alert_id,
@@ -99,6 +99,33 @@ def test_ssh_success_normalization():
     assert alert.attack_family == "initial_access"
     assert alert.event_type == "ssh_login_success"
     assert alert.outcome == "success"
+
+
+def test_invalid_ssh_user_is_not_preclassified_as_brute_force():
+    fixture = auth_raw("ssh-invalid")
+    fixture["_source"]["full_log"] = (
+        "Failed password for invalid user lab from 192.168.100.9 port 4422 ssh2"
+    )
+
+    alert = normalize_alert(fixture).normalized
+
+    assert alert.event_type == "ssh_invalid_user_attempt"
+    assert alert.outcome == "failure"
+
+
+def test_non_ssh_t1110_alert_is_not_labeled_as_ssh():
+    fixture = raw_alert(
+        "windows-t1110",
+        groups=["windows", "authentication_failures"],
+        description="Windows logon failure mapped to T1110",
+        data={"srcip": "192.0.2.50", "dstuser": "analyst"},
+        full_log="Logon failure for analyst",
+    )
+    fixture["_source"]["rule"]["mitre"] = {"id": ["T1110"]}
+
+    alert = normalize_alert(fixture).normalized
+
+    assert not alert.event_type.startswith("ssh_")
 
 
 @pytest.mark.parametrize(
@@ -237,6 +264,20 @@ def test_authentication_deduplication_and_finding_generation():
     assert findings[0].alert_count == 20
     assert findings[0].severity == "high"
     assert findings[0].evidence_refs
+
+
+def test_authentication_events_do_not_split_at_fixed_clock_boundary():
+    first = auth_raw("ssh-boundary-1")
+    second = auth_raw("ssh-boundary-2")
+    first["_source"]["@timestamp"] = "2026-07-24T19:04:59Z"
+    second["_source"]["@timestamp"] = "2026-07-24T19:05:01Z"
+
+    groups = aggregate_alerts(
+        [normalize_alert(first), normalize_alert(second)]
+    )
+
+    assert len(groups) == 1
+    assert groups[0].alert_count == 2
 
 
 def test_attack_specific_grouping_keeps_vulnerabilities_and_compliance_separate():

@@ -78,6 +78,11 @@ class InvestigationRecord(Base):
     failure_code: Mapped[str | None] = mapped_column(String(128), index=True)
     failure_reason: Mapped[str | None] = mapped_column(Text)
     last_successful_stage: Mapped[str | None] = mapped_column(String(64))
+    state_version: Mapped[int] = mapped_column(
+        Integer,
+        default=1,
+        server_default="1",
+    )
     snapshot: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -99,6 +104,48 @@ class InvestigationRecord(Base):
             "organization_id",
             "status",
             "updated_at",
+        ),
+    )
+
+
+class InvestigationResourceLeaseRecord(Base):
+    __tablename__ = "soc_investigation_resource_leases"
+
+    lock_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    organization_id: Mapped[str] = mapped_column(String(128), index=True)
+    resource_type: Mapped[str] = mapped_column(String(64), index=True)
+    resource_id: Mapped[str] = mapped_column(String(256), index=True)
+    lease_token: Mapped[str] = mapped_column(String(64))
+    owner_id: Mapped[str] = mapped_column(String(128), index=True)
+    acquired_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        index=True,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "lease_token",
+            name="uq_soc_investigation_resource_leases_token",
+        ),
+        UniqueConstraint(
+            "organization_id",
+            "resource_type",
+            "resource_id",
+            name="uq_soc_investigation_resource_leases_resource",
+        ),
+        Index(
+            "ix_soc_investigation_resource_leases_org_expiry",
+            "organization_id",
+            "expires_at",
         ),
     )
 
@@ -317,6 +364,14 @@ class ApprovalRecord(Base):
         index=True,
     )
     organization_id: Mapped[str] = mapped_column(String(128), index=True)
+    incident_id: Mapped[str] = mapped_column(String(64), index=True)
+    plan_id: Mapped[str] = mapped_column(String(64), index=True)
+    plan_version: Mapped[int] = mapped_column(Integer)
+    plan_hash: Mapped[str] = mapped_column(String(64), index=True)
+    evidence_version: Mapped[str] = mapped_column(String(64), index=True)
+    policy_version: Mapped[str] = mapped_column(String(64))
+    action_catalogue_version: Mapped[str] = mapped_column(String(64))
+    required_role: Mapped[str] = mapped_column(String(32))
     status: Mapped[str] = mapped_column(String(32), index=True)
     proposed_actions: Mapped[list[dict[str, Any]]] = mapped_column(
         JSON_VALUE,
@@ -339,6 +394,11 @@ class ApprovalRecord(Base):
         DateTime(timezone=True),
         index=True,
     )
+    invalidated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        index=True,
+    )
+    invalidation_reason: Mapped[str | None] = mapped_column(String(128))
 
 
 class ResponseActionRecord(Base):
@@ -354,6 +414,9 @@ class ResponseActionRecord(Base):
     target: Mapped[str] = mapped_column(String(256))
     risk_level: Mapped[str | None] = mapped_column(String(32))
     status: Mapped[str] = mapped_column(String(32), index=True)
+    plan_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    plan_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    evidence_version: Mapped[str | None] = mapped_column(String(64), index=True)
     approval_id: Mapped[str | None] = mapped_column(String(100), index=True)
     approved_by: Mapped[str | None] = mapped_column(String(100))
     approved_by_user_id: Mapped[str | None] = mapped_column(
@@ -373,6 +436,27 @@ class ResponseActionRecord(Base):
         index=True,
     )
     executed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        index=True,
+    )
+    rollback_action_id: Mapped[str | None] = mapped_column(
+        String(64),
+        index=True,
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        index=True,
+    )
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    rollback_claim_id: Mapped[str | None] = mapped_column(
+        String(100),
+        index=True,
+    )
+    rollback_retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_rollback_attempt: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+    )
+    rollback_completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         index=True,
     )

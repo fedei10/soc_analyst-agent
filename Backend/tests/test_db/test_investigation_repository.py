@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
@@ -34,8 +34,13 @@ def repository():
 
 def snapshot():
     timestamp = datetime(2026, 7, 23, 10, 0, tzinfo=UTC).isoformat()
+    requested_at = datetime.now(UTC)
+    expires_at = (requested_at + timedelta(hours=1)).isoformat()
+    plan_hash = "a" * 64
+    evidence_version = "b" * 64
     return {
         "investigation_id": "INV-PERSIST-001",
+        "incident_id": "INC-PERSIST-001",
         "organization_id": "org-test",
         "owner_user_id": "user-1",
         "alert_id": "alert-1",
@@ -51,30 +56,52 @@ def snapshot():
         "l3_result": {"summary": "L3"},
         "proposed_actions": [
             {
+                "action_id": "ACT-001",
                 "action_type": "block_ip",
                 "target": "192.0.2.10",
                 "risk_level": "medium",
             }
         ],
+        "remediation_plan": {
+            "plan_id": "PLAN-001",
+            "plan_version": 1,
+            "plan_hash": plan_hash,
+            "actions": [
+                {
+                    "action_id": "ACT-001",
+                    "action_type": "block_ip",
+                    "target": "192.0.2.10",
+                    "risk_level": "medium",
+                }
+            ],
+            "rollback_actions": [],
+        },
+        "evidence_version": evidence_version,
         "approval_decision": {
             "decision": "approve",
             "approval_id": "APR-001",
-            "approved_by": "analyst",
+            "actor_user_id": "analyst",
+            "plan_hash": plan_hash,
+            "evidence_version": evidence_version,
         },
         "approval_request": {
             "investigation_id": "INV-PERSIST-001",
+            "incident_id": "INC-PERSIST-001",
             "approval_id": "APR-001",
-            "status": "awaiting_approval",
-            "expires_at": timestamp,
-            "proposed_actions": [
-                {
-                    "action_type": "block_ip",
-                    "target": "192.0.2.10",
-                }
-            ],
+            "plan_id": "PLAN-001",
+            "plan_version": 1,
+            "plan_hash": plan_hash,
+            "evidence_version": evidence_version,
+            "policy_version": "1.0",
+            "action_catalogue_version": "1.0",
+            "required_role": "soc_l2",
+            "action_ids": ["ACT-001"],
+            "requested_at": requested_at.isoformat(),
+            "expires_at": expires_at,
         },
         "executed_actions": [
             {
+                "action_id": "ACT-001",
                 "action_type": "block_ip",
                 "target": "192.0.2.10",
                 "status": "queued",
@@ -211,7 +238,11 @@ def test_response_action_claim_is_atomic_and_cannot_repeat():
         "INV-PERSIST-001",
         organization_id="org-test",
         approval_id="APR-001",
-        executed_by="user-responder",
+        executor_user_id="user-responder",
+        executor_roles=["soc_l3"],
+        expected_action_ids=["ACT-001"],
+        expected_plan_hash=value["approval_request"]["plan_hash"],
+        expected_evidence_version=value["evidence_version"],
     )
 
     assert claim["action_ids"]
@@ -219,17 +250,72 @@ def test_response_action_claim_is_atomic_and_cannot_repeat():
         "INV-PERSIST-001",
         organization_id="org-test",
     )
-    assert actions[0]["status"] == "executing"
+    assert actions[0]["status"] == "claimed"
     assert actions[0]["execution_id"] == claim["execution_id"]
     assert actions[0]["executor_user_id"] == "user-responder"
+    assert claim["actor_user_id"] == "user-responder"
+    assert claim["actor_roles"] == ["soc_l3"]
 
     with pytest.raises(ResponseExecutionConflictError):
         store.claim_response_actions(
             "INV-PERSIST-001",
             organization_id="org-test",
             approval_id="APR-001",
-            executed_by="user-responder",
+            executor_user_id="user-responder",
+            executor_roles=["soc_l3"],
+            expected_action_ids=["ACT-001"],
+            expected_plan_hash=value["approval_request"]["plan_hash"],
+            expected_evidence_version=value["evidence_version"],
         )
+
+
+def test_response_action_preflight_is_durable_before_completion():
+    store = repository()
+    value = snapshot()
+    value["status"] = "approved"
+    value["current_stage"] = "response_approved"
+    value["executed_actions"] = []
+    store.save_snapshot(value)
+    claim = store.claim_response_actions(
+        "INV-PERSIST-001",
+        organization_id="org-test",
+        approval_id="APR-001",
+        executor_user_id="user-responder",
+        executor_roles=["soc_l3"],
+        expected_action_ids=["ACT-001"],
+        expected_plan_hash=value["approval_request"]["plan_hash"],
+        expected_evidence_version=value["evidence_version"],
+    )
+    intended_expires_at = datetime.now(UTC) + timedelta(minutes=15)
+    before_state = {
+        "target": "192.0.2.10",
+        "action_present": False,
+        "wazuh_agent_status": "active",
+        "management_connectivity": True,
+    }
+
+    assert store.begin_response_action(
+        "ACT-001",
+        organization_id="org-test",
+        execution_id=claim["execution_id"],
+        before_state=before_state,
+        intended_expires_at=intended_expires_at,
+        idempotency_key="IDEM-PERSIST-001",
+    )
+
+    action = store.list_response_actions(
+        "INV-PERSIST-001",
+        organization_id="org-test",
+    )[0]
+    preflight = action["details"]["execution_preflight"]
+    assert action["status"] == "running"
+    persisted_expiry = action["expires_at"]
+    if persisted_expiry.tzinfo is None:
+        persisted_expiry = persisted_expiry.replace(tzinfo=UTC)
+    assert persisted_expiry == intended_expires_at
+    assert preflight["before_state"] == before_state
+    assert preflight["intended_expires_at"] == intended_expires_at.isoformat()
+    assert preflight["idempotency_key"] == "IDEM-PERSIST-001"
 
 
 def test_repository_persists_multiple_specialist_runs_and_sanitizes_tools():

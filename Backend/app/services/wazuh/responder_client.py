@@ -41,6 +41,7 @@ class WazuhResponderClient:
         command: str,
         arguments: list[str] | None = None,
         alert: dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"command": command, "arguments": arguments or []}
         if alert:
@@ -50,10 +51,20 @@ class WazuhResponderClient:
             "/active-response",
             params={"agents_list": agent_id},
             json=body,
+            timeout_seconds=timeout_seconds,
         ).json()
 
-    def restart_agent(self, agent_id: str) -> dict[str, Any]:
-        return self._transport.request("PUT", f"/agents/{agent_id}/restart").json()
+    def restart_agent(
+        self,
+        agent_id: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        return self._transport.request(
+            "PUT",
+            f"/agents/{agent_id}/restart",
+            timeout_seconds=timeout_seconds,
+        ).json()
 
     def close(self) -> None:
         self._transport.close()

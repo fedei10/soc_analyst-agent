@@ -606,6 +606,9 @@ class WazuhIndexerClient:
             full_log=_first_value(source, ("full_log",)),
             rule_groups=_string_list(rule.get("groups")),
             mitre_ids=_string_list(mitre.get("id")),
+            event_count=int(
+                rule.get("firedtimes") or source.get("event_count") or 1
+            ),
             event_outcome=_event_outcome(source),
         )
 

@@ -1,6 +1,7 @@
 """Reusable application service around the formal investigation graph."""
 
 import uuid
+from datetime import UTC, datetime
 from enum import Enum
 from functools import lru_cache
 from threading import RLock
@@ -10,16 +11,24 @@ from langgraph.types import Command
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 
+from app.config import settings
 from app.mape_k.graph import (
     create_mape_k_graph,
     investigation_config,
 )
+from app.mape_k.schemas import (
+    TrustedApprovalSubmission,
+    VerificationResumeAuthorization,
+)
+from app.mape_k.executor import RestrictedExecutor
+from app.mape_k.utils import response_resource_namespace
 from app.db.checkpointer import (
     CheckpointerHandle,
     create_investigation_checkpointer,
 )
 from app.db.repositories.investigations import (
     InvestigationRepository,
+    ResourceLeaseConflictError,
     ResponseExecutionConflictError,
     get_investigation_repository,
 )
@@ -54,6 +63,7 @@ class InvestigationService:
             self._checkpointer = create_investigation_checkpointer()
             graph = create_mape_k_graph(
                 checkpointer=self._checkpointer.saver,
+                executor=RestrictedExecutor(action_repository=self.repository),
             )
         self.graph = graph
         self._lock = RLock()
@@ -74,8 +84,8 @@ class InvestigationService:
             "incident_id": f"INC-{investigation_id.removeprefix('INV-')}",
             "investigation_id": investigation_id,
             "status": "created",
-            "stage": "created",
-            "current_stage": "created",
+            "stage": "monitor",
+            "current_stage": "monitor",
             "alert_id": alert_id,
             "finding_id": finding_id,
             "agent_id": agent_id,
@@ -91,6 +101,19 @@ class InvestigationService:
             "execution_results": [],
             "executed_actions": [],
             "audit_events": [],
+            "llm_input_tokens": 0,
+            "llm_output_tokens": 0,
+            "estimated_input_tokens": 0,
+            "estimated_output_tokens": 0,
+            "actual_input_tokens": None,
+            "actual_output_tokens": None,
+            "cached_input_tokens": None,
+            "model_calls": 0,
+            "model_retries": 0,
+            "model_provider": None,
+            "model_name": None,
+            "estimated_cost_usd": 0,
+            "actual_cost_usd": None,
             "errors": [],
         }
 
@@ -169,6 +192,28 @@ class InvestigationService:
             and state_organization != organization_id
         ):
             raise InvestigationNotFoundError(investigation_id)
+        plan = state.get("remediation_plan") or {}
+        proposed_actions = state.get("proposed_actions") or [
+            item
+            for item in plan.get("actions", [])
+            if isinstance(item, dict)
+        ]
+        execution_results = state.get("execution_results", [])
+        authorization = state.get("execution_authorization") or {}
+        approval_decision = state.get("approval_decision") or {}
+        executed_actions = state.get("executed_actions") or [
+            {
+                **item,
+                "execution_id": (
+                    authorization.get("execution_id")
+                    or item.get("execution_id")
+                ),
+                "executed_by": authorization.get("actor_user_id"),
+                "approval_id": approval_decision.get("approval_id"),
+            }
+            for item in execution_results
+            if isinstance(item, dict)
+        ]
         result = {
             "incident_id": state["incident_id"],
             "investigation_id": state["investigation_id"],
@@ -201,17 +246,35 @@ class InvestigationService:
             "diagnosis": state.get("diagnosis"),
             "remediation_plan": state.get("remediation_plan"),
             "policy_decision": state.get("policy_decision"),
-            "proposed_actions": state.get("proposed_actions", []),
+            "proposed_actions": proposed_actions,
             "approval_request": state.get("approval_request"),
             "approval_decision": state.get("approval_decision"),
-            "execution_results": state.get("execution_results", []),
-            "executed_actions": state.get("executed_actions", []),
+            "execution_results": execution_results,
+            "executed_actions": executed_actions,
+            "verification_not_before": state.get("verification_not_before"),
             "verification": state.get("verification"),
             "rollback": state.get("rollback"),
             "final_report": state.get("final_report"),
+            "error": state.get("error"),
             "llm_input_tokens": state.get("llm_input_tokens", 0),
             "llm_output_tokens": state.get("llm_output_tokens", 0),
+            "estimated_input_tokens": state.get(
+                "estimated_input_tokens",
+                0,
+            ),
+            "estimated_output_tokens": state.get(
+                "estimated_output_tokens",
+                0,
+            ),
+            "actual_input_tokens": state.get("actual_input_tokens"),
+            "actual_output_tokens": state.get("actual_output_tokens"),
+            "cached_input_tokens": state.get("cached_input_tokens"),
+            "model_calls": state.get("model_calls", 0),
+            "model_retries": state.get("model_retries", 0),
+            "model_provider": state.get("model_provider"),
+            "model_name": state.get("model_name"),
             "estimated_cost_usd": state.get("estimated_cost_usd", 0),
+            "actual_cost_usd": state.get("actual_cost_usd"),
             "errors": state.get("errors", []),
             "failure_code": (
                 (state.get("errors") or [{}])[-1].get("code")
@@ -231,7 +294,19 @@ class InvestigationService:
             "pending_nodes": list(snapshot.next),
         }
         with self._lock:
-            self.repository.save_snapshot(result)
+            persisted = self.repository.get_snapshot(
+                investigation_id,
+                organization_id=state_organization,
+            )
+            expected_version = (
+                int(persisted.get("state_version") or 0)
+                if persisted is not None
+                else 0
+            )
+            result["state_version"] = self.repository.save_snapshot(
+                result,
+                expected_version=expected_version,
+            )
             result["tier_reports"] = self.repository.list_tier_reports(
                 investigation_id,
                 organization_id=state_organization,
@@ -249,26 +324,88 @@ class InvestigationService:
             organization_id=organization_id,
         )
 
-    def resume(
+    def _resume_trusted(
         self,
         investigation_id: str,
-        decision: dict,
+        command_payload: dict,
         *,
         organization_id: str | None = None,
+        resource_lock_held: bool = False,
     ) -> dict[str, Any]:
-        with self._lock:
-            self.snapshot(
-                investigation_id,
-                organization_id=organization_id,
-            )
-            self.graph.invoke(
-                Command(resume=decision),
-                config=investigation_config(investigation_id),
-            )
-            return self.snapshot(
-                investigation_id,
-                organization_id=organization_id,
-            )
+        stored = self.repository.get_snapshot(
+            investigation_id,
+            organization_id=organization_id or "local",
+        )
+        if stored is None:
+            raise InvestigationNotFoundError(investigation_id)
+        lock_namespace = response_resource_namespace(settings)
+        lease: dict[str, Any] | None = None
+        if not resource_lock_held:
+            try:
+                lease = self.repository.acquire_resource_lease(
+                    organization_id=lock_namespace,
+                    resource_type="incident",
+                    resource_id=str(stored["incident_id"]),
+                    owner_id=f"resume-{uuid.uuid4().hex}",
+                    lease_seconds=int(
+                        settings.MAPEK_EXECUTION_LOCK_TTL_SECONDS
+                    ),
+                )
+            except ResourceLeaseConflictError as exc:
+                raise ResponseExecutionConflictError(
+                    "Another worker is updating this investigation."
+                ) from exc
+        try:
+            with self._lock:
+                self.snapshot(
+                    investigation_id,
+                    organization_id=organization_id,
+                )
+                self.graph.invoke(
+                    Command(resume=command_payload),
+                    config=investigation_config(investigation_id),
+                )
+                return self.snapshot(
+                    investigation_id,
+                    organization_id=organization_id,
+                )
+        finally:
+            if lease is not None:
+                try:
+                    self.repository.release_resource_lease(
+                        organization_id=lock_namespace,
+                        resource_type="incident",
+                        resource_id=str(stored["incident_id"]),
+                        lease_token=str(lease["lease_token"]),
+                    )
+                except ResourceLeaseConflictError:
+                    pass
+
+    def submit_approval(
+        self,
+        investigation_id: str,
+        *,
+        approval_id: str,
+        decision: str,
+        comment: str | None,
+        actor_user_id: str,
+        actor_roles: list[str] | tuple[str, ...],
+        organization_id: str,
+    ) -> dict[str, Any]:
+        """Resume approval using identity derived from the authenticated server."""
+
+        submission = TrustedApprovalSubmission(
+            approval_id=approval_id,
+            decision=decision,
+            comment=comment,
+            actor_user_id=actor_user_id,
+            actor_roles=list(actor_roles),
+        )
+        return self._resume_trusted(
+            investigation_id,
+            submission.model_dump(mode="json", exclude_none=True),
+            organization_id=organization_id,
+        )
 
     def execute_approved(
         self,
@@ -276,6 +413,7 @@ class InvestigationService:
         *,
         approval_id: str,
         executed_by: str,
+        executor_roles: list[str] | tuple[str, ...],
         organization_id: str,
     ) -> dict[str, Any]:
         with self._lock:
@@ -292,36 +430,215 @@ class InvestigationService:
                 raise ResponseExecutionConflictError(
                     "Approval ID does not match this investigation."
                 )
-            claim = self.repository.claim_response_actions(
-                investigation_id,
-                organization_id=organization_id,
-                approval_id=approval_id,
-                executed_by=executed_by,
-            )
-            try:
-                self.graph.invoke(
-                    Command(resume={
-                        "approval_id": approval_id,
-                        **claim,
-                    }),
-                    config=investigation_config(investigation_id),
+            plan = before.get("remediation_plan") or {}
+            decision = before.get("approval_decision") or {}
+            expected_action_ids = [
+                str(item.get("action_id"))
+                for item in plan.get("actions", [])
+                if isinstance(item, dict) and item.get("action_id")
+            ]
+            if (
+                not expected_action_ids
+                or request.get("action_ids") != expected_action_ids
+                or decision.get("plan_hash") != plan.get("plan_hash")
+                or decision.get("evidence_version")
+                != before.get("evidence_version")
+            ):
+                raise ResponseExecutionConflictError(
+                    "The approval is stale or no longer matches the plan."
                 )
-                result = self.snapshot(
+            owner_id = f"execution-{uuid.uuid4().hex}"
+            incident_lease_seconds = min(
+                3600,
+                max(
+                    int(settings.MAPEK_EXECUTION_LOCK_TTL_SECONDS),
+                    max(
+                        (
+                            int(item.get("timeout_seconds") or 0)
+                            for item in plan.get("actions", [])
+                            if isinstance(item, dict)
+                        ),
+                        default=0,
+                    )
+                    + 60,
+                ),
+            )
+            lock_namespace = response_resource_namespace(settings)
+            resource_scopes = [
+                (
+                    "incident",
+                    str(before["incident_id"]),
+                    incident_lease_seconds,
+                    False,
+                ),
+                *[
+                    (
+                        (
+                            "ip"
+                            if str(item.get("action_type"))
+                            in {"block_ip", "unblock_ip"}
+                            else str(item.get("action_type") or "resource")
+                        ),
+                        str(item.get("target") or ""),
+                        min(
+                            86_400,
+                            max(
+                                int(
+                                    settings.MAPEK_EXECUTION_LOCK_TTL_SECONDS
+                                ),
+                                int(item.get("ttl_seconds") or 0),
+                                int(item.get("timeout_seconds") or 0) + 60,
+                            ),
+                        ),
+                        bool(item.get("ttl_seconds")),
+                    )
+                    for item in plan.get("actions", [])
+                    if isinstance(item, dict) and item.get("target")
+                ],
+            ]
+            acquired_leases: list[tuple[str, str, str, bool]] = []
+            result: dict[str, Any] | None = None
+            try:
+                for resource_type, resource_id, ttl, retainable in dict.fromkeys(
+                    resource_scopes
+                ):
+                    lease = self.repository.acquire_resource_lease(
+                        organization_id=lock_namespace,
+                        resource_type=resource_type,
+                        resource_id=resource_id,
+                        owner_id=owner_id,
+                        lease_seconds=ttl,
+                    )
+                    acquired_leases.append(
+                        (
+                            resource_type,
+                            resource_id,
+                            str(lease["lease_token"]),
+                            retainable,
+                        )
+                    )
+                claim = self.repository.claim_response_actions(
                     investigation_id,
                     organization_id=organization_id,
+                    approval_id=approval_id,
+                    executor_user_id=executed_by,
+                    executor_roles=list(executor_roles),
+                    expected_action_ids=expected_action_ids,
+                    expected_plan_hash=str(plan.get("plan_hash") or ""),
+                    expected_evidence_version=str(
+                        before.get("evidence_version") or ""
+                    ),
                 )
-            except Exception:
-                self.repository.mark_execution_failed(
-                    claim["execution_id"],
-                    organization_id=organization_id,
+                try:
+                    self._resume_trusted(
+                        investigation_id,
+                        {
+                            "approval_id": approval_id,
+                            **claim,
+                        },
+                        organization_id=organization_id,
+                        resource_lock_held=True,
+                    )
+                    result = self.snapshot(
+                        investigation_id,
+                        organization_id=organization_id,
+                    )
+                except Exception:
+                    self.repository.mark_execution_failed(
+                        claim["execution_id"],
+                        organization_id=organization_id,
+                    )
+                    raise
+                if (
+                    result.get("status") == "failed"
+                    or not result.get("execution_results")
+                ):
+                    self.repository.mark_execution_failed(
+                        claim["execution_id"],
+                        organization_id=organization_id,
+                    )
+                return result
+            except ResourceLeaseConflictError as exc:
+                raise ResponseExecutionConflictError(
+                    "Another workflow holds the incident or target resource lock."
+                ) from exc
+            finally:
+                retained_targets = {
+                    ("ip", str(item.get("target") or ""))
+                    for item in (result or {}).get("execution_results", [])
+                    if isinstance(item, dict)
+                    and item.get("status")
+                    in {"accepted", "applied", "executed", "outcome_unknown"}
+                }
+                for (
+                    resource_type,
+                    resource_id,
+                    lease_token,
+                    retainable,
+                ) in reversed(acquired_leases):
+                    if (
+                        retainable
+                        and (resource_type, resource_id) in retained_targets
+                    ):
+                        continue
+                    try:
+                        self.repository.release_resource_lease(
+                            organization_id=lock_namespace,
+                            resource_type=resource_type,
+                            resource_id=resource_id,
+                            lease_token=lease_token,
+                        )
+                    except ResourceLeaseConflictError:
+                        # An expired lease may already have been recovered.
+                        pass
+
+    def resume_verification(
+        self,
+        investigation_id: str,
+        *,
+        resumed_by: str,
+        executor_roles: list[str] | tuple[str, ...],
+        organization_id: str,
+    ) -> dict[str, Any]:
+        """Resume post-action verification using server-derived identity/time."""
+
+        with self._lock:
+            before = self.snapshot(
+                investigation_id,
+                organization_id=organization_id,
+            )
+            if "verification_wait" not in before["pending_nodes"]:
+                raise ResponseExecutionConflictError(
+                    "Investigation is not waiting for post-action verification."
                 )
-                raise
-            if result.get("status") == "failed":
-                self.repository.mark_execution_failed(
-                    claim["execution_id"],
-                    organization_id=organization_id,
+            ready_at_value = before.get("verification_not_before")
+            ready_at = (
+                datetime.fromisoformat(
+                    str(ready_at_value).replace("Z", "+00:00")
                 )
-            return result
+                if ready_at_value
+                else None
+            )
+            if ready_at is None:
+                raise ResponseExecutionConflictError(
+                    "A successful execution timestamp is required before "
+                    "verification."
+                )
+            if datetime.now(UTC) < ready_at:
+                raise ResponseExecutionConflictError(
+                    "The post-action observation window is not complete. "
+                    f"Verification can resume at {ready_at.isoformat()}."
+                )
+            authorization = VerificationResumeAuthorization(
+                investigation_id=investigation_id,
+                actor_user_id=resumed_by,
+                actor_roles=list(executor_roles),
+            )
+            return self._resume_trusted(
+                investigation_id,
+                authorization.model_dump(mode="json"),
+                organization_id=organization_id,
+            )
 
     def list_recent(
         self,

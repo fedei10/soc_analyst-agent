@@ -1,7 +1,7 @@
 # app/config.py
 import logging
 from functools import lru_cache
-from pydantic import SecretStr
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.core.langsmith import configure_langsmith
@@ -43,13 +43,32 @@ class Settings(BaseSettings):
     MAPEK_MAX_INPUT_TOKENS: int = 8000
     MAPEK_MAX_TOOL_CALLS_PER_STAGE: int = 4
     MAPEK_CORRELATION_WINDOW_SECONDS: int = 600
+    MAPEK_SSH_BRUTE_FORCE_MIN_FAILURES: int = 5
+    MAPEK_SSH_BRUTE_FORCE_MIN_EVENTS: int = 3
+    MAPEK_SSH_BRUTE_FORCE_WINDOW_SECONDS: int = 300
+    MAPEK_SSH_PASSWORD_SPRAY_MIN_USERS: int = 5
+    MAPEK_SSH_PASSWORD_SPRAY_MIN_FAILURES: int = 10
+    MAPEK_SSH_PASSWORD_SPRAY_WINDOW_SECONDS: int = 300
+    MAPEK_SSH_SUCCESS_AFTER_FAILURE_WINDOW_SECONDS: int = 900
+    MAPEK_APPROVAL_TTL_SECONDS: int = 1800
+    MAPEK_REQUIRE_PLAN_HASH_APPROVAL: bool = True
+    MAPEK_POLICY_VERSION: str = "1.0"
+    MAPEK_ACTION_CATALOGUE_VERSION: str = "1.0"
+    MAPEK_CHECKPOINTER_BACKEND: str = "auto"
+    MAPEK_ALLOW_INMEMORY_CHECKPOINTER: bool = True
+    MAPEK_EXECUTION_MODE: str = "disabled"
     MAPEK_DRY_RUN: bool = True
     MAPEK_REAL_EXECUTION_ENABLED: bool = False
+    MAPEK_VERIFICATION_OBSERVATION_SECONDS: int = 60
+    MAPEK_REQUIRE_MANAGEMENT_PROBE: bool = False
+    MAPEK_MAX_EXECUTION_RETRIES: int = 1
+    MAPEK_EXECUTION_LOCK_TTL_SECONDS: int = 300
     MAPEK_TEMPORARY_BLOCK_TTL_SECONDS: int = 900
     MAPEK_PROTECTED_IPS: str = ""
     MAPEK_APPROVED_ADMIN_IPS: str = ""
     MAPEK_PROTECTED_ACCOUNTS: str = "root,wazuh"
     MAPEK_PROTECTED_PROCESSES: str = "sshd,wazuh-agentd"
+    MAPEK_PROTECTED_SERVICES: str = "sshd,wazuh-agent"
     MAPEK_PROTECTED_PORTS: str = "22,55000,9200"
     MAPEK_MAINTENANCE_WINDOW_ACTIVE: bool = False
 
@@ -76,6 +95,7 @@ class Settings(BaseSettings):
     LANGSMITH_HIDE_OUTPUTS: bool = True
     LANGSMITH_INCLUDE_RAW_ALERTS: bool = False
     LANGSMITH_INCLUDE_FULL_LOG: bool = False
+    LANGSMITH_INCLUDE_FULL_INVENTORY: bool = False
     REVISION_ID: str = "development"
 
     # Wazuh (reached through SSH tunnel to PC1, so localhost)
@@ -144,6 +164,16 @@ class Settings(BaseSettings):
     SELF_HEALING_ENABLED: bool = False
     SELF_HEALING_SERVICE_ALLOWLIST: str = ""
     SYSTEM_COMMAND_TIMEOUT: int = 10
+
+    @field_validator("MAPEK_EXECUTION_MODE")
+    @classmethod
+    def validate_mapek_execution_mode(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"disabled", "enabled"}:
+            raise ValueError(
+                "MAPEK_EXECUTION_MODE must be disabled or enabled."
+            )
+        return normalized
 
     model_config = SettingsConfigDict(
         env_file=(".env", ".env.local"),

@@ -5,14 +5,21 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from app.mape_k.schemas import (
     ActionType,
     ApprovalDecision,
+    ApprovalRequestRecord,
+    ApprovalSubmission,
+    AuthenticationEvidenceSummary,
     Diagnosis,
     EvidenceReference,
+    ExecutionAuthorization,
     ExecutionResult,
     IncidentWorkflowState,
     PolicyDecision,
     RemediationAction,
     RemediationPlan,
     RollbackResult,
+    SSHDetectionPolicy,
+    TrustedApprovalSubmission,
+    VerificationOutcome,
     VerificationResult,
     WorkflowError,
     WorkflowStage,
@@ -24,8 +31,12 @@ from app.services.wazuh.normalization.schemas import NormalizedAlert
 CHECKPOINT_TYPES = (
     ActionType,
     ApprovalDecision,
+    ApprovalRequestRecord,
+    ApprovalSubmission,
+    AuthenticationEvidenceSummary,
     Diagnosis,
     EvidenceReference,
+    ExecutionAuthorization,
     ExecutionResult,
     IncidentWorkflowState,
     NormalizedAlert,
@@ -33,6 +44,9 @@ CHECKPOINT_TYPES = (
     RemediationAction,
     RemediationPlan,
     RollbackResult,
+    SSHDetectionPolicy,
+    TrustedApprovalSubmission,
+    VerificationOutcome,
     VerificationResult,
     WorkflowError,
     WorkflowStage,
@@ -42,4 +56,3 @@ CHECKPOINT_TYPES = (
 
 def create_checkpoint_serializer() -> JsonPlusSerializer:
     return JsonPlusSerializer(allowed_msgpack_modules=CHECKPOINT_TYPES)
-

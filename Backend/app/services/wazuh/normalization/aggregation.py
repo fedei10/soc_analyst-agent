@@ -121,6 +121,52 @@ def grouping_key(envelope: AlertEnvelope) -> str:
     return "|".join(parts)
 
 
+def _correlation_key(envelope: AlertEnvelope) -> str:
+    """Return the attack-specific key without a wall-clock bucket."""
+
+    return "|".join(
+        (
+            envelope.normalized.attack_family,
+            *_specific_parts(envelope),
+        )
+    )
+
+
+def _windowed_groups(
+    envelopes: list[AlertEnvelope],
+) -> dict[str, list[AlertEnvelope]]:
+    """Cluster events by elapsed time, avoiding fixed-bucket boundary splits."""
+
+    candidates: dict[str, list[AlertEnvelope]] = defaultdict(list)
+    for envelope in envelopes:
+        candidates[_correlation_key(envelope)].append(envelope)
+
+    grouped: dict[str, list[AlertEnvelope]] = {}
+    for base_key, items in candidates.items():
+        ordered = sorted(items, key=lambda item: item.normalized.timestamp)
+        current: list[AlertEnvelope] = []
+        window_start: datetime | None = None
+        for envelope in ordered:
+            timestamp = envelope.normalized.timestamp
+            window_seconds = _window_seconds(envelope)
+            if (
+                current
+                and window_start is not None
+                and (timestamp - window_start).total_seconds() > window_seconds
+            ):
+                key = f"{base_key}|{window_start.isoformat()}"
+                grouped[key] = current
+                current = []
+                window_start = None
+            if window_start is None:
+                window_start = timestamp
+            current.append(envelope)
+        if current and window_start is not None:
+            key = f"{base_key}|{window_start.isoformat()}"
+            grouped[key] = current
+    return grouped
+
+
 def _unique(values: list[str | None]) -> list[str]:
     return list(dict.fromkeys(value for value in values if value))
 
@@ -132,9 +178,7 @@ def aggregate_alerts(
 ) -> list[AlertGroup]:
     started = time.perf_counter()
     limit = max_evidence_refs or settings.MAX_EVIDENCE_REFS_PER_FINDING
-    grouped: dict[str, list[AlertEnvelope]] = defaultdict(list)
-    for envelope in envelopes:
-        grouped[grouping_key(envelope)].append(envelope)
+    grouped = _windowed_groups(envelopes)
 
     results = []
     for key, items in grouped.items():

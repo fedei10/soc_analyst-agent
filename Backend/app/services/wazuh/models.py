@@ -21,6 +21,7 @@ class AlertEvidence(BaseModel):
     full_log: str | None = None
     rule_groups: list[str] = Field(default_factory=list)
     mitre_ids: list[str] = Field(default_factory=list)
+    event_count: int = Field(default=1, ge=1)
     event_outcome: Literal["success", "failure", "unknown"] = "unknown"
 
 

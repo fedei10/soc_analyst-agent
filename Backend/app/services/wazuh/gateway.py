@@ -79,7 +79,12 @@ class WazuhGateway:
         limit: int = 50,
         agent_id: str | None = None,
         rule_id: str | None = None,
+        source_ip: str | None = None,
         text: str | None = None,
+        authentication_only: bool = False,
+        oldest_first: bool = False,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
     ) -> AlertSearchResult:
         return self.indexer.search_alerts(
             min_level=min_level,
@@ -87,7 +92,12 @@ class WazuhGateway:
             limit=limit,
             agent_id=agent_id,
             rule_id=rule_id,
+            source_ip=source_ip,
             text=text,
+            authentication_only=authentication_only,
+            oldest_first=oldest_first,
+            start_time=start_time,
+            end_time=end_time,
         )
 
     def get_alert_by_id(self, alert_id: str) -> AlertEvidence | None:
@@ -236,26 +246,49 @@ class WazuhGateway:
         )
 
     def get_related_alerts(
-        self, *, alert_id: str, hours: int = 24, limit: int = 100
+        self,
+        *,
+        alert_id: str,
+        hours: int = 24,
+        limit: int = 100,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        authentication_only: bool = False,
     ) -> AlertSearchResult:
+        if (start_time is None) != (end_time is None):
+            raise ValueError("start_time and end_time must be provided together.")
         alert = self.get_alert_by_id(alert_id)
         if alert is None:
             return AlertSearchResult(total=0, returned=0, truncated=False, alerts=[])
+        time_bounds: dict[str, datetime] = {}
+        if start_time is not None and end_time is not None:
+            time_bounds = {
+                "start_time": start_time,
+                "end_time": end_time,
+            }
+        elif alert.agent_id:
+            time_bounds = {
+                "start_time": alert.timestamp - timedelta(hours=hours),
+                "end_time": alert.timestamp + timedelta(hours=hours),
+            }
         if alert.agent_id:
             result = self.indexer.search_alerts(
                 hours=hours,
                 limit=limit,
                 agent_id=alert.agent_id,
                 source_ip=alert.source_ip,
+                authentication_only=authentication_only,
                 oldest_first=True,
-                start_time=alert.timestamp - timedelta(hours=hours),
-                end_time=alert.timestamp + timedelta(hours=hours),
+                **time_bounds,
             )
         else:
             result = self.indexer.search_alerts(
                 hours=hours,
                 limit=limit,
                 rule_id=alert.rule_id,
+                authentication_only=authentication_only,
+                oldest_first=start_time is not None,
+                **time_bounds,
             )
         result = result.model_copy(deep=True)
         result.alerts = [item for item in result.alerts if item.alert_id != alert_id]

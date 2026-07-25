@@ -29,7 +29,9 @@ from app.api.v1.endpoints.wazuh import write as wazuh_write_router
 from app.services.wazuh.dependencies import close_wazuh_dependencies
 from app.coreAgents.orchestration.investigation_service import (
     close_investigation_service,
+    get_investigation_service,
 )
+from app.config import settings
 from app.db.session import close_database
 from app.db.repositories.findings import close_finding_repository
 from app.db.repositories.alert_memory import close_alert_memory_repository
@@ -49,14 +51,20 @@ logger = structlog.get_logger("tsage.api")
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    yield
-    close_investigation_service()
-    close_wazuh_dependencies()
-    close_investigation_repository()
-    close_finding_repository()
-    close_alert_memory_repository()
-    close_database()
-    close_redis_connection()
+    if settings.ENVIRONMENT.strip().lower() in {"prod", "production"}:
+        # Production must prove the durable checkpointer can initialize before
+        # accepting any workflow that could later wait for human approval.
+        get_investigation_service()
+    try:
+        yield
+    finally:
+        close_investigation_service()
+        close_wazuh_dependencies()
+        close_investigation_repository()
+        close_finding_repository()
+        close_alert_memory_repository()
+        close_database()
+        close_redis_connection()
 
 app = create_app(lifespan=lifespan)
 app.include_router(health_router, prefix="/api/v1")

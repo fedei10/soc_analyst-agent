@@ -257,8 +257,8 @@ def list_investigations(
     status: str | None = Query(
         default=None,
         pattern=(
-            "^(created|running|awaiting_approval|approved|rejected|"
-            "completed|escalated|failed)$"
+            "^(created|running|awaiting_approval|waiting_verification|"
+            "approved|rejected|completed|escalated|failed)$"
         ),
     ),
 ):
@@ -320,13 +320,13 @@ def decide_investigation(
             "Investigation is not waiting for human approval.",
         )
 
-    snapshot = get_investigation_service().resume(
+    snapshot = get_investigation_service().submit_approval(
         investigation_id,
-        {
-            **request.model_dump(mode="json", exclude_none=True),
-            "approved_by": principal.user_id,
-            "approver_roles": list(principal.roles),
-        },
+        approval_id=request.approval_id,
+        decision=request.decision,
+        comment=request.comment,
+        actor_user_id=principal.user_id,
+        actor_roles=principal.roles,
         organization_id=principal.scope_id,
     )
     _publish_activity(snapshot)
@@ -348,6 +348,31 @@ def execute_investigation_response(
             investigation_id,
             approval_id=request.approval_id,
             executed_by=principal.user_id,
+            executor_roles=principal.roles,
+            organization_id=principal.scope_id,
+        )
+    except InvestigationNotFoundError:
+        raise HTTPException(404, f"Investigation {investigation_id} not found.")
+    except ResponseExecutionConflictError as exc:
+        raise HTTPException(409, str(exc))
+    _publish_activity(snapshot)
+    return {"data": _public_data(snapshot)}
+
+
+@write.post(
+    "/investigations/{investigation_id}/verification/resume",
+    tags=["investigations"],
+    dependencies=[Depends(require_execute)],
+)
+def resume_investigation_verification(
+    investigation_id: str,
+    principal: ExecutorPrincipal,
+):
+    try:
+        snapshot = get_investigation_service().resume_verification(
+            investigation_id,
+            resumed_by=principal.user_id,
+            executor_roles=principal.roles,
             organization_id=principal.scope_id,
         )
     except InvestigationNotFoundError:

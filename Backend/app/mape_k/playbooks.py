@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 from app.config import settings
+from app.mape_k.registries import PLAYBOOK_REGISTRY
 from app.mape_k.schemas import (
     ActionType,
     IncidentWorkflowState,
@@ -20,10 +23,18 @@ class PlaybookPlanner:
         source_ip = str(diagnosis.affected_entities.get("source_ip") or "")
         block_id = stable_id("ACT", state.incident_id, "block_ip", source_ip)
         unblock_id = stable_id("ACT", state.incident_id, "unblock_ip", source_ip)
-        return RemediationPlan(
+        created_at = datetime.now(UTC)
+        plan = RemediationPlan(
+            plan_version=1,
             playbook_id="ssh-bruteforce-v1",
             playbook_version="1.0",
             incident_id=state.incident_id,
+            evidence_version=str(state.evidence_version or ""),
+            policy_version=settings.MAPEK_POLICY_VERSION,
+            action_catalogue_version=settings.MAPEK_ACTION_CATALOGUE_VERSION,
+            created_at=created_at,
+            expires_at=created_at
+            + timedelta(seconds=settings.MAPEK_APPROVAL_TTL_SECONDS),
             risk_level=1,
             actions=[
                 RemediationAction(
@@ -44,7 +55,11 @@ class PlaybookPlanner:
             ],
             expected_effects=["Failed SSH attempts from the source stop."],
             security_checks=["ssh_attempts_stopped", "no_new_critical_alerts"],
-            health_checks=["wazuh_agent_connected", "legitimate_ssh_reachable"],
+            health_checks=[
+                "wazuh_agent_connected",
+                "ssh_port_listening",
+                "management_ssh_reachable",
+            ],
             rollback_actions=[
                 RemediationAction(
                     action_id=unblock_id,
@@ -62,4 +77,8 @@ class PlaybookPlanner:
                 "with automatic expiry and an explicit rollback."
             ),
         )
-
+        PLAYBOOK_REGISTRY.validate_plan(
+            plan,
+            diagnosis_type=diagnosis.incident_type,
+        )
+        return plan

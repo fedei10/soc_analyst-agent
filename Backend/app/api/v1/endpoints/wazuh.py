@@ -42,6 +42,14 @@ GatewayDep = Annotated[WazuhGateway, Depends(get_wazuh_gateway)]
 ResponderDep = Annotated[WazuhResponderClient, Depends(get_wazuh_responder)]
 
 
+async def require_direct_response_mode() -> None:
+    raise HTTPException(
+        409,
+        "Direct Wazuh response actions are retired. Use the formal "
+        "investigation approval and execution workflow.",
+    )
+
+
 def _wz(gateway: WazuhGateway, path: str, **params: Any) -> dict[str, Any]:
     """GET a Wazuh server API path and unwrap its data object."""
     clean = {k: v for k, v in params.items() if v is not None}
@@ -383,10 +391,14 @@ def vulnerabilities_summary(gateway: GatewayDep):
 
 
 # -------------------------
-# Response actions — wazuh:write, human-approved, audited
+# Retired direct response routes retained only for a stable rejection contract.
 # -------------------------
 
-@write.post("/agents/{agent_id}/active-response", status_code=202)
+@write.post(
+    "/agents/{agent_id}/active-response",
+    status_code=202,
+    dependencies=[Depends(require_direct_response_mode)],
+)
 def run_active_response(
     body: ActiveResponseRequest,
     agent_id: AgentId,
@@ -394,8 +406,9 @@ def run_active_response(
     responder: ResponderDep,
 ):
     """
-    Queue an active-response command on an agent (block IP, deny host, ...).
-    202: Wazuh queues the command; verify the effect via alerts/inventory reads.
+    Compatibility route that always rejects workflow-bypassing execution.
+
+    Normal operation must use the formal investigation approval workflow.
     """
     principal: AuthPrincipal = request.state.principal
     logger.info(
@@ -419,14 +432,18 @@ def run_active_response(
     }}
 
 
-@write.put("/agents/{agent_id}/restart", status_code=202)
+@write.put(
+    "/agents/{agent_id}/restart",
+    status_code=202,
+    dependencies=[Depends(require_direct_response_mode)],
+)
 def restart_agent(
     body: RestartAgentRequest,
     agent_id: AgentId,
     request: Request,
     responder: ResponderDep,
 ):
-    """Restart the Wazuh agent process on the endpoint."""
+    """Compatibility route that always rejects workflow-bypassing execution."""
     principal: AuthPrincipal = request.state.principal
     logger.info(
         "response_action_executed",

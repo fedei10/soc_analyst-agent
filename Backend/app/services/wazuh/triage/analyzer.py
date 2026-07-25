@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from app.mape_k.llm import LLMConfigurationError, LLMProvider, get_llm_provider
 from app.services.wazuh.normalization.schemas import SecurityFinding
 from app.services.wazuh.triage.schemas import EnrichmentResult, TriageVerdict
@@ -93,11 +95,16 @@ class TriageAnalyzer:
             },
             {
                 "role": "user",
-                "content": str(
+                "content": json.dumps(
                     {
                         "finding": finding.model_dump(mode="json"),
-                        "enrichment": [item.model_dump(mode="json") for item in enrichment],
-                    }
+                        "enrichment": [
+                            item.model_dump(mode="json")
+                            for item in enrichment
+                        ],
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
                 ),
             },
         ]

@@ -162,6 +162,7 @@ class AlertNormalizer(ABC):
             attack_details=details,
             evidence_refs=[normalized.evidence_ref],
             raw_document_ref=normalized.evidence_ref,
+            normalizer_name=type(self).__name__,
             normalization_quality=quality,
             missing_fields=missing,
         )

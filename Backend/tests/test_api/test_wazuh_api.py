@@ -146,7 +146,7 @@ def test_analyst_cannot_request_direct_response_actions(client, responder):
     assert restarted == []
 
 
-def test_write_token_uses_separate_responder(client, responder):
+def test_write_token_cannot_bypass_formal_response_workflow(client, responder):
     calls = {}
 
     def run_active_response(**kwargs):
@@ -159,14 +159,34 @@ def test_write_token_uses_separate_responder(client, responder):
         headers=WRITE,
         json={"command": "firewall-drop", "arguments": ["1.2.3.4"]},
     )
-    assert response.status_code == 202
-    assert response.json()["data"]["status"] == "queued"
-    assert calls["agent_id"] == "001"
-    assert calls["command"] == "firewall-drop"
-    assert response.json()["data"]["approved_by"] == "user_responder"
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "conflict"
+    assert "formal" in response.json()["error"]["message"].lower()
+    assert calls == {}
 
 
-def test_unknown_command_and_extra_fields_are_rejected(client):
+def test_write_token_cannot_restart_agent_directly(client, responder):
+    restarted = []
+    responder.restart_agent = restarted.append
+
+    response = client.put(
+        "/api/v1/agents/001/restart",
+        headers=WRITE,
+        json={},
+    )
+
+    assert response.status_code == 409
+    assert "formal" in response.json()["error"]["message"].lower()
+    assert restarted == []
+
+
+def test_direct_endpoint_rejects_all_payloads_even_if_mode_is_direct(
+    client,
+    monkeypatch,
+):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "MAPEK_EXECUTION_MODE", "direct")
     for body in (
         {"command": "rm-rf"},
         {},
@@ -175,7 +195,7 @@ def test_unknown_command_and_extra_fields_are_rejected(client):
         response = client.post(
             "/api/v1/agents/001/active-response", headers=WRITE, json=body
         )
-        assert response.status_code == 422, body
+        assert response.status_code == 409, body
 
 
 def test_non_json_body_is_415(client):

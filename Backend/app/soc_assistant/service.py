@@ -34,6 +34,7 @@ from app.services.wazuh.normalization.serializers import (
 )
 from app.services.wazuh.triage.service import run_triage
 from app.soc_assistant.catalog import public_catalog
+from app.soc_assistant.question_agent import SOCQuestionAgent
 from app.soc_assistant.router import AssistantIntentRouter
 from app.soc_assistant.references import (
     InvestigationReferenceError,
@@ -50,8 +51,8 @@ from app.soc_assistant.schemas import (
 INDICATOR_TYPES = {"ip", "domain", "hash", "process", "user", "path", "other"}
 RUNNING_ACTIVITY = {
     AssistantCommandName.CHAT: (
-        None,
-        "Reading the message",
+        "soc_question_agent",
+        "Preparing a read-only SOC answer",
     ),
     AssistantCommandName.ALERTS: (
         "search_alerts",
@@ -225,10 +226,95 @@ class SOCAssistant:
         gateway: WazuhGateway | None = None,
         investigations: InvestigationService | None = None,
         router: AssistantIntentRouter | None = None,
+        question_agent: SOCQuestionAgent | None = None,
     ) -> None:
         self.gateway = gateway or WazuhGateway()
         self.investigations = investigations or get_investigation_service()
         self.router = router or AssistantIntentRouter()
+        self.question_agent = question_agent or SOCQuestionAgent()
+
+    def _question_context(
+        self,
+        *,
+        recent_context: dict[str, str],
+        organization_id: str,
+    ) -> dict[str, Any]:
+        context: dict[str, Any] = {
+            "references": dict(recent_context),
+        }
+        alert_id = recent_context.get("wazuh_alert")
+        if alert_id:
+            try:
+                alert = get_alert_memory_repository().get_alert_by_document_id(
+                    alert_id
+                )
+            except Exception:
+                alert = None
+            if alert:
+                context["alert"] = {
+                    key: alert.get(key)
+                    for key in (
+                        "wazuh_document_id",
+                        "event_timestamp",
+                        "agent_id",
+                        "agent_name",
+                        "rule_id",
+                        "rule_level",
+                        "source_ip",
+                        "target_user",
+                        "event_type",
+                        "correlation_status",
+                    )
+                }
+
+        finding_id = recent_context.get("finding")
+        if finding_id:
+            try:
+                finding = get_finding_repository().get(
+                    finding_id,
+                    organization_id=settings.WAZUH_INGESTION_ORGANIZATION_ID,
+                )
+            except Exception:
+                finding = None
+            if finding:
+                context["finding"] = {
+                    "finding_id": finding["finding_id"],
+                    "status": finding.get("status"),
+                    "version": finding.get("version"),
+                    "finding": finding.get("finding"),
+                    "verdict": finding.get("verdict"),
+                }
+
+        investigation_id = recent_context.get("investigation")
+        if investigation_id:
+            try:
+                snapshot = self.investigations.snapshot(
+                    investigation_id,
+                    organization_id=organization_id,
+                )
+            except Exception:
+                snapshot = None
+            if snapshot:
+                context["investigation"] = {
+                    key: snapshot.get(key)
+                    for key in (
+                        "investigation_id",
+                        "alert_id",
+                        "finding_id",
+                        "agent_id",
+                        "status",
+                        "current_stage",
+                        "severity",
+                        "confidence",
+                        "diagnosis",
+                        "remediation_plan",
+                        "verification",
+                        "failure_code",
+                        "failure_reason",
+                        "pending_nodes",
+                    )
+                }
+        return context
 
     @staticmethod
     def _activity(
@@ -388,24 +474,66 @@ class SOCAssistant:
         organization_id: str,
         user_id: str,
         recent_context: dict[str, str] | None = None,
+        conversation_history: list[dict[str, str]] | None = None,
     ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
         if command == AssistantCommandName.CHAT:
+            question = str(arguments.get("question") or "").strip()
+            if question.lower() in {
+                "hi",
+                "hello",
+                "hey",
+                "yo",
+                "good morning",
+                "good afternoon",
+                "good evening",
+            }:
+                return (
+                    (
+                        "Hi. Ask me about an alert, finding, investigation, "
+                        "Wazuh, or defensive remediation."
+                    ),
+                    {
+                        "display_mode": "conversation",
+                        "answer_type": "greeting",
+                    },
+                    [],
+                    {},
+                )
+            try:
+                answer, answer_usage = self.question_agent.answer(
+                    question=question,
+                    context=self._question_context(
+                        recent_context=recent_context or {},
+                        organization_id=organization_id,
+                    ),
+                    history=conversation_history or [],
+                )
+            except Exception:
+                return (
+                    (
+                        "I could not generate the SOC explanation because the "
+                        "question-answer model is unavailable. Deterministic "
+                        "commands such as `/alerts`, `/status`, and `/health` "
+                        "are still available."
+                    ),
+                    {
+                        "display_mode": "conversation",
+                        "answer_type": "model_unavailable",
+                    },
+                    [],
+                    {},
+                )
             return (
-                (
-                    "Hi. I can route SOC requests to the right Wazuh tools. "
-                    "Ask for recent alerts, alert summaries, threat hunting, "
-                    "triage findings, investigation status, or a full investigation."
-                ),
+                answer.answer,
                 {
                     "display_mode": "conversation",
-                    "examples": [
-                        "give me the latest alerts",
-                        "triage high severity alerts from the last 6 hours",
-                        "hunt for 192.0.2.10",
-                        "investigate the alert returned by the previous search",
-                    ],
+                    "answer_type": "soc_question",
+                    "confidence": answer.confidence,
+                    "references": answer.references,
+                    "limitations": answer.limitations,
+                    "model_usage": answer_usage,
                 },
-                [],
+                ["soc_question_agent"],
                 {},
             )
 
@@ -1014,6 +1142,7 @@ class SOCAssistant:
         organization_id: str,
         user_id: str,
         recent_context: dict[str, str] | None = None,
+        conversation_history: list[dict[str, str]] | None = None,
     ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
         return self._execute(
             command,
@@ -1021,6 +1150,7 @@ class SOCAssistant:
             organization_id=organization_id,
             user_id=user_id,
             recent_context=recent_context,
+            conversation_history=conversation_history,
         )
 
     @traceable(
@@ -1042,6 +1172,7 @@ class SOCAssistant:
     ) -> AssistantResponse:
         active_conversation_id = conversation_id or uuid.uuid4().hex
         recent_context: dict[str, str] = {}
+        conversation_history: list[dict[str, str]] = []
         if database_url():
             try:
                 recent_context = (
@@ -1053,7 +1184,35 @@ class SOCAssistant:
                 )
             except Exception:
                 recent_context = {}
+            try:
+                from app.db.repositories.conversations import (
+                    get_conversation_repository,
+                )
+
+                conversation_repository = get_conversation_repository()
+                if conversation_repository.get_conversation(
+                    active_conversation_id,
+                    organization_id=organization_id,
+                ):
+                    conversation_history = [
+                        {
+                            "role": str(item["role"]),
+                            "content": str(item["content"]),
+                        }
+                        for item in conversation_repository.list_messages(
+                            active_conversation_id,
+                            organization_id=organization_id,
+                            limit=200,
+                        )[-8:]
+                        if item["role"] in {"user", "assistant"}
+                    ]
+            except Exception:
+                conversation_history = []
         intent, usage = routed or self._trace_route(message=message)
+        if intent.command == AssistantCommandName.CHAT:
+            intent.arguments["question"] = (
+                intent.arguments.get("question") or message
+            )
         if intent.command == AssistantCommandName.INVESTIGATE and not intent.arguments.get(
             "alert_id"
         ):
@@ -1082,6 +1241,7 @@ class SOCAssistant:
                 organization_id=organization_id,
                 user_id=user_id,
                 recent_context=recent_context,
+                conversation_history=conversation_history,
             )
             activities.append(
                 self._activity(

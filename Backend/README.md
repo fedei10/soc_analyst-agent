@@ -73,6 +73,11 @@ requests. Its server-owned capability catalog is exposed to the frontend for
 autocomplete. Ambiguous requests may use Oxy only for typed intent
 classification; provider failure does not disable known commands.
 
+Use `/ask <question>` or natural-language questions for read-only SOC
+explanations. The Oxy question agent receives only bounded conversation history
+and validated alert, finding, and investigation context. It cannot call write
+tools, approve actions, execute commands, or change workflow state.
+
 ## LangSmith
 
 Set `LANGSMITH_API_KEY`, `LANGSMITH_TRACING=true`, and

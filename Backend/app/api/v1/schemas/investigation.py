@@ -100,11 +100,11 @@ class ResponseActionHistoryItem(APIModel):
 
 
 class ApprovalDecisionInput(APIModel):
-    decision: ApprovalChoice
     approval_id: str = Field(min_length=1, max_length=100)
-    modified_actions: list[dict[str, Any]] | None = Field(
+    decision: Literal["approve", "reject"]
+    comment: str | None = Field(
         default=None,
-        max_length=10,
+        max_length=2000,
     )
 
 

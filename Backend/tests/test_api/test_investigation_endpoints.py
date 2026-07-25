@@ -7,6 +7,7 @@ from app.api.auth.deps import AuthPrincipal
 from app.api.v1.endpoints import investigations
 from app.api.v1.schemas.investigation import (
     AgentChatRequest,
+    ApprovalDecisionInput,
     InvestigationCreate,
     L1Result,
     L2Result,
@@ -52,6 +53,10 @@ def test_investigation_and_chat_routes_are_registered():
     assert "/api/v1/investigations/{investigation_id}" in paths
     assert "/api/v1/investigations/{investigation_id}/approval" in paths
     assert "/api/v1/investigations/{investigation_id}/execute" in paths
+    assert (
+        "/api/v1/investigations/{investigation_id}/verification/resume"
+        in paths
+    )
     assert "/api/v1/investigations/{investigation_id}/report" in paths
     assert "/api/v1/investigations/{investigation_id}/tier-reports" in paths
     assert "/api/v1/investigations/{investigation_id}/agent-runs" in paths
@@ -106,6 +111,95 @@ def test_public_api_data_hides_internal_scope():
         "organization_id": "user_test",
         "nested": [{"organization_id": "user_test", "status": "running"}],
     }) == {"nested": [{"status": "running"}]}
+
+
+def test_approval_endpoint_uses_verified_server_actor(monkeypatch):
+    captured = {}
+    principal = AuthPrincipal(
+        user_id="user_analyst",
+        session_id="sess_analyst",
+        scope_id="user_analyst",
+        roles=("soc_l1", "soc_l2"),
+    )
+
+    class FakeService:
+        def submit_approval(self, investigation_id, **kwargs):
+            captured["investigation_id"] = investigation_id
+            captured.update(kwargs)
+            return {
+                "investigation_id": investigation_id,
+                "organization_id": principal.scope_id,
+                "pending_nodes": ["execution_authorization"],
+                "audit_events": [],
+            }
+
+    monkeypatch.setattr(
+        investigations,
+        "_snapshot",
+        lambda *args, **kwargs: {"pending_nodes": ["human_approval"]},
+    )
+    monkeypatch.setattr(
+        investigations,
+        "get_investigation_service",
+        lambda: FakeService(),
+    )
+    monkeypatch.setattr(investigations, "_publish_activity", lambda _: None)
+
+    investigations.decide_investigation(
+        "INV-001",
+        ApprovalDecisionInput(
+            approval_id="APR-001",
+            decision="approve",
+            comment="Approved for temporary containment.",
+        ),
+        principal,
+    )
+
+    assert captured["actor_user_id"] == "user_analyst"
+    assert captured["actor_roles"] == principal.roles
+    assert captured["organization_id"] == principal.scope_id
+    assert "approved_by" not in captured
+    assert "approver_roles" not in captured
+
+
+def test_verification_resume_uses_verified_server_actor(monkeypatch):
+    captured = {}
+    principal = AuthPrincipal(
+        user_id="user_executor",
+        session_id="sess_executor",
+        scope_id="user_executor",
+        roles=("soc_l1", "soc_l3"),
+    )
+
+    class FakeService:
+        def resume_verification(self, investigation_id, **kwargs):
+            captured["investigation_id"] = investigation_id
+            captured.update(kwargs)
+            return {
+                "investigation_id": investigation_id,
+                "organization_id": principal.scope_id,
+                "pending_nodes": [],
+                "audit_events": [],
+            }
+
+    monkeypatch.setattr(
+        investigations,
+        "get_investigation_service",
+        lambda: FakeService(),
+    )
+    monkeypatch.setattr(investigations, "_publish_activity", lambda _: None)
+
+    investigations.resume_investigation_verification(
+        "INV-001",
+        principal,
+    )
+
+    assert captured == {
+        "investigation_id": "INV-001",
+        "resumed_by": "user_executor",
+        "executor_roles": principal.roles,
+        "organization_id": principal.scope_id,
+    }
 
 
 def test_tier_agent_chat_is_retired():

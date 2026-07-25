@@ -1,7 +1,11 @@
 import pytest
 from pydantic import ValidationError
 
-from app.api.v1.schemas.investigation import L1Result, ProposedAction
+from app.api.v1.schemas.investigation import (
+    ApprovalDecisionInput,
+    L1Result,
+    ProposedAction,
+)
 
 
 def test_l1_result_accepts_valid_output():
@@ -100,3 +104,30 @@ def test_action_risk_cannot_be_informational():
             risk_level="informational",
             operational_impact="None",
         )
+
+
+@pytest.mark.parametrize(
+    "injected_field",
+    ("approved_by", "approver_roles", "actor_user_id", "actor_roles"),
+)
+def test_approval_input_rejects_client_supplied_identity(injected_field):
+    with pytest.raises(ValidationError):
+        ApprovalDecisionInput.model_validate({
+            "approval_id": "APR-001",
+            "decision": "approve",
+            injected_field: ["soc_l3"] if "roles" in injected_field else "attacker",
+        })
+
+
+def test_approval_input_accepts_only_decision_and_comment():
+    submission = ApprovalDecisionInput(
+        approval_id="APR-001",
+        decision="reject",
+        comment="Evidence is incomplete.",
+    )
+
+    assert submission.model_dump() == {
+        "approval_id": "APR-001",
+        "decision": "reject",
+        "comment": "Evidence is incomplete.",
+    }

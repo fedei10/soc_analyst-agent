@@ -5,6 +5,22 @@ from app.soc_assistant.schemas import AssistantCommand, AssistantCommandName
 
 COMMANDS = (
     AssistantCommand(
+        name=AssistantCommandName.CHAT,
+        slash="/ask",
+        aliases=["/question"],
+        title="Ask the SOC analyst",
+        description=(
+            "Ask a read-only SOC question using bounded conversation and "
+            "workflow context."
+        ),
+        usage="/ask <question>",
+        category="Analyze",
+        examples=[
+            "/ask What does this finding mean?",
+            "/ask How should I remediate this alert?",
+        ],
+    ),
+    AssistantCommand(
         name=AssistantCommandName.ALERTS,
         slash="/alerts",
         aliases=["/alert", "/recent"],
