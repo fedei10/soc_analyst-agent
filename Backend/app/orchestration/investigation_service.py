@@ -32,10 +32,35 @@ from app.db.repositories.investigations import (
     ResponseExecutionConflictError,
     get_investigation_repository,
 )
+from app.services.telegram.notifier import (
+    format_approval_alert,
+    format_escalation_alert,
+    get_telegram_notifier,
+)
 
 
 class InvestigationNotFoundError(LookupError):
     pass
+
+
+def _notify_investigation_transition(snapshot: dict[str, Any]) -> None:
+    status = str(snapshot.get("status") or "")
+    if status == "awaiting_approval" and not settings.TELEGRAM_NOTIFY_APPROVALS:
+        return
+    if status not in {"awaiting_approval", "escalated", "failed"}:
+        return
+    try:
+        notifier = get_telegram_notifier()
+        if not notifier.configured:
+            return
+        message = (
+            format_approval_alert(snapshot)
+            if status == "awaiting_approval"
+            else format_escalation_alert(snapshot)
+        )
+        notifier.send(message)
+    except Exception:
+        pass
 
 
 def _json_safe(value: Any) -> Any:
@@ -48,6 +73,22 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
     return value
+
+
+_SEVERITY_RANK = {
+    "informational": 0,
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+    "critical": 4,
+}
+
+
+def _worst_severity(findings: list[dict[str, Any]]) -> str | None:
+    severities = [item.get("severity") for item in findings if item.get("severity")]
+    if not severities:
+        return None
+    return max(severities, key=lambda value: _SEVERITY_RANK.get(value, -1))
 
 
 class InvestigationService:
@@ -167,23 +208,17 @@ class InvestigationService:
                 state,
                 config=investigation_config(investigation_id),
             )
-            return self.snapshot(investigation_id)
+            return self._sync_snapshot(investigation_id)
 
-    def snapshot(
+    def _checkpoint_view(
         self,
         investigation_id: str,
         *,
         organization_id: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         snapshot = self.graph.get_state(investigation_config(investigation_id))
         if not snapshot.values:
-            stored = self.repository.get_snapshot(
-                investigation_id,
-                organization_id=organization_id or "local",
-            )
-            if stored is None:
-                raise InvestigationNotFoundError(investigation_id)
-            return stored
+            return None
 
         state = _json_safe(dict(snapshot.values))
         state_organization = str(state.get("organization_id") or "local")
@@ -227,11 +262,7 @@ class InvestigationService:
             "status": state["status"],
             "stage": state.get("stage"),
             "current_stage": state["current_stage"],
-            "severity": (
-                (state.get("findings") or [{}])[0].get("severity")
-                if state.get("findings")
-                else None
-            ),
+            "severity": _worst_severity(state.get("findings") or []),
             "confidence": (
                 state.get("diagnosis", {}).get("confidence")
                 if isinstance(state.get("diagnosis"), dict)
@@ -293,6 +324,63 @@ class InvestigationService:
             "specialist_runs": [],
             "pending_nodes": list(snapshot.next),
         }
+        return result
+
+    def snapshot(
+        self,
+        investigation_id: str,
+        *,
+        organization_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Read-only public view; never writes.
+
+        Persistence happens on workflow transitions via _sync_snapshot.
+        """
+        result = self._checkpoint_view(
+            investigation_id,
+            organization_id=organization_id,
+        )
+        if result is None:
+            stored = self.repository.get_snapshot(
+                investigation_id,
+                organization_id=organization_id or "local",
+            )
+            if stored is None:
+                raise InvestigationNotFoundError(investigation_id)
+            return stored
+        state_organization = str(result["organization_id"])
+        persisted = self.repository.get_snapshot(
+            investigation_id,
+            organization_id=state_organization,
+        )
+        result["state_version"] = (
+            int(persisted.get("state_version") or 0)
+            if persisted is not None
+            else 0
+        )
+        result["tier_reports"] = self.repository.list_tier_reports(
+            investigation_id,
+            organization_id=state_organization,
+        )
+        return result
+
+    def _sync_snapshot(
+        self,
+        investigation_id: str,
+        *,
+        organization_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist the checkpoint view after a graph transition."""
+        result = self._checkpoint_view(
+            investigation_id,
+            organization_id=organization_id,
+        )
+        if result is None:
+            return self.snapshot(
+                investigation_id,
+                organization_id=organization_id,
+            )
+        state_organization = str(result["organization_id"])
         with self._lock:
             persisted = self.repository.get_snapshot(
                 investigation_id,
@@ -311,6 +399,7 @@ class InvestigationService:
                 investigation_id,
                 organization_id=state_organization,
             )
+        _notify_investigation_transition(result)
         return result
 
     def active_for_alert(
@@ -357,15 +446,11 @@ class InvestigationService:
                 ) from exc
         try:
             with self._lock:
-                self.snapshot(
-                    investigation_id,
-                    organization_id=organization_id,
-                )
                 self.graph.invoke(
                     Command(resume=command_payload),
                     config=investigation_config(investigation_id),
                 )
-                return self.snapshot(
+                return self._sync_snapshot(
                     investigation_id,
                     organization_id=organization_id,
                 )

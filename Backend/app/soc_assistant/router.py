@@ -28,6 +28,20 @@ FLAG_OPTIONS = {
     "--all": "all_results",
 }
 
+# Bare, targetless imperatives ("analyze them", "check these", "what do you
+# think", a lone "investigate") name nothing concrete to filter on. Routing
+# these into the tool-calling chat agent invites it to chain several broad
+# searches (each a real LLM call) before finding anything to say. Short-
+# circuit to one deterministic, zero-LLM alert summary instead and let the
+# user name a specific alert/agent/IP/time range for anything deeper.
+VAGUE_NO_TARGET_PATTERN = re.compile(
+    r"(?:analyze|analyse|check|review|look at|look into)\s+"
+    r"(?:them|these|those|it)"
+    r"|investigate"
+    r"|what do you think"
+    r"|any\s*(?:thing)?\s*suspicious"
+)
+
 
 class AssistantIntentRouter:
     def __init__(self, llm: LLMProvider | None = None) -> None:
@@ -117,6 +131,11 @@ class AssistantIntentRouter:
         lower = message.lower()
         stripped = re.sub(r"[^\w\s]", "", lower).strip()
         normalized = re.sub(r"\bmape-?k\b", "mapek", lower)
+        if VAGUE_NO_TARGET_PATTERN.fullmatch(stripped):
+            return AssistantIntent(
+                command=AssistantCommandName.SUMMARY,
+                arguments={"vague_fallback": True},
+            )
         investigation = re.search(r"\bINV-[A-Za-z0-9-]+\b", message, re.I)
         alert = re.search(
             r"(?:alert(?:\s+id)?|mapek|investigate)\s*[:#]?\s+([A-Za-z0-9_.-]{3,256})",
@@ -159,6 +178,17 @@ class AssistantIntentRouter:
             return AssistantIntent(
                 command=AssistantCommandName.INVESTIGATE,
                 arguments={"alert_id": alert.group(1)} if alert else {},
+            )
+        if "investigate" in lower:
+            # Casual phrasing ("could u investigate him 1.2.3.4") that isn't
+            # a formal /investigate <alert_id> request. The formal workflow
+            # needs a specific Wazuh alert ID; anything looser is a search
+            # and correlation question the chat tool agent can actually
+            # answer (it can look up the indicator, related alerts, and
+            # endpoint context on its own).
+            return AssistantIntent(
+                command=AssistantCommandName.CHAT,
+                arguments={"question": message},
             )
         if any(phrase in lower for phrase in ("threat hunt", "hunt for", "search for ioc", "search telemetry")):
             indicator, indicator_type = self._indicator(message)
@@ -247,14 +277,27 @@ class AssistantIntentRouter:
                 update={"source": "oxy"}
             )
             if routed.confidence < 0.65:
-                routed = AssistantIntent(command=AssistantCommandName.HELP)
+                # An uncertain classification is not a reason to dead-end the
+                # user at a menu message - hand the raw message to the
+                # general-purpose (read-only) chat capability instead, which
+                # can actually search and answer it.
+                routed = AssistantIntent(
+                    command=AssistantCommandName.CHAT,
+                    arguments={"question": message},
+                    confidence=routed.confidence,
+                    source="oxy",
+                )
             return routed, usage
         except Exception:
             # Slash commands and deterministic natural-language routes must stay
             # available when the optional intent-classification call is down.
+            # Route to chat rather than a dead-end HELP message: the chat path
+            # has its own graceful "model unavailable" fallback, so the user
+            # gets an honest answer either way instead of a non-sequitur menu.
             return (
                 AssistantIntent(
-                    command=AssistantCommandName.HELP,
+                    command=AssistantCommandName.CHAT,
+                    arguments={"question": message},
                     confidence=0,
                     source="fallback",
                 ),

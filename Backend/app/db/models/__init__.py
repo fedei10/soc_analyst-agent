@@ -27,8 +27,10 @@ from app.db.models.investigation import (
     ToolExecutionRecord,
     UserRecord,
 )
+from app.db.models.report import AnalystReportRecord
 
 __all__ = [
+    "AnalystReportRecord",
     "AgentRunRecord",
     "ApprovalRecord",
     "AuditEventRecord",

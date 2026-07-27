@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from threading import RLock
 from typing import Any
@@ -27,12 +28,23 @@ from app.db.models.alert_memory import (
 from app.db.models.finding import FindingRecord
 from app.db.sanitization import bounded_excerpt, sanitize_for_storage
 from app.db.session import database_url, get_session_factory, init_database
-from app.services.wazuh.models import AlertIngestionDocument
+from app.services.wazuh.models import (
+    AlertIngestionDocument,
+    AlertPagePersistenceResult,
+)
 from app.services.wazuh.normalization.registry import normalize_alerts
 
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def _fingerprint(document: AlertIngestionDocument) -> str:
@@ -56,6 +68,7 @@ def _alert_dict(record: WazuhAlertRecord) -> dict[str, Any]:
         "wazuh_document_id": record.wazuh_document_id,
         "wazuh_index": record.wazuh_index,
         "event_timestamp": record.event_timestamp,
+        "ingested_at": record.ingested_at,
         "agent_id": record.agent_id,
         "agent_name": record.agent_name,
         "rule_id": record.rule_id,
@@ -99,6 +112,7 @@ class InMemoryAlertMemoryRepository:
                     "wazuh_document_id": document.document_id,
                     "wazuh_index": document.index_name,
                     "event_timestamp": alert.timestamp,
+                    "ingested_at": _now(),
                     "agent_id": alert.agent_id,
                     "agent_name": alert.agent_name,
                     "rule_id": alert.rule_id,
@@ -136,7 +150,7 @@ class InMemoryAlertMemoryRepository:
         with self._lock:
             alerts = list(self._alerts.values())
         return sum(
-            alert["event_timestamp"] > since
+            alert["ingested_at"] > since
             and alert["rule_level"] >= min_level
             and (agent_id is None or alert["agent_id"] == agent_id)
             for alert in alerts
@@ -212,43 +226,187 @@ class SQLAlchemyAlertMemoryRepository:
             source_name="wazuh-validation",
             documents=[document],
             search_after=document.sort_values or None,
+            advance_checkpoint=False,
         )
         record = self.get_alert_by_document_id(document.document_id)
         if record is None:
             raise RuntimeError("Alert persistence did not produce a record.")
         return record
 
-    def checkpoint(self, source_name: str) -> dict[str, Any] | None:
+    @staticmethod
+    def _checkpoint_data(
+        record: IngestionCheckpointRecord,
+    ) -> dict[str, Any]:
+        return {
+            "source_name": record.source_name,
+            "connection_profile_id": record.connection_profile_id,
+            "index_pattern": record.index_pattern,
+            "cursor_version": record.cursor_version,
+            "last_event_timestamp": record.last_event_timestamp,
+            "last_index_name": record.last_index_name,
+            "last_document_id": record.last_document_id,
+            "search_after": deepcopy(record.search_after),
+            "last_run_started_at": record.last_run_started_at,
+            "previous_run_completed_at": record.previous_run_completed_at,
+            "last_run_completed_at": record.last_run_completed_at,
+            "last_alert_count": record.last_alert_count,
+            "last_duplicate_count": record.last_duplicate_count,
+            "last_finding_count": record.last_finding_count,
+            "last_updated_finding_count": record.last_updated_finding_count,
+            "last_incident_count": record.last_incident_count,
+            "highest_new_rule_level": record.highest_new_rule_level,
+            "last_cursor_advanced": record.last_cursor_advanced,
+            "last_truncated": record.last_truncated,
+            "status": record.status,
+            "error_message": record.error_message,
+            "lease_expires_at": record.lease_expires_at,
+        }
+
+    @staticmethod
+    def _ensure_checkpoint(
+        session: Session,
+        *,
+        source_name: str,
+        connection_profile_id: str,
+        index_pattern: str,
+    ) -> IngestionCheckpointRecord:
+        dialect_insert = (
+            insert
+            if session.bind is not None
+            and session.bind.dialect.name == "postgresql"
+            else sqlite_insert
+        )
+        session.execute(
+            dialect_insert(IngestionCheckpointRecord)
+            .values(
+                source_name=source_name,
+                connection_profile_id=connection_profile_id,
+                index_pattern=index_pattern,
+                cursor_version=1,
+                last_alert_count=0,
+                last_duplicate_count=0,
+                last_finding_count=0,
+                last_updated_finding_count=0,
+                last_incident_count=0,
+                last_cursor_advanced=False,
+                last_truncated=False,
+                status="idle",
+                updated_at=_now(),
+            )
+            .on_conflict_do_nothing(index_elements=["source_name"])
+        )
+        record = session.get(
+            IngestionCheckpointRecord,
+            source_name,
+            with_for_update=True,
+        )
+        if record is None:
+            raise RuntimeError("Ingestion checkpoint could not be created.")
+        if (
+            record.connection_profile_id != connection_profile_id
+            or record.index_pattern != index_pattern
+        ):
+            raise RuntimeError(
+                "Ingestion cursor scope does not match its connection profile "
+                "and index pattern."
+            )
+        return record
+
+    def checkpoint(
+        self,
+        source_name: str,
+        *,
+        connection_profile_id: str | None = None,
+        index_pattern: str | None = None,
+    ) -> dict[str, Any] | None:
         with self._session_factory() as session:
             record = session.get(IngestionCheckpointRecord, source_name)
             if record is None:
                 return None
-            return {
-                "source_name": record.source_name,
-                "last_event_timestamp": record.last_event_timestamp,
-                "last_document_id": record.last_document_id,
-                "search_after": deepcopy(record.search_after),
-                "last_run_started_at": record.last_run_started_at,
-                "last_run_completed_at": record.last_run_completed_at,
-                "last_alert_count": record.last_alert_count,
-                "status": record.status,
-                "error_message": record.error_message,
-            }
+            if (
+                connection_profile_id is not None
+                and record.connection_profile_id != connection_profile_id
+            ):
+                return None
+            if index_pattern is not None and record.index_pattern != index_pattern:
+                return None
+            return self._checkpoint_data(record)
 
-    def mark_ingestion_started(self, source_name: str) -> None:
+    def claim_ingestion(
+        self,
+        source_name: str,
+        *,
+        connection_profile_id: str,
+        index_pattern: str,
+        lease_token: str | None = None,
+        lease_ttl_seconds: int,
+    ) -> str | None:
+        token = lease_token or secrets.token_urlsafe(24)
         now = _now()
         with self._session_factory.begin() as session:
-            record = session.get(IngestionCheckpointRecord, source_name)
-            if record is None:
-                record = IngestionCheckpointRecord(
-                    source_name=source_name,
-                    last_alert_count=0,
-                )
-                session.add(record)
+            record = self._ensure_checkpoint(
+                session,
+                source_name=source_name,
+                connection_profile_id=connection_profile_id,
+                index_pattern=index_pattern,
+            )
+            if (
+                record.lease_token
+                and record.lease_token != token
+                and record.lease_expires_at
+                and _as_utc(record.lease_expires_at) > now
+            ):
+                return None
+            record.lease_token = token
+            record.lease_expires_at = now + timedelta(
+                seconds=max(lease_ttl_seconds, 1)
+            )
             record.status = "running"
             record.error_message = None
             record.last_run_started_at = now
             record.updated_at = now
+        return token
+
+    def renew_ingestion_claim(
+        self,
+        source_name: str,
+        *,
+        lease_token: str,
+        lease_ttl_seconds: int,
+    ) -> bool:
+        now = _now()
+        with self._session_factory.begin() as session:
+            record = session.get(
+                IngestionCheckpointRecord,
+                source_name,
+                with_for_update=True,
+            )
+            if record is None or record.lease_token != lease_token:
+                return False
+            record.lease_expires_at = now + timedelta(
+                seconds=max(lease_ttl_seconds, 1)
+            )
+            record.updated_at = now
+            return True
+
+    def release_ingestion_claim(
+        self,
+        source_name: str,
+        *,
+        lease_token: str,
+    ) -> bool:
+        with self._session_factory.begin() as session:
+            record = session.get(
+                IngestionCheckpointRecord,
+                source_name,
+                with_for_update=True,
+            )
+            if record is None or record.lease_token != lease_token:
+                return False
+            record.lease_token = None
+            record.lease_expires_at = None
+            record.updated_at = _now()
+            return True
 
     def mark_ingestion_failed(self, source_name: str, error: Exception) -> None:
         now = _now()
@@ -257,6 +415,8 @@ class SQLAlchemyAlertMemoryRepository:
             if record is None:
                 record = IngestionCheckpointRecord(
                     source_name=source_name,
+                    connection_profile_id="default",
+                    index_pattern="wazuh-alerts-*",
                     last_alert_count=0,
                 )
                 session.add(record)
@@ -269,6 +429,13 @@ class SQLAlchemyAlertMemoryRepository:
         source_name: str,
         *,
         alert_count: int,
+        duplicate_count: int = 0,
+        finding_count: int = 0,
+        updated_finding_count: int = 0,
+        incident_count: int = 0,
+        highest_new_rule_level: int | None = None,
+        cursor_advanced: bool = False,
+        truncated: bool = False,
     ) -> None:
         now = _now()
         with self._session_factory.begin() as session:
@@ -276,8 +443,16 @@ class SQLAlchemyAlertMemoryRepository:
             if record is None:
                 record = IngestionCheckpointRecord(source_name=source_name)
                 session.add(record)
+            record.previous_run_completed_at = record.last_run_completed_at
             record.last_run_completed_at = now
             record.last_alert_count = alert_count
+            record.last_duplicate_count = duplicate_count
+            record.last_finding_count = finding_count
+            record.last_updated_finding_count = updated_finding_count
+            record.last_incident_count = incident_count
+            record.highest_new_rule_level = highest_new_rule_level
+            record.last_cursor_advanced = cursor_advanced
+            record.last_truncated = truncated
             record.status = "idle"
             record.error_message = None
             record.updated_at = now
@@ -288,10 +463,34 @@ class SQLAlchemyAlertMemoryRepository:
         source_name: str,
         documents: list[AlertIngestionDocument],
         search_after: list[Any] | None,
+        connection_profile_id: str = "default",
+        index_pattern: str = "wazuh-alerts-*",
+        advance_checkpoint: bool = True,
     ) -> int:
-        """Insert and normalize a page, then atomically commit its checkpoint."""
+        return self.ingest_page_result(
+            source_name=source_name,
+            documents=documents,
+            search_after=search_after,
+            connection_profile_id=connection_profile_id,
+            index_pattern=index_pattern,
+            advance_checkpoint=advance_checkpoint,
+        ).inserted_count
+
+    def ingest_page_result(
+        self,
+        *,
+        source_name: str,
+        documents: list[AlertIngestionDocument],
+        search_after: list[Any] | None,
+        connection_profile_id: str = "default",
+        index_pattern: str = "wazuh-alerts-*",
+        advance_checkpoint: bool = True,
+    ) -> AlertPagePersistenceResult:
+        """Persist one page and monotonically advance its durable high-water mark."""
 
         inserted = 0
+        highest_new_rule_level: int | None = None
+        cursor_advanced = False
         now = _now()
         with self._session_factory.begin() as session:
             dialect_insert = (
@@ -359,26 +558,51 @@ class SQLAlchemyAlertMemoryRepository:
                     )
                 )
                 inserted += 1
-
-            checkpoint = session.get(IngestionCheckpointRecord, source_name)
-            if checkpoint is None:
-                checkpoint = IngestionCheckpointRecord(
-                    source_name=source_name,
+                highest_new_rule_level = max(
+                    highest_new_rule_level or 0,
+                    int(alert.rule_level),
                 )
-                session.add(checkpoint)
-            last = documents[-1] if documents else None
-            checkpoint.last_event_timestamp = (
-                last.normalized.timestamp
-                if last
-                else checkpoint.last_event_timestamp
-            )
-            checkpoint.last_document_id = (
-                last.document_id if last else checkpoint.last_document_id
-            )
-            if documents:
-                checkpoint.search_after = search_after
-            checkpoint.updated_at = now
-        return inserted
+
+            if advance_checkpoint:
+                checkpoint = self._ensure_checkpoint(
+                    session,
+                    source_name=source_name,
+                    connection_profile_id=connection_profile_id,
+                    index_pattern=index_pattern,
+                )
+                last = documents[-1] if documents else None
+                current_position = (
+                    _as_utc(checkpoint.last_event_timestamp),
+                    checkpoint.last_index_name or "",
+                    checkpoint.last_document_id or "",
+                )
+                candidate_position = (
+                    _as_utc(last.normalized.timestamp),
+                    last.index_name,
+                    last.document_id,
+                ) if last else None
+                if (
+                    candidate_position is not None
+                    and (
+                        current_position[0] is None
+                        or candidate_position > current_position
+                    )
+                ):
+                    checkpoint.last_event_timestamp = candidate_position[0]
+                    checkpoint.last_index_name = candidate_position[1]
+                    checkpoint.last_document_id = candidate_position[2]
+                    cursor_advanced = True
+                # search_after is the scan cursor. It can move through an
+                # overlap page even when the durable high-water mark does not.
+                if documents:
+                    checkpoint.search_after = search_after
+                checkpoint.updated_at = now
+        return AlertPagePersistenceResult(
+            inserted_count=inserted,
+            duplicate_count=max(len(documents) - inserted, 0),
+            highest_new_rule_level=highest_new_rule_level,
+            cursor_advanced=cursor_advanced,
+        )
 
     def get_user_cursor(self, user_id: str) -> datetime | None:
         with self._session_factory() as session:
@@ -416,7 +640,7 @@ class SQLAlchemyAlertMemoryRepository:
         min_level: int = 0,
     ) -> int:
         statement = select(func.count(WazuhAlertRecord.id)).where(
-            WazuhAlertRecord.event_timestamp > since,
+            WazuhAlertRecord.ingested_at > since,
             WazuhAlertRecord.rule_level >= min_level,
         )
         if agent_id:

@@ -4,10 +4,19 @@ from __future__ import annotations
 
 import json
 
-from app.mape_k.llm import LLMConfigurationError, LLMProvider, get_llm_provider
+import structlog
+
+from app.mape_k.llm import (
+    LLMConfigurationError,
+    LLMInvocationError,
+    LLMProvider,
+    get_llm_provider,
+)
 from app.services.wazuh.normalization.schemas import SecurityFinding
 from app.services.wazuh.triage.schemas import EnrichmentResult, TriageVerdict
 
+
+logger = structlog.get_logger("tsage.wazuh.triage")
 
 # event_type -> deterministic verdict label. Anything not listed falls back to the LLM.
 DETERMINISTIC_VERDICTS: dict[str, str] = {
@@ -78,11 +87,28 @@ class TriageAnalyzer:
         self,
         finding: SecurityFinding,
         enrichment: list[EnrichmentResult],
+        *,
+        allow_model: bool = True,
     ) -> TriageVerdict:
         deterministic = self._deterministic(finding, enrichment)
         if deterministic is not None:
             self._validate_evidence(deterministic, finding)
             return deterministic
+
+        if not allow_model:
+            return TriageVerdict(
+                verdict="inconclusive",
+                confidence=0.0,
+                severity=finding.severity,
+                summary=finding.summary,
+                evidence_refs=finding.evidence_refs,
+                escalation_recommended=finding.investigation_recommended,
+                missing_evidence=[
+                    "The deterministic monitor has no verdict rule for this event type.",
+                ],
+                deterministic=True,
+                reason_code="MONITOR_RULE_UNAVAILABLE",
+            )
 
         messages = [
             {
@@ -112,7 +138,15 @@ class TriageAnalyzer:
             result, _usage = self.llm.invoke_structured(TriageVerdict, messages)
             verdict = TriageVerdict.model_validate(result)
             self._validate_evidence(verdict, finding)
-        except LLMConfigurationError:
+        except (LLMConfigurationError, LLMInvocationError) as exc:
+            reason_code = "LLM_UNAVAILABLE"
+            if isinstance(exc, LLMInvocationError):
+                reason_code = exc.code.value
+                logger.warning(
+                    "triage_model_degraded",
+                    finding_id=finding.finding_id,
+                    **exc.safe_metadata(),
+                )
             verdict = TriageVerdict(
                 verdict="inconclusive",
                 confidence=0.0,
@@ -124,6 +158,6 @@ class TriageAnalyzer:
                     "Semantic triage is unavailable and no deterministic rule matched.",
                 ],
                 deterministic=False,
-                reason_code="LLM_UNAVAILABLE",
+                reason_code=reason_code,
             )
         return verdict

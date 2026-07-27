@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 
 class ServiceCheck(BaseModel):
-    status: Literal["healthy", "unhealthy"]
+    status: Literal["healthy", "unhealthy", "disabled"]
     # present when healthy
     cluster_status: str | None = None
     nodes: int | None = None

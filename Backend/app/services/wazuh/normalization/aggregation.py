@@ -171,16 +171,17 @@ def _unique(values: list[str | None]) -> list[str]:
     return list(dict.fromkeys(value for value in values if value))
 
 
-def aggregate_alerts(
+def _aggregate_alerts(
     envelopes: list[AlertEnvelope],
     *,
     max_evidence_refs: int | None = None,
-) -> list[AlertGroup]:
+) -> tuple[list[AlertGroup], dict[str, list[str]]]:
     started = time.perf_counter()
     limit = max_evidence_refs or settings.MAX_EVIDENCE_REFS_PER_FINDING
     grouped = _windowed_groups(envelopes)
 
     results = []
+    memberships: dict[str, list[str]] = {}
     for key, items in grouped.items():
         alerts = [item.normalized for item in items]
         evidence_refs = _unique(
@@ -203,6 +204,7 @@ def aggregate_alerts(
             alerts,
             key=lambda item: (item.rule_level, item.timestamp),
         )
+        memberships[group_id] = evidence_refs
         results.append(
             AlertGroup(
                 group_id=group_id,
@@ -252,7 +254,32 @@ def aggregate_alerts(
         ),
         duration_ms=round((time.perf_counter() - started) * 1000, 2),
     )
-    return results
+    return results, memberships
+
+
+def aggregate_alerts(
+    envelopes: list[AlertEnvelope],
+    *,
+    max_evidence_refs: int | None = None,
+) -> list[AlertGroup]:
+    groups, _memberships = _aggregate_alerts(
+        envelopes,
+        max_evidence_refs=max_evidence_refs,
+    )
+    return groups
+
+
+def aggregate_alerts_with_memberships(
+    envelopes: list[AlertEnvelope],
+    *,
+    max_evidence_refs: int | None = None,
+) -> tuple[list[AlertGroup], dict[str, list[str]]]:
+    """Return bounded groups plus complete internal evidence membership."""
+
+    return _aggregate_alerts(
+        envelopes,
+        max_evidence_refs=max_evidence_refs,
+    )
 
 
 def build_findings(groups: list[AlertGroup]) -> list[SecurityFinding]:

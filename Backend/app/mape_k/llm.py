@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
+from collections import deque
 from enum import StrEnum
 from functools import lru_cache
 from typing import Any
 
 import httpx
+from openai import RateLimitError
 from pydantic import BaseModel, ValidationError
 
 from app.config import settings
@@ -143,6 +146,88 @@ def classify_llm_error(
     )
 
 
+def is_rate_limit_error(exc: BaseException) -> bool:
+    """True if exc, or anything it wraps, is a provider 429.
+
+    LangGraph/LangChain often re-raise the original provider error inside
+    another exception (e.g. a graph-step failure) - walk __cause__/__context__
+    so a rate limit stays recognizable however many layers deep it surfaces.
+    """
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, RateLimitError):
+            return True
+        if (
+            isinstance(current, LLMInvocationError)
+            and current.code == LLMErrorCode.MODEL_RATE_LIMITED
+        ):
+            return True
+        if _status_code(current) == 429:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+class LLMRateLimitedError(RuntimeError):
+    def __init__(self, wait_seconds: float) -> None:
+        super().__init__(
+            "LLM rate limit budget exhausted; the next free slot is "
+            f"{wait_seconds:.1f}s away."
+        )
+        self.wait_seconds = wait_seconds
+
+
+class LLMRateLimiter:
+    """Process-wide sliding-window gate shared by every real LLM call.
+
+    The provider enforces a hard per-minute request cap; without this, one
+    process serving several users can independently rediscover that limit
+    every few seconds. Synchronous (threading.Lock + time.sleep) because
+    this codebase has no asyncio anywhere - sync FastAPI handlers, sync
+    gateway/LLM calls throughout.
+    """
+
+    def __init__(
+        self,
+        max_requests: int,
+        period_seconds: float,
+        max_wait_seconds: float,
+    ) -> None:
+        self.max_requests = max_requests
+        self.period_seconds = period_seconds
+        self.max_wait_seconds = max_wait_seconds
+        self._timestamps: deque[float] = deque()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                while (
+                    self._timestamps
+                    and now - self._timestamps[0] >= self.period_seconds
+                ):
+                    self._timestamps.popleft()
+                if len(self._timestamps) < self.max_requests:
+                    self._timestamps.append(now)
+                    return
+                wait = self.period_seconds - (now - self._timestamps[0])
+            if wait > self.max_wait_seconds:
+                raise LLMRateLimitedError(wait)
+            time.sleep(max(wait, 0.05))
+
+
+# Conservative margin under the real 5-req/min provider ceiling.
+llm_rate_limiter = LLMRateLimiter(
+    max_requests=4,
+    period_seconds=60.0,
+    max_wait_seconds=8.0,
+)
+
+
+SUPPORTED_LLM_PROVIDERS = {"oxy", "mistral"}
+
+
 def effective_llm_api_key() -> str:
     return settings.LLM_API_KEY.get_secret_value().strip()
 
@@ -153,24 +238,40 @@ class LLMProvider:
 
     def get_client(self):
         if self._client is None:
-            if settings.LLM_PROVIDER.strip().lower() != "oxy":
+            provider = settings.LLM_PROVIDER.strip().lower()
+            if provider not in SUPPORTED_LLM_PROVIDERS:
                 raise LLMConfigurationError(
-                    "Only the centralized Oxy inference provider is supported."
+                    f"Unsupported LLM_PROVIDER '{provider}'. Supported: "
+                    f"{', '.join(sorted(SUPPORTED_LLM_PROVIDERS))}."
                 )
             api_key = effective_llm_api_key()
             if not api_key:
                 raise LLMConfigurationError("The centralized LLM is not configured.")
             from langchain_openai import ChatOpenAI
 
-            self._client = ChatOpenAI(
+            client = ChatOpenAI(
                 api_key=api_key,
                 base_url=settings.LLM_BASE_URL,
                 model=settings.LLM_MODEL,
                 temperature=0,
                 timeout=settings.LLM_TIMEOUT_SECONDS,
                 max_retries=0,
-                tags=["provider:oxy", "workflow:mape-k"],
+                tags=[f"provider:{provider}", "workflow:mape-k"],
             )
+            # Gate every real call through the shared limiter, not just our
+            # own invoke_structured() path. Instance-level patch (not a
+            # subclass) so it survives .bind_tools()/.with_structured_output()
+            # - both still call through to this same instance's .invoke.
+            # object.__setattr__ bypasses ChatOpenAI's Pydantic __setattr__,
+            # which rejects assigning to anything that isn't a model field.
+            original_invoke = client.invoke
+
+            def rate_limited_invoke(*args: Any, **kwargs: Any) -> Any:
+                llm_rate_limiter.acquire()
+                return original_invoke(*args, **kwargs)
+
+            object.__setattr__(client, "invoke", rate_limited_invoke)
+            self._client = client
         return self._client
 
     def invoke_structured(

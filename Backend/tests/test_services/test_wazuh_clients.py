@@ -476,3 +476,76 @@ def test_archive_search_reports_unavailable_index_without_claiming_no_activity()
     assert result.total == 0
     assert result.archive_status == "unavailable"
     assert result.query_scope["text"] == "failed password"
+
+
+def test_agent_inventory_supports_hardware_component():
+    class RecordingServer(FakeServer):
+        def __init__(self):
+            self.calls = []
+
+        def get(self, path, params=None):
+            self.calls.append((path, params))
+            return {
+                "data": {
+                    "affected_items": [{"board_serial": "ABC123"}],
+                    "total_affected_items": 1,
+                }
+            }
+
+    result = AlertSearchResult(total=0, returned=0, truncated=False, alerts=[])
+    server = RecordingServer()
+    gateway = WazuhGateway(server=server, indexer=FakeIndexer(result))
+
+    inventory = gateway.get_agent_inventory(
+        agent_id="004",
+        component="hardware",
+        limit=5,
+    )
+
+    assert server.calls == [("/syscollector/004/hardware", {"limit": 5})]
+    assert inventory.component == "hardware"
+    assert inventory.items[0]["board_serial"] == "ABC123"
+
+
+def test_agent_connectivity_summary_handles_nested_connection_shape():
+    class NestedStatusServer(FakeServer):
+        def get(self, path, params=None):
+            assert path == "/agents/summary/status"
+            return {
+                "data": {
+                    "connection": {
+                        "active": 8,
+                        "disconnected": 2,
+                        "pending": 0,
+                        "never_connected": 1,
+                        "total": 11,
+                    }
+                }
+            }
+
+    result = AlertSearchResult(total=0, returned=0, truncated=False, alerts=[])
+    gateway = WazuhGateway(server=NestedStatusServer(), indexer=FakeIndexer(result))
+
+    summary = gateway.agent_connectivity_summary()
+
+    assert summary.by_status == {
+        "active": 8,
+        "disconnected": 2,
+        "pending": 0,
+        "never_connected": 1,
+    }
+    assert summary.total == 11
+
+
+def test_agent_connectivity_summary_handles_flat_shape():
+    class FlatStatusServer(FakeServer):
+        def get(self, path, params=None):
+            return {"data": {"active": 3, "disconnected": 1}}
+
+    result = AlertSearchResult(total=0, returned=0, truncated=False, alerts=[])
+    gateway = WazuhGateway(server=FlatStatusServer(), indexer=FakeIndexer(result))
+
+    summary = gateway.agent_connectivity_summary()
+
+    assert summary.by_status == {"active": 3, "disconnected": 1}
+    assert summary.total == 4

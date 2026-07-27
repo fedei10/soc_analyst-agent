@@ -177,6 +177,7 @@ def build_soc_platform(
     model_assignments: list[dict[str, Any]],
     response_policy: dict[str, bool | int | str],
     retention: dict[str, int | str],
+    wazuh_dashboard_url: str | None = None,
 ) -> SOCPlatform:
     approvals: list[dict[str, Any]] = []
     actions: list[dict[str, Any]] = []
@@ -262,4 +263,5 @@ def build_soc_platform(
         model_assignments=model_assignments,
         response_policy=response_policy,
         retention=retention,
+        wazuh_dashboard_url=wazuh_dashboard_url,
     )

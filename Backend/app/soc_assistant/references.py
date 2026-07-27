@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.config import settings
-from app.coreAgents.orchestration.investigation_service import (
+from app.orchestration.investigation_service import (
     InvestigationNotFoundError,
     InvestigationService,
 )

@@ -9,7 +9,11 @@ from app.db.repositories.findings import (
     FindingOwnershipError,
     InMemoryFindingRepository,
 )
-from app.mape_k.llm import LLMConfigurationError
+from app.mape_k.llm import (
+    LLMConfigurationError,
+    LLMErrorCode,
+    LLMInvocationError,
+)
 from app.services.wazuh.triage.analyzer import TriageAnalyzer
 from app.services.wazuh.triage.enrichment import (
     ExternalNotConfiguredAdapter,
@@ -89,6 +93,17 @@ class UnconfiguredLLM:
         raise LLMConfigurationError("provider not configured")
 
 
+class RateLimitedLLM:
+    def invoke_structured(self, schema, messages):
+        raise LLMInvocationError(
+            LLMErrorCode.MODEL_RATE_LIMITED,
+            retryable=True,
+            attempt=2,
+            duration_ms=100,
+            status_code=429,
+        )
+
+
 def test_ssh_brute_force_verdict_is_deterministic_and_malicious():
     finding = ssh_brute_force_finding()
     assert finding.event_type == "ssh_brute_force"
@@ -161,12 +176,37 @@ def test_llm_fallback_used_for_unmapped_event_type(monkeypatch):
     assert verdict.verdict == "suspicious"
 
 
+def test_deterministic_monitor_does_not_call_model_for_unmapped_event_type():
+    finding = ssh_brute_force_finding()
+    finding = finding.model_copy(update={"event_type": "network_connection"})
+
+    verdict = TriageAnalyzer(llm=FailingLLM()).run(
+        finding,
+        enrichment=[],
+        allow_model=False,
+    )
+
+    assert verdict.deterministic is True
+    assert verdict.verdict == "inconclusive"
+    assert verdict.reason_code == "MONITOR_RULE_UNAVAILABLE"
+    assert verdict.evidence_refs == finding.evidence_refs
+
+
 def test_llm_unavailable_falls_back_to_inconclusive():
     finding = ssh_brute_force_finding()
     finding = finding.model_copy(update={"event_type": "network_connection"})
     verdict = TriageAnalyzer(llm=UnconfiguredLLM()).run(finding, enrichment=[])
     assert verdict.verdict == "inconclusive"
     assert verdict.reason_code == "LLM_UNAVAILABLE"
+
+
+def test_llm_rate_limit_falls_back_to_inconclusive():
+    finding = ssh_brute_force_finding()
+    finding = finding.model_copy(update={"event_type": "network_connection"})
+    verdict = TriageAnalyzer(llm=RateLimitedLLM()).run(finding, enrichment=[])
+    assert verdict.verdict == "inconclusive"
+    assert verdict.reason_code == "MODEL_RATE_LIMITED"
+    assert verdict.evidence_refs == finding.evidence_refs
 
 
 def test_internal_asset_adapter_flags_private_ip_as_internal():
@@ -303,3 +343,38 @@ def test_run_triage_rejects_out_of_range_hours():
             organization_id="org-1",
             repository=InMemoryFindingRepository(),
         )
+
+
+def test_run_triage_notifies_telegram_once_for_a_new_notable_finding(monkeypatch):
+    sent = []
+    monkeypatch.setattr(
+        "app.services.wazuh.triage.service.get_telegram_notifier",
+        lambda: type(
+            "N",
+            (),
+            {"configured": True, "send": lambda self, text: sent.append(text)},
+        )(),
+    )
+    repo = InMemoryFindingRepository()
+    run_triage(
+        gateway=FakeGateway(),
+        hours=24,
+        min_level=0,
+        limit=50,
+        organization_id="org-1",
+        repository=repo,
+        analyzer=TriageAnalyzer(llm=FailingLLM()),
+    )
+    assert len(sent) == 1
+
+    # Repeat run on the same alerts: finding already exists, no new notify.
+    run_triage(
+        gateway=FakeGateway(),
+        hours=24,
+        min_level=0,
+        limit=50,
+        organization_id="org-1",
+        repository=repo,
+        analyzer=TriageAnalyzer(llm=FailingLLM()),
+    )
+    assert len(sent) == 1

@@ -102,24 +102,58 @@ class IngestionCheckpointRecord(Base):
     __tablename__ = "soc_ingestion_checkpoints"
 
     source_name: Mapped[str] = mapped_column(String(128), primary_key=True)
+    connection_profile_id: Mapped[str] = mapped_column(
+        String(128),
+        default="default",
+    )
+    index_pattern: Mapped[str] = mapped_column(
+        String(256),
+        default="wazuh-alerts-*",
+    )
+    cursor_version: Mapped[int] = mapped_column(Integer, default=1)
     last_event_timestamp: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
+    last_index_name: Mapped[str | None] = mapped_column(String(256))
     last_document_id: Mapped[str | None] = mapped_column(String(256))
     search_after: Mapped[list[Any] | None] = mapped_column(JSON_VALUE)
     last_run_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    previous_run_completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
     last_run_completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
     last_alert_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_duplicate_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_finding_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_updated_finding_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_incident_count: Mapped[int] = mapped_column(Integer, default=0)
+    highest_new_rule_level: Mapped[int | None] = mapped_column(Integer)
+    last_cursor_advanced: Mapped[bool] = mapped_column(default=False)
+    last_truncated: Mapped[bool] = mapped_column(default=False)
     status: Mapped[str] = mapped_column(String(32), default="idle", index=True)
     error_message: Mapped[str | None] = mapped_column(Text)
+    lease_token: Mapped[str | None] = mapped_column(String(100), index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        index=True,
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=utc_now,
         onupdate=utc_now,
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "source_name",
+            "connection_profile_id",
+            "index_pattern",
+            name="uq_soc_ingestion_cursor_scope",
+        ),
     )
 
 

@@ -5,8 +5,8 @@ Scopes (enforced in app/api/auth/deps.py):
   - every read endpoint requires wazuh:read  (SOC L1/L2 agent tokens)
   - response actions require wazuh:write     (human-held tokens, SOC L3)
 
-Which subset of read endpoints an L1 vs L2 agent may call is decided where
-the agent's tools are registered (coreAgents), not here.
+Which subset of read endpoints a caller may use is decided by token scopes,
+not here.
 
 Response envelope: {"data": ...}. Collections pass Wazuh's own shape through
 ({"affected_items": [...], "total_affected_items": N}); indexer-backed routes
@@ -22,6 +22,10 @@ from app.api.auth.deps import AuthPrincipal, require_read, require_write
 from app.api.v1.schemas.wazuh import ActiveResponseRequest, RestartAgentRequest
 from app.services.wazuh.dependencies import get_wazuh_gateway, get_wazuh_responder
 from app.services.wazuh.gateway import WazuhGateway
+from app.services.wazuh.ingestion import (
+    AlertIngestionService,
+    IngestionAlreadyRunningError,
+)
 from app.services.wazuh.responder_client import WazuhResponderClient
 
 logger = structlog.get_logger("tsage.api")
@@ -86,6 +90,17 @@ def list_alerts(
 def alert_summary(gateway: GatewayDep, hours: Hours = 24):
     """Alert counts by level / agent / rule group — the L1 triage overview."""
     return {"data": gateway.alert_summary(hours=hours)}
+
+
+@read.post("/alerts/check", tags=["alerts"])
+def check_new_alerts(gateway: GatewayDep):
+    """Run one durable Monitor cycle and return deterministic new-alert counts."""
+
+    try:
+        result = AlertIngestionService(gateway=gateway).ingest()
+    except IngestionAlreadyRunningError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"data": result.model_dump(mode="json")}
 
 
 @read.get("/alerts/{alert_id}", tags=["alerts"])
@@ -388,6 +403,25 @@ def list_vulnerabilities(
 @read.get("/vulnerabilities/summary", tags=["vulnerabilities"])
 def vulnerabilities_summary(gateway: GatewayDep):
     return {"data": gateway.vulnerability_summary()}
+
+
+@read.get("/vulnerabilities/prioritized", tags=["vulnerabilities"])
+def prioritized_vulnerabilities(
+    gateway: GatewayDep,
+    severity: Annotated[Severity | None, Query()] = None,
+    agent_id: Annotated[str | None, Query(pattern=r"^\d+$")] = None,
+    limit: Limit = 50,
+):
+    """CVEs re-ranked by real exploitability (CISA KEV + EPSS), not CVSS alone."""
+    from app.services.wazuh.triage.vuln_priority import (
+        rank_detected_vulnerabilities,
+    )
+
+    items, total = gateway.search_vulnerabilities(
+        severity=severity, agent_id=agent_id, limit=limit
+    )
+    ranked = rank_detected_vulnerabilities(items)
+    return {"data": {"items": ranked, "count": len(ranked), "total": total}}
 
 
 # -------------------------

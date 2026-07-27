@@ -5,6 +5,7 @@ from typing import Any, Literal
 
 from app.services.wazuh.indexer_client import WazuhIndexerClient
 from app.services.wazuh.models import (
+    AgentConnectivitySummary,
     AgentSummary,
     AlertIngestionPage,
     AlertEvidence,
@@ -209,6 +210,7 @@ class WazuhGateway:
             "os",
             "network",
             "hotfixes",
+            "hardware",
         ],
         limit: int = 50,
         text: str | None = None,
@@ -223,6 +225,7 @@ class WazuhGateway:
             "os": "os",
             "network": "netiface",
             "hotfixes": "hotfixes",
+            "hardware": "hardware",
         }
         syscollector_component = paths.get(component)
         if syscollector_component is None:
@@ -622,6 +625,25 @@ class WazuhGateway:
 
     def vulnerability_summary(self) -> dict[str, Any]:
         return self.indexer.vulnerability_summary()
+
+    def agent_connectivity_summary(self) -> AgentConnectivitySummary:
+        """Agent counts by connection status (active/disconnected/pending/
+        never_connected), for detecting telemetry gaps and Wazuh health."""
+        payload = self.server.get("/agents/summary/status")
+        data = payload.get("data") or {}
+        # Response shape varies by Wazuh version: newer APIs nest counts
+        # under "connection", older ones return them at the top level.
+        source = data.get("connection") if isinstance(data.get("connection"), dict) else data
+        counts = {
+            str(key): int(value)
+            for key, value in source.items()
+            if isinstance(value, int) and key.lower() != "total"
+        }
+        total = source.get("total")
+        return AgentConnectivitySummary(
+            by_status=counts,
+            total=int(total) if isinstance(total, int) else sum(counts.values()),
+        )
 
     def close(self) -> None:
         self.server.close()

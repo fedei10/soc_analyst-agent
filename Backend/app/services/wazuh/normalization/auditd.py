@@ -4,6 +4,7 @@ from typing import Any
 
 from app.services.wazuh.normalization.base import AlertNormalizer, outcome_from_text
 from app.services.wazuh.normalization.field_extractors import (
+    auditd_command_fields,
     combined_text,
     hash_sensitive,
     integer,
@@ -23,12 +24,15 @@ class AuditdNormalizer(AlertNormalizer):
 
     def normalize(self, raw: dict[str, Any]):
         value = combined_text(raw)
-        executable = text(
-            raw,
-            "data.audit.exe",
-            "data.exe",
-            "process.executable",
-            "process.name",
+        executable = (
+            text(
+                raw,
+                "data.audit.exe",
+                "data.exe",
+                "process.executable",
+                "process.name",
+            )
+            or auditd_command_fields(raw)
         )
         parent = text(raw, "data.audit.parent", "process.parent.name")
         command = text(raw, "data.audit.command", "process.command_line", "data.command")

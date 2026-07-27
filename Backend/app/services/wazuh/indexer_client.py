@@ -320,6 +320,7 @@ class WazuhIndexerClient:
             "size": size,
             "sort": [
                 {"@timestamp": {"order": "asc", "unmapped_type": "date"}},
+                {"_index": {"order": "asc"}},
                 {"_id": {"order": "asc"}},
             ],
             "track_total_hits": True,

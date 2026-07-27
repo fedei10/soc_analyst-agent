@@ -4,7 +4,7 @@ import operator
 from enum import Enum
 from typing import Annotated, Any, NotRequired, Required, TypedDict
 
-from app.coreAgents.orchestration.schemas import Severity
+from app.orchestration.schemas import Severity
 
 
 class InvestigationStatus(str, Enum):

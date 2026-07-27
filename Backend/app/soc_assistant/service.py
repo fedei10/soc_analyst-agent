@@ -12,12 +12,13 @@ from langsmith import traceable
 from opensearchpy import exceptions as opensearch_exc
 
 from app.config import settings
-from app.coreAgents.orchestration.investigation_service import (
+from app.mape_k.llm import is_rate_limit_error
+from app.orchestration.investigation_service import (
     InvestigationNotFoundError,
     InvestigationService,
     get_investigation_service,
 )
-from app.coreAgents.tools.wazuh._common import failure as wazuh_tool_failure
+from app.services.wazuh.tool_results import failure as wazuh_tool_failure
 from app.db.session import database_url
 from app.db.repositories.alert_memory import get_alert_memory_repository
 from app.db.repositories.findings import get_finding_repository
@@ -35,6 +36,7 @@ from app.services.wazuh.normalization.serializers import (
 from app.services.wazuh.triage.service import run_triage
 from app.soc_assistant.catalog import public_catalog
 from app.soc_assistant.question_agent import SOCQuestionAgent
+from app.soc_assistant.tool_agent import SOCToolAgent
 from app.soc_assistant.router import AssistantIntentRouter
 from app.soc_assistant.references import (
     InvestigationReferenceError,
@@ -196,6 +198,15 @@ def _bounded_int(
     return parsed
 
 
+def _stage_phrase(status: str, current_stage: str) -> str:
+    """`status="escalated"` means the graph already reached its terminal
+    state (pending_nodes is empty) waiting on a human, not "still working" -
+    say so plainly instead of just naming the stage it stopped at."""
+    if status == "escalated":
+        return f"escalated for analyst review (stopped at stage: {current_stage})"
+    return f"{status} at stage {current_stage}"
+
+
 def _duration_hours(value: Any, *, default: int = 24) -> int:
     if value in (None, ""):
         return default
@@ -227,11 +238,15 @@ class SOCAssistant:
         investigations: InvestigationService | None = None,
         router: AssistantIntentRouter | None = None,
         question_agent: SOCQuestionAgent | None = None,
+        tool_agent: "SOCToolAgent | None" = None,
     ) -> None:
         self.gateway = gateway or WazuhGateway()
         self.investigations = investigations or get_investigation_service()
         self.router = router or AssistantIntentRouter()
         self.question_agent = question_agent or SOCQuestionAgent()
+        self.tool_agent = tool_agent or SOCToolAgent(
+            gateway=self.gateway, investigations=self.investigations
+        )
 
     def _question_context(
         self,
@@ -473,6 +488,7 @@ class SOCAssistant:
         *,
         organization_id: str,
         user_id: str,
+        conversation_id: str | None = None,
         recent_context: dict[str, str] | None = None,
         conversation_history: list[dict[str, str]] | None = None,
     ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
@@ -499,6 +515,46 @@ class SOCAssistant:
                     [],
                     {},
                 )
+            try:
+                agent_answer, tool_calls, active_alert_id = self.tool_agent.answer(
+                    question=question,
+                    history=conversation_history or [],
+                    organization_id=organization_id,
+                    created_by=user_id,
+                    conversation_id=conversation_id,
+                )
+                return (
+                    agent_answer,
+                    {
+                        "display_mode": "conversation",
+                        "answer_type": "soc_tool_agent",
+                        "tools_called": tool_calls,
+                    },
+                    ["soc_tool_agent", *tool_calls],
+                    (
+                        {"active_alert_id": active_alert_id}
+                        if active_alert_id
+                        else {}
+                    ),
+                )
+            except Exception as exc:
+                if is_rate_limit_error(exc):
+                    # Falling through to question_agent would just spend
+                    # another request against the same exhausted limit.
+                    return (
+                        (
+                            "The AI provider's rate limit was reached. Please "
+                            "wait a moment and try again."
+                        ),
+                        {
+                            "display_mode": "conversation",
+                            "answer_type": "rate_limited",
+                        },
+                        [],
+                        {},
+                    )
+                # Fall through to the context-primed question agent.
+                pass
             try:
                 answer, answer_usage = self.question_agent.answer(
                     question=question,
@@ -689,11 +745,20 @@ class SOCAssistant:
                 )
                 payload = {
                     "raw_alert_count": new_alerts,
+                    "recent_alerts": new_alerts,
                     "finding_count": len(findings),
                     "findings": findings,
-                    "new_alerts": new_alerts,
-                    "new_findings": len(new_records),
-                    "updated_findings": len(updated_records),
+                    "new_alerts": (
+                        new_alerts if previous_check is not None else None
+                    ),
+                    "new_findings": (
+                        len(new_records) if previous_check is not None else None
+                    ),
+                    "updated_findings": (
+                        len(updated_records)
+                        if previous_check is not None
+                        else None
+                    ),
                     "unchanged_findings": (
                         len(records) - len(changed_ids)
                     ),
@@ -708,6 +773,8 @@ class SOCAssistant:
                         if previous_check
                         else None
                     ),
+                    "baseline_established": previous_check is None,
+                    "cursor_status": "durable",
                     "mode": (
                         "new"
                         if arguments.get("new_only")
@@ -730,15 +797,25 @@ class SOCAssistant:
                         default=None,
                     ),
                 )
-                return (
-                    (
+                if previous_check is None:
+                    summary = (
+                        f"Found {new_alerts} recent alert"
+                        f"{'' if new_alerts == 1 else 's'} and "
+                        f"{len(records)} current finding"
+                        f"{'' if len(records) == 1 else 's'}. "
+                        "This check established your durable baseline."
+                    )
+                else:
+                    summary = (
                         f"Found {new_alerts} new alert"
                         f"{'' if new_alerts == 1 else 's'}, "
                         f"{len(new_records)} new finding"
                         f"{'' if len(new_records) == 1 else 's'}, and "
                         f"{len(updated_records)} updated finding"
                         f"{'' if len(updated_records) == 1 else 's'}."
-                    ),
+                    )
+                return (
+                    summary,
                     payload,
                     ["query_alert_memory"],
                     {},
@@ -749,74 +826,32 @@ class SOCAssistant:
                 fn=lambda: self.gateway.search_alerts(**tool_inputs),
             )
             compact = compact_alert_search_result(result)
-            new_alerts = (
-                sum(
-                    alert.timestamp > previous_check
-                    for alert in result.alerts
-                )
-                if previous_check
-                else result.returned
-            )
-            new_findings = 0
-            updated_findings = 0
-            unchanged_findings = 0
-            for finding in compact["findings"]:
-                first_seen = datetime.fromisoformat(
-                    str(finding["first_seen"]).replace("Z", "+00:00")
-                )
-                last_seen = datetime.fromisoformat(
-                    str(finding["last_seen"]).replace("Z", "+00:00")
-                )
-                if previous_check is None or first_seen > previous_check:
-                    new_findings += 1
-                elif last_seen > previous_check:
-                    updated_findings += 1
-                else:
-                    unchanged_findings += 1
             compact.update(
                 {
-                    "new_alerts": new_alerts,
-                    "new_findings": new_findings,
-                    "updated_findings": updated_findings,
-                    "unchanged_findings": unchanged_findings,
-                    "since": (
-                        previous_check.isoformat()
-                        if previous_check
-                        else None
-                    ),
+                    "recent_alerts": result.returned,
+                    "new_alerts": None,
+                    "new_findings": None,
+                    "updated_findings": None,
+                    "since": None,
                     "checked_at": checked_at.isoformat(),
-                    "new_since_last_check": (
-                        previous_check.isoformat()
-                        if previous_check
-                        else None
-                    ),
+                    "new_since_last_check": None,
+                    "baseline_established": False,
+                    "cursor_status": "unavailable",
                 }
             )
-            if arguments.get("new_only") and previous_check:
-                compact["findings"] = [
-                    finding
-                    for finding in compact["findings"]
-                    if datetime.fromisoformat(
-                        str(finding["last_seen"]).replace("Z", "+00:00")
-                    )
-                    > previous_check
-                ]
-                compact["finding_count"] = len(compact["findings"])
             compact["mode"] = (
-                "new"
-                if arguments.get("new_only")
-                else "open"
+                "open"
                 if arguments.get("open_only")
                 else "all"
                 if arguments.get("all_results")
-                else "updated_since_last_check"
+                else "recent"
             )
-            memory.advance_user_cursor(user_id, checked_at)
             return (
                 (
-                    f"Found {new_alerts} new alert"
-                    f"{'' if new_alerts == 1 else 's'} since your previous check. "
-                    f"The current window contains {compact['finding_count']} findings."
+                    f"Found {result.returned} recent alert"
+                    f"{'' if result.returned == 1 else 's'} in the selected window. "
+                    "PostgreSQL alert memory is unavailable, so this result "
+                    "cannot prove what is new since your previous check."
                 ),
                 compact,
                 ["search_alerts"],
@@ -877,8 +912,15 @@ class SOCAssistant:
                     fn=lambda: self.gateway.alert_summary(hours=hours),
                 )
             )
+            message = f"Loaded the Wazuh alert overview for the last {hours} hours."
+            if arguments.get("vague_fallback"):
+                message += (
+                    " Your message didn't name a specific alert, agent, IP, rule, "
+                    "or time range, so here's the broad picture instead of a deep "
+                    "dive — tell me which alert or asset to look into next."
+                )
             return (
-                f"Loaded the Wazuh alert overview for the last {hours} hours.",
+                message,
                 {"hours": hours, "summary": summary},
                 ["alert_summary"],
                 {},
@@ -998,8 +1040,8 @@ class SOCAssistant:
             )
             return (
                 (
-                    f"Started MAPE-K investigation {snapshot['investigation_id']}. "
-                    f"Current stage: {snapshot['current_stage']}."
+                    f"Started MAPE-K investigation {snapshot['investigation_id']}, "
+                    f"{_stage_phrase(snapshot['status'], snapshot['current_stage'])}."
                 ),
                 {
                     "investigation_id": snapshot["investigation_id"],
@@ -1057,8 +1099,8 @@ class SOCAssistant:
                 ) from exc
             return (
                 (
-                    f"Investigation {investigation_id} is {snapshot['status']} "
-                    f"at stage {snapshot['current_stage']}."
+                    f"Investigation {investigation_id} is "
+                    f"{_stage_phrase(snapshot['status'], snapshot['current_stage'])}."
                 ),
                 {
                     "investigation_id": investigation_id,
@@ -1141,6 +1183,7 @@ class SOCAssistant:
         *,
         organization_id: str,
         user_id: str,
+        conversation_id: str | None = None,
         recent_context: dict[str, str] | None = None,
         conversation_history: list[dict[str, str]] | None = None,
     ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
@@ -1149,6 +1192,7 @@ class SOCAssistant:
             arguments,
             organization_id=organization_id,
             user_id=user_id,
+            conversation_id=conversation_id,
             recent_context=recent_context,
             conversation_history=conversation_history,
         )
@@ -1240,12 +1284,21 @@ class SOCAssistant:
                 intent.arguments,
                 organization_id=organization_id,
                 user_id=user_id,
+                conversation_id=active_conversation_id,
                 recent_context=recent_context,
                 conversation_history=conversation_history,
             )
+            for tool_name in payload.get("tools_called") or []:
+                activities.append(
+                    self._activity(
+                        len(activities) + 1,
+                        f"Queried {tool_name}",
+                        tool=tool_name,
+                    )
+                )
             activities.append(
                 self._activity(
-                    2,
+                    len(activities) + 1,
                     f"Completed {intent.command.value}",
                     tool=tools[-1] if tools else None,
                 )

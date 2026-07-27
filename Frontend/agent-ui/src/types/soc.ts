@@ -2,9 +2,6 @@ export type WorkspaceView =
   | 'overview'
   | 'chat'
   | 'alerts'
-  | 'alert-triage'
-  | 'investigations'
-  | 'threat-hunting'
   | 'assets'
   | 'playbooks'
   | 'approvals'
@@ -230,6 +227,7 @@ export interface SOCPlatform {
   }>
   response_policy: Record<string, boolean | number | string>
   retention: Record<string, number | string>
+  wazuh_dashboard_url?: string | null
 }
 
 export interface ProposedAction {
@@ -249,7 +247,7 @@ export interface ApprovalRequest {
   approval_id: string
   expires_at: string
   required_role?: 'soc_l2' | 'soc_l3' | 'security_admin' | null
-  proposed_actions: ProposedAction[]
+  action_ids: string[]
 }
 
 export interface AuditEvent {
@@ -306,123 +304,66 @@ export interface Investigation {
   pending_nodes: string[]
 }
 
-export interface InvestigationHistoryItem {
-  investigation_id: string
-  alert_id: string
-  agent_id?: string | null
-  status: string
-  current_stage: string
-  severity?: string | null
-  confidence?: number | null
-  initiated_by?: string | null
-  initiation_reason?: string | null
-  completed_tiers: Array<'l1' | 'l2' | 'l3'>
-  created_at?: string | null
-  updated_at?: string | null
-}
-
-export interface InvestigationHistory {
-  items: InvestigationHistoryItem[]
-  count: number
-  total: number
-  limit: number
-  offset: number
-}
-
 export interface ApprovalInput {
   decision: ApprovalDecision
   approval_id: string
   modified_actions?: Record<string, unknown>[]
 }
 
-export type VerdictLabel =
-  | 'benign'
-  | 'suspicious'
-  | 'malicious'
-  | 'inconclusive'
-
-export interface TriageVerdict {
-  verdict: VerdictLabel
-  confidence: number
-  severity: string
+export interface ShiftHandoff {
   summary: string
-  evidence_refs: string[]
-  false_positive_indicators: string[]
-  escalation_recommended: boolean
-  missing_evidence: string[]
-  deterministic: boolean
-  reason_code?: string | null
+  highlights: string[]
+  open_items: string[]
+  recommendations: string[]
+  window_hours: number
+  generated_at: string
+  investigation_count: number
+  finding_count: number
 }
 
-export interface EnrichmentResult {
-  indicator: string
-  indicator_type: 'ip' | 'domain' | 'hash'
-  is_internal: boolean
-  reputation: 'unknown' | 'malicious' | 'suspicious' | 'clean'
-  known_asset: boolean
-  asset_owner?: string | null
-  allowlisted: boolean
-  previous_incidents: number
-  source: string
+export interface CommandExplanation {
+  plain_english: string
+  behavior: string[]
+  risk: 'benign' | 'suspicious' | 'malicious' | 'unknown'
+  indicators: string[]
+  recommended_checks: string[]
 }
 
-export interface SecurityFindingSummary {
-  finding_id: string
+export interface PrioritizedVulnerability {
+  cve: string
+  severity: string
+  cvss?: number | null
+  epss?: number | null
+  known_exploited: boolean
+  priority_score: number
+  reasons: string[]
+  agent_id?: string | null
+  agent_name?: string | null
+  package?: string | null
+  description?: string | null
+}
+
+export interface PrioritizedVulnerabilityList {
+  items: PrioritizedVulnerability[]
+  count: number
+  total: number
+}
+
+export interface AnalystReport {
+  report_id: string
   title: string
   summary: string
-  severity: string
-  confidence: number
-  first_seen: string
-  last_seen: string
-  affected_assets: string[]
-  source_ips: string[]
-  target_users: string[]
-  mitre_techniques: string[]
-  alert_count: number
-  representative_alert_id: string
-  evidence_refs: string[]
-  investigation_recommended: boolean
-}
-
-export type FeedbackDisposition =
-  | 'confirmed_malicious'
-  | 'confirmed_benign'
-  | 'expected_admin_activity'
-  | 'wrong_asset_context'
-  | 'wrong_severity'
-  | 'duplicate_incident'
-  | 'insufficient_evidence'
-
-export interface FindingFeedback {
-  feedback_id: string
-  finding_id: string
-  reviewer_user_id: string
-  disposition: FeedbackDisposition
-  notes?: string | null
+  body_markdown: string
+  severity?: string | null
+  source: string
+  created_by: string
+  conversation_id?: string | null
+  related_alert_ids: string[]
+  related_finding_ids: string[]
   created_at: string
 }
 
-export interface Finding {
-  finding_id: string
-  category: string
-  attack_family: string
-  event_type: string
-  severity: string
-  severity_score: number
-  first_seen: string
-  last_seen: string
-  alert_count: number
-  representative_alert_id: string
-  evidence_refs: string[]
-  finding: SecurityFindingSummary
-  verdict: TriageVerdict
-  enrichment: EnrichmentResult[]
-  created_at: string
-  updated_at: string
-  feedback: FindingFeedback[]
-}
-
-export interface FindingList {
-  items: Finding[]
+export interface AnalystReportList {
+  items: AnalystReport[]
   count: number
 }

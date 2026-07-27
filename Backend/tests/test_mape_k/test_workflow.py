@@ -8,7 +8,10 @@ from langgraph.types import Command
 from pydantic import ValidationError
 
 from app.config import settings
-from app.coreAgents.orchestration.investigation_service import InvestigationService
+from app.orchestration.investigation_service import (
+    InvestigationService,
+    _worst_severity,
+)
 from app.db.repositories.investigations import (
     InMemoryInvestigationRepository,
     ResponseExecutionConflictError,
@@ -16,10 +19,10 @@ from app.db.repositories.investigations import (
 from app.mape_k.analyze import IncidentAnalyzer
 from app.mape_k.executor import RestrictedExecutor
 from app.mape_k.graph import (
-    _validate_approval_binding,
     create_mape_k_graph,
     investigation_config,
 )
+from app.mape_k.nodes import _validate_approval_binding
 from app.mape_k.llm import LLMInputLimitError, LLMProvider
 from app.mape_k.monitor import WazuhMonitor
 from app.mape_k.policy import PolicyEngine, role_allows
@@ -641,10 +644,10 @@ def test_real_execution_waits_durably_before_server_resumes_verification(
             return future if tz is not None else future.replace(tzinfo=None)
 
     monkeypatch.setattr(
-        "app.coreAgents.orchestration.investigation_service.datetime",
+        "app.orchestration.investigation_service.datetime",
         FutureDateTime,
     )
-    monkeypatch.setattr("app.mape_k.graph.datetime", FutureDateTime)
+    monkeypatch.setattr("app.mape_k.nodes.datetime", FutureDateTime)
     completed = service.resume_verification(
         started["investigation_id"],
         resumed_by="worker-1",
@@ -861,3 +864,86 @@ def test_service_rejects_execution_when_target_resource_is_locked():
         lease_seconds=60,
     )
     assert released_incident_lease["owner_id"] == "next-worker"
+
+
+def test_notify_investigation_transition_sends_for_approval_and_escalation(
+    monkeypatch,
+):
+    from app.orchestration.investigation_service import (
+        _notify_investigation_transition,
+    )
+
+    sent = []
+    monkeypatch.setattr(
+        "app.orchestration.investigation_service.get_telegram_notifier",
+        lambda: type(
+            "N",
+            (),
+            {"configured": True, "send": lambda self, text: sent.append(text)},
+        )(),
+    )
+    monkeypatch.setattr(
+        "app.orchestration.investigation_service.settings.TELEGRAM_NOTIFY_APPROVALS",
+        True,
+    )
+
+    _notify_investigation_transition(
+        {
+            "status": "awaiting_approval",
+            "investigation_id": "INV-1",
+            "alert_id": "AL-1",
+            "approval_request": {"required_role": "soc_l2", "action_ids": ["a"]},
+        }
+    )
+    _notify_investigation_transition(
+        {
+            "status": "escalated",
+            "investigation_id": "INV-2",
+            "alert_id": "AL-2",
+            "current_stage": "execute",
+            "error": {"message": "boom"},
+        }
+    )
+    _notify_investigation_transition({"status": "running"})
+    assert len(sent) == 2
+    assert "INV-1" in sent[0]
+    assert "INV-2" in sent[1]
+
+
+def test_notify_investigation_transition_respects_approval_flag(monkeypatch):
+    from app.orchestration.investigation_service import (
+        _notify_investigation_transition,
+    )
+
+    sent = []
+    monkeypatch.setattr(
+        "app.orchestration.investigation_service.get_telegram_notifier",
+        lambda: type(
+            "N",
+            (),
+            {"configured": True, "send": lambda self, text: sent.append(text)},
+        )(),
+    )
+    monkeypatch.setattr(
+        "app.orchestration.investigation_service.settings.TELEGRAM_NOTIFY_APPROVALS",
+        False,
+    )
+
+    _notify_investigation_transition(
+        {"status": "awaiting_approval", "investigation_id": "INV-3"}
+    )
+    assert sent == []
+
+
+def test_worst_severity_picks_the_highest_not_the_first_finding():
+    findings = [
+        {"severity": "informational"},
+        {"severity": "critical"},
+        {"severity": "low"},
+    ]
+    assert _worst_severity(findings) == "critical"
+
+
+def test_worst_severity_handles_empty_or_missing_findings():
+    assert _worst_severity([]) is None
+    assert _worst_severity([{"finding_id": "no-severity-key"}]) is None

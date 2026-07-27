@@ -61,3 +61,4 @@ class SOCPlatform(APIModel):
     model_assignments: list[ModelAssignment]
     response_policy: dict[str, bool | int | str]
     retention: dict[str, int | str]
+    wazuh_dashboard_url: str | None = None

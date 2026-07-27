@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
+import structlog
+
 from app.db.repositories.findings import FindingRepository, get_finding_repository
+from app.services.telegram.notifier import (
+    format_finding_alert,
+    get_telegram_notifier,
+    meets_finding_severity_threshold,
+)
 from app.services.wazuh.gateway import WazuhGateway
 from app.services.wazuh.normalization.aggregation import aggregate_alerts, build_findings
 from app.services.wazuh.normalization.registry import normalize_alerts
@@ -12,6 +19,7 @@ from app.services.wazuh.triage.enrichment import InternalAssetAdapter, VENDOR_AD
 from app.services.wazuh.triage.schemas import EnrichmentResult, TriagedFinding
 
 MAX_ENRICHED_IPS_PER_FINDING = 5
+logger = structlog.get_logger("tsage.triage")
 
 
 def _enrich_finding(
@@ -59,11 +67,31 @@ def run_triage(
     for finding in findings:
         enrichment = _enrich_finding(finding, internal_adapter)
         verdict = analyzer.run(finding, enrichment)
-        repository.upsert(
+        is_new = (
+            repository.get(finding.finding_id, organization_id=organization_id)
+            is None
+        )
+        record = repository.upsert(
             organization_id=organization_id,
             finding=finding,
             verdict=verdict,
             enrichment=enrichment,
         )
+        if is_new:
+            _notify_new_finding(record)
         triaged.append(TriagedFinding(finding=finding, verdict=verdict, enrichment=enrichment))
     return triaged
+
+
+def _notify_new_finding(record: dict) -> None:
+    verdict = record.get("verdict") or {}
+    if verdict.get("verdict") == "benign":
+        return
+    if not meets_finding_severity_threshold(str(record.get("severity") or "")):
+        return
+    try:
+        notifier = get_telegram_notifier()
+        if notifier.configured:
+            notifier.send(format_finding_alert(record))
+    except Exception:
+        logger.warning("telegram_finding_notify_failed", exc_info=True)

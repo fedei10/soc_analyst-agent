@@ -6,21 +6,18 @@ import {
   AlertTriangle,
   Bell,
   Bot,
-  Check,
   CheckCircle2,
   ChevronRight,
-  CircleGauge,
-  Clock3,
-  FileSearch,
+  ClipboardList,
+  FileText,
   GitBranch,
   History,
   LayoutDashboard,
-  ListChecks,
   MessageSquare,
   Network,
   Plus,
   RefreshCw,
-  Search,
+  ScrollText,
   Send,
   Server,
   Settings2,
@@ -30,8 +27,7 @@ import {
   TrendingDown,
   Terminal,
   Workflow,
-  Zap,
-  X
+  Zap
 } from 'lucide-react'
 import {
   FormEvent,
@@ -44,49 +40,38 @@ import {
 import { toast } from 'sonner'
 
 import {
-  createInvestigation,
-  executeApprovedResponse,
+  explainCommand,
   getAlertSummary,
   getAssistantCommands,
-  getFinding,
-  getFindings,
-  getInvestigation,
-  getInvestigationHistory,
   getLiveness,
+  getReports,
+  getShiftHandoff,
   getSOCOverview,
   getSOCPlatform,
   getWazuhHealth,
-  streamAgentMessage,
-  submitApproval,
-  submitFindingFeedback
+  streamAgentMessage
 } from '@/api/soc'
 import type {
   AlertSummary,
-  ApprovalDecision,
+  AnalystReport,
   AssistantCommand,
   ChatActivity,
   ChatMessage,
-  FeedbackDisposition,
-  Finding,
-  Investigation,
-  InvestigationHistoryItem,
+  CommandExplanation,
+  ShiftHandoff,
   SOCOverview,
   SOCPlatform,
   WorkspaceView,
-  WazuhAlert,
   WazuhHealth
 } from '@/types/soc'
 import PlatformWorkspaces from '@/components/soc/PlatformWorkspaces'
-
-const FEEDBACK_OPTIONS: Array<{ value: FeedbackDisposition; label: string }> = [
-  { value: 'confirmed_malicious', label: 'Confirmed malicious' },
-  { value: 'confirmed_benign', label: 'Confirmed benign' },
-  { value: 'expected_admin_activity', label: 'Expected admin activity' },
-  { value: 'wrong_asset_context', label: 'Wrong asset context' },
-  { value: 'wrong_severity', label: 'Wrong severity' },
-  { value: 'duplicate_incident', label: 'Duplicate incident' },
-  { value: 'insufficient_evidence', label: 'Insufficient evidence' }
-]
+import MarkdownRenderer from '@/components/ui/typography/MarkdownRenderer'
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle
+} from '@/components/ui/dialog'
 
 const SUGGESTED_PROMPTS = [
   '/alerts --min-level 10 --hours 24',
@@ -99,9 +84,6 @@ const WORKSPACE_TITLES: Record<WorkspaceView, string> = {
   overview: 'Operations overview',
   chat: 'SOC Assistant',
   alerts: 'Alerts',
-  'alert-triage': 'Findings',
-  investigations: 'Incidents',
-  'threat-hunting': 'Threat Hunting',
   assets: 'Assets',
   playbooks: 'Playbooks',
   approvals: 'Approval Center',
@@ -315,6 +297,27 @@ function ChatMessageItem({ message }: { message: ChatMessage }) {
   )
 }
 
+function OpsClock() {
+  const [now, setNow] = useState<Date | null>(null)
+
+  useEffect(() => {
+    const tick = () => setNow(new Date())
+    tick()
+    const timer = setInterval(tick, 1000)
+    return () => clearInterval(timer)
+  }, [])
+
+  if (!now) return null
+  const utc = now.toISOString()
+  return (
+    <div className="ops-clock" title="Coordinated Universal Time">
+      <strong>UTC</strong>
+      {utc.slice(11, 19)}
+      <span>{utc.slice(0, 10)}</span>
+    </div>
+  )
+}
+
 function Metric({
   label,
   value,
@@ -356,24 +359,21 @@ export default function SocConsole() {
   const [alertSummary, setAlertSummary] = useState<AlertSummary | null>(null)
   const [environmentBusy, setEnvironmentBusy] = useState(false)
   const [environmentHydrated, setEnvironmentHydrated] = useState(false)
-  const [investigation, setInvestigation] = useState<Investigation | null>(null)
-  const [investigationHistory, setInvestigationHistory] = useState<
-    InvestigationHistoryItem[]
-  >([])
-  const [pendingApprovalTotal, setPendingApprovalTotal] = useState(0)
-  const [historyBusy, setHistoryBusy] = useState(false)
-  const [investigationBusy, setInvestigationBusy] = useState(false)
-  const [alertId, setAlertId] = useState('')
-  const [agentId, setAgentId] = useState('')
-  const [findings, setFindings] = useState<Finding[]>([])
-  const [findingsBusy, setFindingsBusy] = useState(false)
-  const [selectedFinding, setSelectedFinding] = useState<Finding | null>(null)
-  const [findingBusy, setFindingBusy] = useState(false)
-  const [feedbackNotes, setFeedbackNotes] = useState('')
-  const [feedbackBusy, setFeedbackBusy] = useState(false)
+  const [handoff, setHandoff] = useState<ShiftHandoff | null>(null)
+  const [handoffBusy, setHandoffBusy] = useState(false)
+  const [explainInput, setExplainInput] = useState('')
+  const [explanation, setExplanation] = useState<CommandExplanation | null>(
+    null
+  )
+  const [explainBusy, setExplainBusy] = useState(false)
+  const [reports, setReports] = useState<AnalystReport[]>([])
+  const [reportsBusy, setReportsBusy] = useState(false)
+  const [openReport, setOpenReport] = useState<AnalystReport | null>(null)
   const userId = user?.id
   const conversationStorageKey = `tsage_conversation_id:${userId || 'none'}`
-  const investigationStorageKey = `tsage_investigation_id:${userId || 'none'}`
+  const pendingApprovalTotal =
+    platform?.pending_approvals.filter((item) => item.status === 'pending')
+      .length ?? 0
 
   const activityTrace = useMemo(
     () =>
@@ -453,23 +453,6 @@ export default function SocConsole() {
     setEnvironmentHydrated(true)
   }
 
-  async function refreshInvestigationHistory() {
-    setHistoryBusy(true)
-    try {
-      const [history, pending] = await Promise.all([
-        getInvestigationHistory(),
-        getInvestigationHistory(1, 'awaiting_approval')
-      ])
-      setInvestigationHistory(history.items)
-      setPendingApprovalTotal(pending.total)
-    } catch {
-      setInvestigationHistory([])
-      setPendingApprovalTotal(0)
-    } finally {
-      setHistoryBusy(false)
-    }
-  }
-
   async function refreshOverview() {
     setOverviewBusy(true)
     try {
@@ -495,8 +478,6 @@ export default function SocConsole() {
   useEffect(() => {
     if (!userLoaded || !userId) return
     setMessages([])
-    setInvestigation(null)
-    const storedInvestigation = sessionStorage.getItem(investigationStorageKey)
     const storedConversation =
       sessionStorage.getItem(conversationStorageKey) || createClientId()
     setConversationId(storedConversation)
@@ -504,16 +485,9 @@ export default function SocConsole() {
     void refreshEnvironment()
     void refreshOverview()
     void refreshPlatform()
-    void refreshInvestigationHistory()
     void getAssistantCommands()
       .then((catalog) => setAssistantCommands(catalog.items))
       .catch(() => setAssistantCommands([]))
-
-    if (storedInvestigation) {
-      void getInvestigation(storedInvestigation)
-        .then(setInvestigation)
-        .catch(() => sessionStorage.removeItem(investigationStorageKey))
-    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userLoaded, userId])
 
@@ -579,13 +553,8 @@ export default function SocConsole() {
       ])
       setConversationId(result.conversation_id)
       sessionStorage.setItem(conversationStorageKey, result.conversation_id)
-      if (result.investigation) {
-        setInvestigation(result.investigation)
-        sessionStorage.setItem(
-          investigationStorageKey,
-          result.investigation.investigation_id
-        )
-        void refreshInvestigationHistory()
+      if (result.tools_used?.includes('save_report')) {
+        void refreshReports()
       }
     } catch (error) {
       const message =
@@ -612,17 +581,6 @@ export default function SocConsole() {
       return
     }
     void submitChatPrompt(prompt)
-  }
-
-  function investigateAlert(alert: WazuhAlert) {
-    setAlertId(alert.alert_id)
-    setAgentId(alert.agent_id || '')
-    setView('investigations')
-  }
-
-  function openInvestigation(investigationId: string) {
-    setView('investigations')
-    void selectInvestigation(investigationId)
   }
 
   function handleChatKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -659,164 +617,47 @@ export default function SocConsole() {
     }
   }
 
-  async function handleCreateInvestigation(event: FormEvent) {
-    event.preventDefault()
-
-    setInvestigationBusy(true)
+  async function generateHandoff() {
+    setHandoffBusy(true)
     try {
-      const result = await createInvestigation(
-        alertId.trim(),
-        agentId.trim() || undefined
-      )
-      setInvestigation(result)
-      sessionStorage.setItem(investigationStorageKey, result.investigation_id)
-      void refreshInvestigationHistory()
-      toast.success(`Investigation ${result.investigation_id} started.`)
+      setHandoff(await getShiftHandoff())
     } catch (error) {
       toast.error(
         error instanceof Error
           ? error.message
-          : 'Investigation could not be started.'
+          : 'Handoff notes could not be generated.'
       )
     } finally {
-      setInvestigationBusy(false)
+      setHandoffBusy(false)
     }
   }
 
-  async function refreshInvestigation() {
-    if (!investigation) return
-    setInvestigationBusy(true)
+  async function handleExplainCommand() {
+    const command = explainInput.trim()
+    if (!command || explainBusy) return
+    setExplainBusy(true)
+    setExplanation(null)
     try {
-      const result = await getInvestigation(investigation.investigation_id)
-      setInvestigation(result)
-      void refreshInvestigationHistory()
+      setExplanation(await explainCommand(command))
     } catch (error) {
       toast.error(
         error instanceof Error
           ? error.message
-          : 'Investigation could not be refreshed.'
+          : 'The command could not be explained.'
       )
     } finally {
-      setInvestigationBusy(false)
+      setExplainBusy(false)
     }
   }
 
-  async function selectInvestigation(investigationId: string) {
-    if (investigationBusy) return
-    setInvestigationBusy(true)
+  async function refreshReports() {
+    setReportsBusy(true)
     try {
-      const result = await getInvestigation(investigationId)
-      setInvestigation(result)
-      sessionStorage.setItem(investigationStorageKey, investigationId)
-    } catch (error) {
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : 'Investigation could not be loaded.'
-      )
+      setReports((await getReports()).items)
+    } catch {
+      setReports([])
     } finally {
-      setInvestigationBusy(false)
-    }
-  }
-
-  async function handleApproval(decision: ApprovalDecision) {
-    const request = investigation?.approval_request
-    if (!investigation || !request) return
-
-    setInvestigationBusy(true)
-    try {
-      const result = await submitApproval(investigation.investigation_id, {
-        decision,
-        approval_id: request.approval_id
-      })
-      setInvestigation(result)
-      void refreshInvestigationHistory()
-      toast.success(`Decision recorded: ${decision}.`)
-    } catch (error) {
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : 'Approval could not be submitted.'
-      )
-    } finally {
-      setInvestigationBusy(false)
-    }
-  }
-
-  async function handleExecution() {
-    const request = investigation?.approval_request
-    if (!investigation || !request) return
-
-    setInvestigationBusy(true)
-    try {
-      const result = await executeApprovedResponse(
-        investigation.investigation_id,
-        request.approval_id
-      )
-      setInvestigation(result)
-      void refreshInvestigationHistory()
-      toast.success('Approved response executed and verification recorded.')
-    } catch (error) {
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : 'Approved response could not be executed.'
-      )
-    } finally {
-      setInvestigationBusy(false)
-    }
-  }
-
-  async function refreshFindings() {
-    setFindingsBusy(true)
-    try {
-      const result = await getFindings()
-      setFindings(result.items)
-    } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : 'Findings could not be loaded.'
-      )
-    } finally {
-      setFindingsBusy(false)
-    }
-  }
-
-  async function selectFinding(findingId: string) {
-    if (findingBusy) return
-    setFindingBusy(true)
-    try {
-      const result = await getFinding(findingId)
-      setSelectedFinding(result)
-      setFeedbackNotes('')
-    } catch (error) {
-      toast.error(
-        error instanceof Error ? error.message : 'Finding could not be loaded.'
-      )
-    } finally {
-      setFindingBusy(false)
-    }
-  }
-
-  async function handleFindingFeedback(disposition: FeedbackDisposition) {
-    if (!selectedFinding) return
-    setFeedbackBusy(true)
-    try {
-      await submitFindingFeedback(
-        selectedFinding.finding_id,
-        disposition,
-        feedbackNotes.trim() || undefined
-      )
-      toast.success('Feedback recorded.')
-      setFeedbackNotes('')
-      await selectFinding(selectedFinding.finding_id)
-    } catch (error) {
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : 'Feedback could not be recorded.'
-      )
-    } finally {
-      setFeedbackBusy(false)
+      setReportsBusy(false)
     }
   }
 
@@ -847,7 +688,10 @@ export default function SocConsole() {
           </button>
           <button
             className={view === 'chat' ? 'active' : ''}
-            onClick={() => setView('chat')}
+            onClick={() => {
+              setView('chat')
+              void refreshReports()
+            }}
           >
             <MessageSquare size={17} />
             SOC Assistant
@@ -858,33 +702,6 @@ export default function SocConsole() {
           >
             <Bell size={17} />
             Alerts
-          </button>
-          <button
-            className={view === 'alert-triage' ? 'active' : ''}
-            onClick={() => {
-              setView('alert-triage')
-              void refreshFindings()
-            }}
-          >
-            <ShieldAlert size={17} />
-            Findings
-          </button>
-          <button
-            className={view === 'investigations' ? 'active' : ''}
-            onClick={() => {
-              setView('investigations')
-              void refreshInvestigationHistory()
-            }}
-          >
-            <FileSearch size={17} />
-            Incidents
-          </button>
-          <button
-            className={view === 'threat-hunting' ? 'active' : ''}
-            onClick={() => setView('threat-hunting')}
-          >
-            <Search size={17} />
-            Threat Hunting
           </button>
           <button
             className={view === 'assets' ? 'active' : ''}
@@ -994,6 +811,7 @@ export default function SocConsole() {
             <h1>{WORKSPACE_TITLES[view]}</h1>
           </div>
           <div className="topbar-actions">
+            <OpsClock />
             <div className="clerk-controls">
               <UserButton />
             </div>
@@ -1162,67 +980,61 @@ export default function SocConsole() {
               </Panel>
             </div>
 
-            <div className="overview-columns">
-              <Panel
-                title="Recent investigations"
-                icon={<FileSearch size={17} />}
-              >
-                <div className="overview-list">
-                  {overview?.recent_investigations.map((item) => (
-                    <button
-                      key={item.investigation_id}
-                      onClick={() => {
-                        setView('investigations')
-                        void selectInvestigation(item.investigation_id)
-                      }}
-                    >
-                      <div>
-                        <strong>{item.alert_id}</strong>
-                        <span>{item.investigation_id}</span>
+            <Panel
+              title="Shift handoff"
+              icon={<ClipboardList size={17} />}
+              action={
+                <button
+                  className="button button-secondary"
+                  onClick={() => void generateHandoff()}
+                  disabled={handoffBusy}
+                >
+                  <RefreshCw size={14} className={handoffBusy ? 'spin' : ''} />
+                  {handoff ? 'Regenerate' : 'Generate notes'}
+                </button>
+              }
+            >
+              {handoff ? (
+                <div className="handoff-body">
+                  <p className="result-summary">{handoff.summary}</p>
+                  <div className="handoff-columns">
+                    {(
+                      [
+                        ['Highlights', handoff.highlights],
+                        ['Open items', handoff.open_items],
+                        ['Recommendations', handoff.recommendations]
+                      ] as const
+                    ).map(([label, items]) => (
+                      <div key={label} className="handoff-block">
+                        <h3>{label}</h3>
+                        {items.length > 0 ? (
+                          <ul>
+                            {items.map((item) => (
+                              <li key={item}>{item}</li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <span>Nothing recorded</span>
+                        )}
                       </div>
-                      <StatusBadge value={item.status} />
-                      <ChevronRight size={15} />
-                    </button>
-                  ))}
-                  {overview?.recent_investigations.length === 0 && (
-                    <div className="panel-empty">
-                      <FileSearch size={20} />
-                      <span>No persisted investigations</span>
-                    </div>
-                  )}
+                    ))}
+                  </div>
+                  <small className="handoff-meta">
+                    Last {handoff.window_hours}h · {handoff.finding_count}{' '}
+                    findings · {handoff.investigation_count} investigations ·
+                    generated{' '}
+                    {new Date(handoff.generated_at).toLocaleTimeString()}
+                  </small>
                 </div>
-              </Panel>
-
-              <Panel title="Recent findings" icon={<ShieldAlert size={17} />}>
-                <div className="overview-list">
-                  {overview?.recent_findings.map((item) => (
-                    <button
-                      key={item.finding_id}
-                      onClick={() => {
-                        setView('alert-triage')
-                        void selectFinding(item.finding_id)
-                      }}
-                    >
-                      <div>
-                        <strong>{item.title || item.finding_id}</strong>
-                        <span>
-                          {item.alert_count} alert
-                          {item.alert_count === 1 ? '' : 's'}
-                        </span>
-                      </div>
-                      <StatusBadge value={item.verdict} />
-                      <ChevronRight size={15} />
-                    </button>
-                  ))}
-                  {overview?.recent_findings.length === 0 && (
-                    <div className="panel-empty">
-                      <ShieldAlert size={20} />
-                      <span>No persisted findings</span>
-                    </div>
-                  )}
+              ) : (
+                <div className="panel-empty">
+                  <ClipboardList size={20} />
+                  <span>
+                    Generate plain-language notes for the incoming shift
+                  </span>
                 </div>
-              </Panel>
-            </div>
+              )}
+            </Panel>
           </div>
         ) : view === 'chat' ? (
           <div className="chat-workspace">
@@ -1443,6 +1255,97 @@ export default function SocConsole() {
                 )}
               </Panel>
 
+              <Panel
+                title="Saved reports"
+                icon={<FileText size={16} />}
+                action={
+                  <button
+                    className="icon-button"
+                    onClick={() => void refreshReports()}
+                    title="Refresh saved reports"
+                    aria-label="Refresh saved reports"
+                    disabled={reportsBusy}
+                  >
+                    <RefreshCw
+                      size={14}
+                      className={reportsBusy ? 'spin' : ''}
+                    />
+                  </button>
+                }
+              >
+                {reports.length > 0 ? (
+                  <div className="overview-list">
+                    {reports.map((report) => (
+                      <button
+                        key={report.report_id}
+                        onClick={() => setOpenReport(report)}
+                      >
+                        <div>
+                          <strong>{report.title}</strong>
+                          <span>
+                            {new Date(report.created_at).toLocaleString()}
+                          </span>
+                        </div>
+                        <StatusBadge value={report.severity} />
+                        <ChevronRight size={15} />
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="panel-empty">
+                    <FileText size={20} />
+                    <span>
+                      Ask the assistant to write up and save a report - it will
+                      appear here
+                    </span>
+                  </div>
+                )}
+              </Panel>
+
+              <Panel title="Command explainer" icon={<Terminal size={16} />}>
+                <div className="explainer-form">
+                  <textarea
+                    value={explainInput}
+                    onChange={(event) => setExplainInput(event.target.value)}
+                    placeholder="Paste a suspicious command line..."
+                    rows={2}
+                    disabled={explainBusy}
+                  />
+                  <button
+                    className="button button-secondary"
+                    onClick={() => void handleExplainCommand()}
+                    disabled={!explainInput.trim() || explainBusy}
+                  >
+                    {explainBusy ? (
+                      <RefreshCw size={14} className="spin" />
+                    ) : (
+                      <Terminal size={14} />
+                    )}
+                    Explain command
+                  </button>
+                </div>
+                {explanation && (
+                  <div className="result-details">
+                    <div className="explainer-risk">
+                      <StatusBadge value={explanation.risk} />
+                    </div>
+                    <p className="result-summary">
+                      {explanation.plain_english}
+                    </p>
+                    {explanation.indicators.length > 0 && (
+                      <p className="result-summary">
+                        Indicators: {explanation.indicators.join(' · ')}
+                      </p>
+                    )}
+                    {explanation.recommended_checks.length > 0 && (
+                      <p className="result-summary">
+                        Check next: {explanation.recommended_checks.join(' · ')}
+                      </p>
+                    )}
+                  </div>
+                )}
+              </Panel>
+
               {wazuhHealth?.status === 'unhealthy' && (
                 <div className="diagnostic-callout">
                   <AlertTriangle size={17} />
@@ -1456,610 +1359,6 @@ export default function SocConsole() {
               )}
             </aside>
           </div>
-        ) : view === 'alert-triage' ? (
-          <div className="investigation-workspace">
-            <Panel
-              title="Findings"
-              icon={<ShieldAlert size={17} />}
-              action={
-                <button
-                  className="icon-button"
-                  onClick={() => void refreshFindings()}
-                  title="Refresh findings"
-                  aria-label="Refresh findings"
-                  disabled={findingsBusy}
-                >
-                  <RefreshCw size={16} className={findingsBusy ? 'spin' : ''} />
-                </button>
-              }
-            >
-              <div className="history-list">
-                {findings.map((item) => (
-                  <button
-                    key={item.finding_id}
-                    className={
-                      selectedFinding?.finding_id === item.finding_id
-                        ? 'active'
-                        : ''
-                    }
-                    onClick={() => void selectFinding(item.finding_id)}
-                    disabled={findingBusy}
-                  >
-                    <div>
-                      <strong>{item.finding.title}</strong>
-                      <span>{item.finding_id}</span>
-                    </div>
-                    <div className="history-tiers">
-                      {item.alert_count} alert
-                      {item.alert_count === 1 ? '' : 's'}
-                    </div>
-                    <StatusBadge value={item.verdict.verdict} />
-                    <time>{new Date(item.last_seen).toLocaleString()}</time>
-                    <ChevronRight size={16} />
-                  </button>
-                ))}
-                {!findingsBusy && findings.length === 0 && (
-                  <div className="panel-empty">
-                    <ShieldAlert size={20} />
-                    <span>No findings in the selected window</span>
-                  </div>
-                )}
-              </div>
-            </Panel>
-
-            {selectedFinding ? (
-              <>
-                <section className="investigation-header">
-                  <div>
-                    <span className="eyebrow">Selected finding</span>
-                    <h2>{selectedFinding.finding.title}</h2>
-                  </div>
-                  <button
-                    className="icon-button"
-                    onClick={() =>
-                      void selectFinding(selectedFinding.finding_id)
-                    }
-                    title="Refresh finding"
-                    aria-label="Refresh finding"
-                    disabled={findingBusy}
-                  >
-                    <RefreshCw
-                      size={17}
-                      className={findingBusy ? 'spin' : ''}
-                    />
-                  </button>
-                </section>
-
-                <div className="summary-grid">
-                  <Metric
-                    label="Severity"
-                    value={titleCase(selectedFinding.severity)}
-                  />
-                  <Metric
-                    label="Verdict"
-                    value={titleCase(selectedFinding.verdict.verdict)}
-                    detail={`${Math.round(selectedFinding.verdict.confidence * 100)}% confidence`}
-                  />
-                  <Metric
-                    label="Alert count"
-                    value={selectedFinding.alert_count}
-                  />
-                  <Metric
-                    label="Escalation"
-                    value={
-                      selectedFinding.verdict.escalation_recommended
-                        ? 'Recommended'
-                        : 'Not needed'
-                    }
-                  />
-                </div>
-
-                <div className="investigation-columns">
-                  <Panel title="Verdict" icon={<CircleGauge size={17} />}>
-                    <ResultDetails
-                      result={
-                        selectedFinding.verdict as unknown as Record<
-                          string,
-                          unknown
-                        >
-                      }
-                    />
-                    {selectedFinding.verdict.false_positive_indicators.length >
-                      0 && (
-                      <div className="panel-empty">
-                        <AlertTriangle size={16} />
-                        <span>
-                          {selectedFinding.verdict.false_positive_indicators.join(
-                            ' '
-                          )}
-                        </span>
-                      </div>
-                    )}
-                    {selectedFinding.verdict.missing_evidence.length > 0 && (
-                      <div className="panel-empty">
-                        <FileSearch size={16} />
-                        <span>
-                          {selectedFinding.verdict.missing_evidence.join(' ')}
-                        </span>
-                      </div>
-                    )}
-                  </Panel>
-
-                  <Panel title="Enrichment" icon={<Activity size={17} />}>
-                    {selectedFinding.enrichment.length > 0 ? (
-                      <div className="agent-result-list">
-                        {selectedFinding.enrichment.map((item, index) => (
-                          <details
-                            key={`${item.indicator}-${item.source}-${index}`}
-                            open
-                          >
-                            <summary>
-                              <CheckCircle2 size={15} />
-                              {item.indicator} ({item.source})
-                            </summary>
-                            <ResultDetails
-                              result={
-                                item as unknown as Record<string, unknown>
-                              }
-                            />
-                          </details>
-                        ))}
-                      </div>
-                    ) : (
-                      <div className="panel-empty">
-                        <Activity size={20} />
-                        <span>No indicators were enriched</span>
-                      </div>
-                    )}
-                  </Panel>
-                </div>
-
-                <Panel title="Evidence" icon={<ListChecks size={17} />}>
-                  <div className="audit-list">
-                    {selectedFinding.evidence_refs.map((ref) => (
-                      <div key={ref}>
-                        <span className="audit-marker" />
-                        <div>
-                          <strong>{ref}</strong>
-                        </div>
-                      </div>
-                    ))}
-                    {selectedFinding.evidence_refs.length === 0 && (
-                      <div className="panel-empty">
-                        <ListChecks size={20} />
-                        <span>No evidence references recorded</span>
-                      </div>
-                    )}
-                  </div>
-                </Panel>
-
-                <Panel title="Analyst feedback" icon={<Check size={17} />}>
-                  <div className="approval-form">
-                    <div className="field field-full">
-                      <label htmlFor="feedback-notes">Notes</label>
-                      <input
-                        id="feedback-notes"
-                        value={feedbackNotes}
-                        onChange={(event) =>
-                          setFeedbackNotes(event.target.value)
-                        }
-                        placeholder="Optional context for this disposition"
-                      />
-                    </div>
-                    <div
-                      className="approval-buttons field-full"
-                      style={{ flexWrap: 'wrap', justifyContent: 'flex-start' }}
-                    >
-                      {FEEDBACK_OPTIONS.map((option) => (
-                        <button
-                          key={option.value}
-                          className="button button-secondary"
-                          onClick={() =>
-                            void handleFindingFeedback(option.value)
-                          }
-                          disabled={feedbackBusy}
-                        >
-                          {option.label}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                  <div className="audit-list">
-                    {selectedFinding.feedback.map((entry) => (
-                      <div key={entry.feedback_id}>
-                        <span className="audit-marker" />
-                        <div>
-                          <strong>{titleCase(entry.disposition)}</strong>
-                          <span>
-                            {entry.reviewer_user_id}
-                            {entry.notes ? ` — ${entry.notes}` : ''}
-                          </span>
-                          <time>
-                            {new Date(entry.created_at).toLocaleString()}
-                          </time>
-                        </div>
-                      </div>
-                    ))}
-                    {selectedFinding.feedback.length === 0 && (
-                      <div className="panel-empty">
-                        <Check size={20} />
-                        <span>No analyst feedback recorded yet</span>
-                      </div>
-                    )}
-                  </div>
-                </Panel>
-              </>
-            ) : (
-              <div className="investigation-empty">
-                <ShieldAlert size={28} />
-                <h2>No finding selected</h2>
-                <p>Select a finding to review its evidence-backed verdict.</p>
-              </div>
-            )}
-          </div>
-        ) : view === 'investigations' ? (
-          <div className="investigation-workspace">
-            <Panel title="Start investigation" icon={<FileSearch size={17} />}>
-              <form
-                className="investigation-form"
-                onSubmit={handleCreateInvestigation}
-              >
-                <div className="field">
-                  <label htmlFor="alert-id">Wazuh alert document ID</label>
-                  <input
-                    id="alert-id"
-                    value={alertId}
-                    onChange={(event) => setAlertId(event.target.value)}
-                    placeholder="Required"
-                    required
-                  />
-                </div>
-                <div className="field">
-                  <label htmlFor="agent-id">Agent ID</label>
-                  <input
-                    id="agent-id"
-                    value={agentId}
-                    onChange={(event) => setAgentId(event.target.value)}
-                    placeholder="001"
-                    pattern="[0-9]+"
-                  />
-                </div>
-                <button
-                  className="button button-primary"
-                  type="submit"
-                  disabled={investigationBusy}
-                >
-                  <CircleGauge size={16} />
-                  Run workflow
-                </button>
-              </form>
-            </Panel>
-
-            <Panel
-              title="Investigation history"
-              icon={<Clock3 size={17} />}
-              action={
-                <button
-                  className="icon-button"
-                  onClick={() => void refreshInvestigationHistory()}
-                  title="Refresh investigation history"
-                  aria-label="Refresh investigation history"
-                  disabled={historyBusy}
-                >
-                  <RefreshCw size={16} className={historyBusy ? 'spin' : ''} />
-                </button>
-              }
-            >
-              <div className="history-list">
-                {investigationHistory.map((item) => (
-                  <button
-                    key={item.investigation_id}
-                    className={
-                      investigation?.investigation_id === item.investigation_id
-                        ? 'active'
-                        : ''
-                    }
-                    onClick={() =>
-                      void selectInvestigation(item.investigation_id)
-                    }
-                    disabled={investigationBusy}
-                  >
-                    <div>
-                      <strong>{item.alert_id}</strong>
-                      <span>{item.investigation_id}</span>
-                    </div>
-                    <div className="history-tiers">
-                      {item.completed_tiers.length > 0
-                        ? item.completed_tiers
-                            .map((tier) => tier.toUpperCase())
-                            .join(' / ')
-                        : 'Queued'}
-                    </div>
-                    <StatusBadge value={item.status} />
-                    <time>
-                      {item.updated_at
-                        ? new Date(item.updated_at).toLocaleString()
-                        : '-'}
-                    </time>
-                    <ChevronRight size={16} />
-                  </button>
-                ))}
-                {!historyBusy && investigationHistory.length === 0 && (
-                  <div className="panel-empty">
-                    <Clock3 size={20} />
-                    <span>No persisted investigations</span>
-                  </div>
-                )}
-              </div>
-            </Panel>
-
-            {investigation ? (
-              <>
-                <section className="investigation-header">
-                  <div>
-                    <span className="eyebrow">Active investigation</span>
-                    <h2>{investigation.investigation_id}</h2>
-                  </div>
-                  <button
-                    className="icon-button"
-                    onClick={() => void refreshInvestigation()}
-                    title="Refresh investigation"
-                    aria-label="Refresh investigation"
-                    disabled={investigationBusy}
-                  >
-                    <RefreshCw
-                      size={17}
-                      className={investigationBusy ? 'spin' : ''}
-                    />
-                  </button>
-                </section>
-
-                <div className="summary-grid">
-                  <Metric
-                    label="Status"
-                    value={titleCase(investigation.status)}
-                  />
-                  <Metric
-                    label="Current stage"
-                    value={titleCase(investigation.current_stage)}
-                  />
-                  <Metric
-                    label="Severity"
-                    value={
-                      investigation.severity
-                        ? titleCase(investigation.severity)
-                        : '-'
-                    }
-                  />
-                  <Metric
-                    label="Confidence"
-                    value={
-                      investigation.confidence === null ||
-                      investigation.confidence === undefined
-                        ? '-'
-                        : `${Math.round(investigation.confidence * 100)}%`
-                    }
-                  />
-                </div>
-
-                <div className="investigation-columns">
-                  <Panel
-                    title="MAPE-K analysis"
-                    icon={<CircleGauge size={17} />}
-                  >
-                    <div className="agent-result-list">
-                      {[
-                        ['Diagnosis', investigation.diagnosis],
-                        ['Remediation plan', investigation.remediation_plan],
-                        ['Policy decision', investigation.policy_decision],
-                        ['Verification', investigation.verification],
-                        ['Rollback', investigation.rollback]
-                      ].map(([label, result]) =>
-                        result ? (
-                          <details key={label as string} open>
-                            <summary>
-                              <CheckCircle2 size={15} />
-                              {label as string}
-                            </summary>
-                            <ResultDetails
-                              result={result as Record<string, unknown>}
-                            />
-                          </details>
-                        ) : null
-                      )}
-                      {!investigation.diagnosis && (
-                        <div className="panel-empty">
-                          <CircleGauge size={20} />
-                          <span>No workflow analysis was produced</span>
-                        </div>
-                      )}
-                    </div>
-                  </Panel>
-
-                  <Panel title="Audit trail" icon={<ListChecks size={17} />}>
-                    <div className="audit-list">
-                      {investigation.audit_events
-                        .slice()
-                        .reverse()
-                        .map((event) => (
-                          <div key={`${event.timestamp}-${event.event}`}>
-                            <span className="audit-marker" />
-                            <div>
-                              <strong>{titleCase(event.event)}</strong>
-                              <span>{titleCase(event.stage)}</span>
-                              <time>
-                                {new Date(event.timestamp).toLocaleString()}
-                              </time>
-                            </div>
-                          </div>
-                        ))}
-                      {investigation.audit_events.length === 0 && (
-                        <div className="panel-empty">
-                          <Clock3 size={20} />
-                          <span>No transitions recorded</span>
-                        </div>
-                      )}
-                    </div>
-                  </Panel>
-                </div>
-
-                {investigation.tier_reports &&
-                  investigation.tier_reports.length > 0 && (
-                    <Panel
-                      title="Analyst handoff reports"
-                      icon={<FileSearch size={17} />}
-                    >
-                      <div className="agent-result-list">
-                        {investigation.tier_reports.map((report) => (
-                          <details key={report.report_id} open>
-                            <summary>
-                              <CheckCircle2 size={15} />
-                              {report.tier.toUpperCase()} incident report
-                            </summary>
-                            <ResultDetails
-                              result={
-                                report as unknown as Record<string, unknown>
-                              }
-                            />
-                          </details>
-                        ))}
-                      </div>
-                    </Panel>
-                  )}
-
-                {investigation.errors.length > 0 && (
-                  <Panel
-                    title="Workflow errors"
-                    icon={<AlertTriangle size={17} />}
-                    className="error-panel"
-                  >
-                    <pre>{JSON.stringify(investigation.errors, null, 2)}</pre>
-                  </Panel>
-                )}
-
-                {investigation.approval_request &&
-                  investigation.pending_nodes.includes('human_approval') && (
-                    <Panel
-                      title="Human approval checkpoint"
-                      icon={<ShieldAlert size={17} />}
-                      action={<StatusBadge value="awaiting_approval" />}
-                      className="approval-panel"
-                    >
-                      <div className="approval-actions">
-                        {investigation.approval_request.proposed_actions.map(
-                          (action) => (
-                            <article
-                              key={`${action.action_type}-${action.target}`}
-                            >
-                              <div>
-                                <strong>{titleCase(action.action_type)}</strong>
-                                <StatusBadge
-                                  value={String(action.risk_level)}
-                                />
-                              </div>
-                              <span>{action.target}</span>
-                              <code>
-                                TTL {action.ttl_seconds ?? 'not applicable'}{' '}
-                                seconds
-                              </code>
-                              <p>
-                                Evidence:{' '}
-                                {action.evidence_refs.join(', ') || 'none'}
-                              </p>
-                            </article>
-                          )
-                        )}
-                      </div>
-                      <div className="approval-form">
-                        <div className="approval-buttons field-full">
-                          <button
-                            className="button button-danger"
-                            onClick={() => void handleApproval('reject')}
-                            disabled={investigationBusy}
-                          >
-                            <X size={16} />
-                            Reject all
-                          </button>
-                          <button
-                            className="button button-primary"
-                            onClick={() => void handleApproval('approve')}
-                            disabled={investigationBusy}
-                          >
-                            <Check size={16} />
-                            Approve response
-                          </button>
-                        </div>
-                      </div>
-                    </Panel>
-                  )}
-
-                {investigation.approval_request &&
-                  investigation.pending_nodes.includes(
-                    'execution_authorization'
-                  ) && (
-                    <Panel
-                      title="Approved response"
-                      icon={<ShieldAlert size={17} />}
-                      action={<StatusBadge value="approved" />}
-                      className="approval-panel"
-                    >
-                      <div className="approval-actions">
-                        {investigation.approval_request.proposed_actions.map(
-                          (action) => (
-                            <article
-                              key={`${action.action_type}-${action.target}`}
-                            >
-                              <div>
-                                <strong>{titleCase(action.action_type)}</strong>
-                                <StatusBadge
-                                  value={String(action.risk_level)}
-                                />
-                              </div>
-                              <span>{action.target}</span>
-                              <code>
-                                TTL {action.ttl_seconds ?? 'not applicable'}{' '}
-                                seconds
-                              </code>
-                              <p>
-                                Evidence:{' '}
-                                {action.evidence_refs.join(', ') || 'none'}
-                              </p>
-                            </article>
-                          )
-                        )}
-                      </div>
-                      <div className="approval-buttons">
-                        <button
-                          className="button button-danger"
-                          onClick={() => void handleExecution()}
-                          disabled={investigationBusy}
-                        >
-                          <Terminal size={16} />
-                          Execute approved response
-                        </button>
-                      </div>
-                    </Panel>
-                  )}
-
-                {investigation.final_report && (
-                  <Panel title="Final report" icon={<CheckCircle2 size={17} />}>
-                    <pre className="report-output">
-                      {JSON.stringify(investigation.final_report, null, 2)}
-                    </pre>
-                  </Panel>
-                )}
-              </>
-            ) : (
-              <div className="investigation-empty">
-                <FileSearch size={28} />
-                <h2>No investigation selected</h2>
-                <p>
-                  Enter a real Wazuh alert document ID to run the LangGraph
-                  workflow.
-                </p>
-              </div>
-            )}
-          </div>
         ) : (
           <PlatformWorkspaces
             view={view}
@@ -2067,12 +1366,44 @@ export default function SocConsole() {
             platform={platform}
             platformBusy={platformBusy}
             onRefreshPlatform={refreshPlatform}
-            onOpenInvestigation={openInvestigation}
-            onInvestigateAlert={investigateAlert}
             onRunCommand={openAssistantPrompt}
           />
         )}
       </main>
+
+      <Dialog
+        open={openReport !== null}
+        onOpenChange={(open) => {
+          if (!open) setOpenReport(null)
+        }}
+      >
+        <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto">
+          {openReport && (
+            <>
+              <DialogHeader>
+                <DialogTitle>{openReport.title}</DialogTitle>
+              </DialogHeader>
+              <div className="report-dialog-meta">
+                <StatusBadge value={openReport.severity} />
+                <span>{openReport.created_by}</span>
+                <time>{new Date(openReport.created_at).toLocaleString()}</time>
+                <a
+                  className="text-button"
+                  href={`/api/tsage/api/v1/reports/${encodeURIComponent(openReport.report_id)}.pdf`}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  <ScrollText size={13} />
+                  Download PDF
+                </a>
+              </div>
+              <div className="report-dialog-body">
+                <MarkdownRenderer>{openReport.body_markdown}</MarkdownRenderer>
+              </div>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

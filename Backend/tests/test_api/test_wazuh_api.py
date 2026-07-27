@@ -8,8 +8,13 @@ import httpx
 import pytest
 
 from app.main import app
+from app.api.v1.endpoints import wazuh as wazuh_endpoints
 from app.services.wazuh.dependencies import get_wazuh_gateway, get_wazuh_responder
-from app.services.wazuh.models import AlertEvidence, AlertSearchResult
+from app.services.wazuh.models import (
+    AlertEvidence,
+    AlertSearchResult,
+    NewAlertCheckResult,
+)
 
 READ = {"Authorization": "Bearer test-read-key"}
 WRITE = {"Authorization": "Bearer test-write-key"}
@@ -101,6 +106,42 @@ def test_read_token_lists_normalized_alerts(client, gateway):
     assert response.status_code == 200
     assert response.json()["data"]["affected_items"][0]["alert_id"] == "alert-1"
     assert response.headers["X-Request-ID"]
+
+
+def test_monitor_check_returns_typed_delta(
+    monkeypatch,
+):
+    class Service:
+        def __init__(self, **kwargs):
+            pass
+
+        def ingest(self):
+            return NewAlertCheckResult(
+                source="wazuh-indexer",
+                connection_profile_id="default",
+                index_pattern="wazuh-alerts-*",
+                checked_at=datetime(2026, 7, 26, 12, 30, tzinfo=UTC),
+                previous_check_at=datetime(
+                    2026, 7, 26, 12, 25, tzinfo=UTC
+                ),
+                new_alert_count=14,
+                duplicate_alert_count=3,
+                new_finding_count=2,
+                new_incident_count=0,
+                highest_new_rule_level=12,
+                has_new_alerts=True,
+                cursor_advanced=True,
+                truncated=False,
+                pages=1,
+            )
+
+    monkeypatch.setattr(wazuh_endpoints, "AlertIngestionService", Service)
+
+    response = wazuh_endpoints.check_new_alerts(SimpleNamespace())
+
+    assert response["data"]["new_alert_count"] == 14
+    assert response["data"]["duplicate_alert_count"] == 3
+    assert response["data"]["cursor_advanced"] is True
 
 
 def test_valid_incoming_request_id_is_preserved(client):

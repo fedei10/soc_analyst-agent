@@ -28,8 +28,8 @@ from app.db.models.investigation import (
 )
 from app.db.models.alert_memory import InvestigationStepRecord
 from app.db.models.alert_memory import WazuhAlertRecord
-from app.coreAgents.orchestration.reporting import build_tier_report
-from app.coreAgents.orchestration.schemas import AgentTier
+from app.orchestration.reporting import build_tier_report
+from app.orchestration.schemas import AgentTier
 from app.db.sanitization import bounded_excerpt, sanitize_for_storage
 from app.db.session import (
     DatabaseNotConfiguredError,

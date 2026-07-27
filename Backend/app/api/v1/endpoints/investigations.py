@@ -11,22 +11,19 @@ from fastapi.responses import StreamingResponse
 from app.api.auth.deps import (
     AuthPrincipal,
     require_approve,
-    require_execute,
     require_investigate,
     require_read,
 )
 from app.api.v1.schemas.investigation import (
     AgentChatRequest,
     ApprovalDecisionInput,
-    InvestigationCreate,
-    ResponseExecutionInput,
+    CommandExplainInput,
 )
 from app.config import settings
-from app.coreAgents.orchestration.investigation_service import (
+from app.orchestration.investigation_service import (
     InvestigationNotFoundError,
     get_investigation_service,
 )
-from app.db.repositories.investigations import ResponseExecutionConflictError
 from app.db.repositories.findings import (
     FindingRepository,
     get_finding_repository,
@@ -36,13 +33,15 @@ from app.services.redis.ephemeral import EphemeralRedis
 from app.services.wazuh.dependencies import get_wazuh_gateway
 from app.services.wazuh.gateway import WazuhGateway
 from app.soc_assistant.catalog import public_catalog
+from app.soc_assistant.command_explainer import (
+    MAX_COMMAND_LENGTH,
+    explain_command,
+)
+from app.soc_assistant.handoff import build_shift_handoff
+from app.services.telegram.notifier import get_telegram_notifier
 from app.soc_assistant.overview import build_soc_overview, build_soc_platform
 from app.soc_assistant.schemas import AssistantRequest
 from app.soc_assistant.service import SOCAssistant
-from app.soc_assistant.references import (
-    InvestigationReferenceError,
-    resolve_investigation_reference,
-)
 
 
 read = APIRouter(dependencies=[Depends(require_read)])
@@ -54,7 +53,6 @@ InvestigatorPrincipal = Annotated[
     Depends(require_investigate),
 ]
 ApproverPrincipal = Annotated[AuthPrincipal, Depends(require_approve)]
-ExecutorPrincipal = Annotated[AuthPrincipal, Depends(require_execute)]
 AssistantGateway = Annotated[WazuhGateway, Depends(get_wazuh_gateway)]
 FindingRepo = Annotated[FindingRepository, Depends(get_finding_repository)]
 activity_store = EphemeralRedis()
@@ -156,151 +154,6 @@ def _conversation_repository():
     return get_conversation_repository()
 
 
-def _initial_state(
-    investigation_id: str,
-    request: InvestigationCreate,
-) -> dict[str, Any]:
-    return get_investigation_service().initial_state(
-        investigation_id,
-        alert_id=request.alert_id,
-        agent_id=request.agent_id,
-    )
-
-
-@read.post(
-    "/investigations",
-    status_code=201,
-    tags=["investigations"],
-    dependencies=[Depends(require_investigate)],
-)
-def create_investigation(
-    request: InvestigationCreate,
-    principal: InvestigatorPrincipal,
-    gateway: AssistantGateway,
-):
-    _enforce_rate_limit(
-        principal,
-        operation="create-investigation",
-        limit=10,
-    )
-    service = get_investigation_service()
-    try:
-        resolved = resolve_investigation_reference(
-            request.alert_id,
-            agent_id=request.agent_id,
-            organization_id=principal.scope_id,
-            gateway=gateway,
-            investigations=service,
-        )
-    except InvestigationReferenceError as exc:
-        raise HTTPException(status_code=422, detail=exc.payload()) from exc
-    if resolved.existing_investigation is not None:
-        return {
-            "data": _public_data(
-                {
-                    **resolved.existing_investigation,
-                    "existing": True,
-                    "message": (
-                        "An active investigation already exists for this alert."
-                    ),
-                }
-            )
-        }
-    snapshot = service.start(
-        alert_id=resolved.alert_id,
-        finding_id=resolved.finding_id,
-        agent_id=resolved.agent_id,
-        initiated_by=principal.user_id,
-        organization_id=principal.scope_id,
-        owner_user_id=principal.user_id,
-    )
-    _publish_activity(snapshot)
-    return {"data": _public_data(snapshot)}
-
-
-def _history_item(snapshot: dict[str, Any]) -> dict[str, Any]:
-    audit_events = snapshot.get("audit_events", [])
-    timestamps = [
-        str(item["timestamp"])
-        for item in audit_events
-        if isinstance(item, dict) and item.get("timestamp")
-    ]
-    return {
-        key: snapshot.get(key)
-        for key in (
-            "investigation_id",
-            "alert_id",
-            "agent_id",
-            "status",
-            "current_stage",
-            "severity",
-            "confidence",
-            "initiated_by",
-            "initiation_reason",
-        )
-    } | {
-        "completed_tiers": [
-            tier
-            for tier in ("l1", "l2", "l3")
-            if isinstance(snapshot.get(f"{tier}_result"), dict)
-        ],
-        "created_at": timestamps[0] if timestamps else None,
-        "updated_at": timestamps[-1] if timestamps else None,
-    }
-
-
-@read.get("/investigations", tags=["investigations"])
-def list_investigations(
-    principal: ReadPrincipal,
-    limit: int = Query(default=20, ge=1, le=100),
-    offset: int = Query(default=0, ge=0),
-    status: str | None = Query(
-        default=None,
-        pattern=(
-            "^(created|running|awaiting_approval|waiting_verification|"
-            "approved|rejected|completed|escalated|failed)$"
-        ),
-    ),
-):
-    service = get_investigation_service()
-    items = service.list_history(
-        limit=limit,
-        offset=offset,
-        status=status,
-        organization_id=principal.scope_id,
-    )
-    return {
-        "data": {
-            "items": [_history_item(item) for item in items],
-            "count": len(items),
-            "total": service.history_count(
-                status=status,
-                organization_id=principal.scope_id,
-            ),
-            "limit": limit,
-            "offset": offset,
-        }
-    }
-
-
-@read.get(
-    "/investigations/{investigation_id}",
-    tags=["investigations"],
-)
-def get_investigation(
-    investigation_id: str,
-    principal: ReadPrincipal,
-):
-    return {
-        "data": _public_data(
-            _snapshot(
-                investigation_id,
-                organization_id=principal.scope_id,
-            )
-        )
-    }
-
-
 @write.post(
     "/investigations/{investigation_id}/approval",
     tags=["investigations"],
@@ -331,243 +184,6 @@ def decide_investigation(
     )
     _publish_activity(snapshot)
     return {"data": _public_data(snapshot)}
-
-
-@write.post(
-    "/investigations/{investigation_id}/execute",
-    tags=["investigations"],
-    dependencies=[Depends(require_execute)],
-)
-def execute_investigation_response(
-    investigation_id: str,
-    request: ResponseExecutionInput,
-    principal: ExecutorPrincipal,
-):
-    try:
-        snapshot = get_investigation_service().execute_approved(
-            investigation_id,
-            approval_id=request.approval_id,
-            executed_by=principal.user_id,
-            executor_roles=principal.roles,
-            organization_id=principal.scope_id,
-        )
-    except InvestigationNotFoundError:
-        raise HTTPException(404, f"Investigation {investigation_id} not found.")
-    except ResponseExecutionConflictError as exc:
-        raise HTTPException(409, str(exc))
-    _publish_activity(snapshot)
-    return {"data": _public_data(snapshot)}
-
-
-@write.post(
-    "/investigations/{investigation_id}/verification/resume",
-    tags=["investigations"],
-    dependencies=[Depends(require_execute)],
-)
-def resume_investigation_verification(
-    investigation_id: str,
-    principal: ExecutorPrincipal,
-):
-    try:
-        snapshot = get_investigation_service().resume_verification(
-            investigation_id,
-            resumed_by=principal.user_id,
-            executor_roles=principal.roles,
-            organization_id=principal.scope_id,
-        )
-    except InvestigationNotFoundError:
-        raise HTTPException(404, f"Investigation {investigation_id} not found.")
-    except ResponseExecutionConflictError as exc:
-        raise HTTPException(409, str(exc))
-    _publish_activity(snapshot)
-    return {"data": _public_data(snapshot)}
-
-
-@read.get(
-    "/investigations/{investigation_id}/report",
-    tags=["investigations"],
-)
-def get_investigation_report(
-    investigation_id: str,
-    principal: ReadPrincipal,
-):
-    try:
-        report = get_investigation_service().report(
-            investigation_id,
-            organization_id=principal.scope_id,
-        )
-    except InvestigationNotFoundError:
-        raise HTTPException(404, f"Investigation {investigation_id} not found.")
-    if report is None:
-        raise HTTPException(409, "Investigation report is not ready.")
-    return {"data": _public_data(report)}
-
-
-@read.get(
-    "/investigations/{investigation_id}/tier-reports",
-    tags=["investigations"],
-)
-def get_investigation_tier_reports(
-    investigation_id: str,
-    principal: ReadPrincipal,
-):
-    try:
-        items = get_investigation_service().tier_reports(
-            investigation_id,
-            organization_id=principal.scope_id,
-        )
-    except InvestigationNotFoundError:
-        raise HTTPException(404, f"Investigation {investigation_id} not found.")
-    return {
-        "data": {
-            "items": _public_data(items),
-            "count": len(items),
-        }
-    }
-
-
-@read.get(
-    "/investigations/{investigation_id}/agent-runs",
-    tags=["investigations"],
-)
-def get_investigation_agent_runs(
-    investigation_id: str,
-    principal: ReadPrincipal,
-):
-    try:
-        items = get_investigation_service().agent_runs(
-            investigation_id,
-            organization_id=principal.scope_id,
-        )
-    except InvestigationNotFoundError:
-        raise HTTPException(404, f"Investigation {investigation_id} not found.")
-    return {
-        "data": {
-            "items": _public_data(items),
-            "count": len(items),
-        }
-    }
-
-
-@read.get(
-    "/investigations/{investigation_id}/audit",
-    tags=["investigations"],
-)
-def get_investigation_audit(
-    investigation_id: str,
-    principal: ReadPrincipal,
-):
-    try:
-        items = get_investigation_service().audit_history(
-            investigation_id,
-            organization_id=principal.scope_id,
-        )
-    except InvestigationNotFoundError:
-        raise HTTPException(404, f"Investigation {investigation_id} not found.")
-    return {
-        "data": {
-            "items": _public_data(items),
-            "count": len(items),
-        }
-    }
-
-
-@read.get(
-    "/investigations/{investigation_id}/approvals",
-    tags=["investigations"],
-)
-def get_investigation_approvals(
-    investigation_id: str,
-    principal: ReadPrincipal,
-):
-    try:
-        items = get_investigation_service().approval_history(
-            investigation_id,
-            organization_id=principal.scope_id,
-        )
-    except InvestigationNotFoundError:
-        raise HTTPException(404, f"Investigation {investigation_id} not found.")
-    return {
-        "data": {
-            "items": _public_data(items),
-            "count": len(items),
-        }
-    }
-
-
-@read.get(
-    "/investigations/{investigation_id}/actions",
-    tags=["investigations"],
-)
-def get_investigation_actions(
-    investigation_id: str,
-    principal: ReadPrincipal,
-):
-    try:
-        items = get_investigation_service().response_actions(
-            investigation_id,
-            organization_id=principal.scope_id,
-        )
-    except InvestigationNotFoundError:
-        raise HTTPException(404, f"Investigation {investigation_id} not found.")
-    return {
-        "data": {
-            "items": _public_data(items),
-            "count": len(items),
-        }
-    }
-
-
-@read.get(
-    "/investigations/{investigation_id}/events",
-    tags=["investigations"],
-)
-def stream_investigation_activity(
-    investigation_id: str,
-    principal: ReadPrincipal,
-    after_id: str | None = Query(default=None, max_length=128),
-):
-    _snapshot(
-        investigation_id,
-        organization_id=principal.scope_id,
-    )
-
-    def events():
-        redis_events = activity_store.read_activity(
-            organization_id=principal.scope_id,
-            investigation_id=investigation_id,
-            after_id=after_id,
-            limit=500,
-        )
-        if redis_events:
-            for item in redis_events:
-                yield _sse(
-                    str(item["event"]),
-                    _public_data({
-                        "id": item["id"],
-                        "timestamp": item.get("timestamp"),
-                        **(item.get("payload") or {}),
-                    }),
-                )
-            return
-
-        for item in get_investigation_service().audit_history(
-            investigation_id,
-            organization_id=principal.scope_id,
-        ):
-            yield _sse(
-                str(item.get("event") or "activity"),
-                _public_data(item),
-            )
-
-    return StreamingResponse(
-        events(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-    )
 
 
 @read.get("/soc/conversations", tags=["agents"])
@@ -714,6 +330,99 @@ def get_soc_overview(
     return {"data": _public_data(overview.model_dump(mode="json"))}
 
 
+@read.get("/soc/handoff", tags=["assistant"])
+def get_shift_handoff(
+    principal: ReadPrincipal,
+    gateway: AssistantGateway,
+    finding_repository: FindingRepo,
+    hours: int = Query(default=8, ge=1, le=48),
+):
+    service = get_investigation_service()
+    snapshots = service.list_history(
+        limit=50,
+        organization_id=principal.scope_id,
+    )
+    findings = finding_repository.list(
+        organization_id=settings.WAZUH_INGESTION_ORGANIZATION_ID,
+        limit=50,
+    )
+    try:
+        alert_summary = gateway.alert_summary(hours=hours)
+    except Exception as exc:
+        logger.warning(
+            "soc_handoff_wazuh_unavailable",
+            error_type=type(exc).__name__,
+        )
+        alert_summary = None
+    try:
+        handoff = build_shift_handoff(
+            investigations=snapshots,
+            findings=findings,
+            alert_summary=alert_summary,
+            window_hours=hours,
+        )
+    except Exception as exc:
+        logger.warning(
+            "soc_handoff_generation_failed",
+            error_type=type(exc).__name__,
+        )
+        raise HTTPException(
+            503,
+            "The handoff writer is unavailable. Try again shortly.",
+        )
+    return {"data": handoff}
+
+
+@read.post("/soc/explain-command", tags=["assistant"])
+def post_explain_command(
+    request: CommandExplainInput,
+    principal: ReadPrincipal,
+):
+    try:
+        explanation, usage = explain_command(
+            request.command[:MAX_COMMAND_LENGTH],
+        )
+    except Exception as exc:
+        logger.warning(
+            "soc_command_explainer_failed",
+            error_type=type(exc).__name__,
+        )
+        raise HTTPException(
+            503,
+            "The command explainer is unavailable. Try again shortly.",
+        )
+    return {
+        "data": {
+            **explanation.model_dump(mode="json"),
+            "token_usage": {
+                "input_tokens": usage.get("input_tokens"),
+                "output_tokens": usage.get("output_tokens"),
+            },
+        }
+    }
+
+
+@read.post(
+    "/soc/telegram/test",
+    tags=["assistant"],
+    dependencies=[Depends(require_investigate)],
+)
+def post_telegram_test(_: InvestigatorPrincipal):
+    notifier = get_telegram_notifier()
+    if not notifier.configured:
+        raise HTTPException(
+            409,
+            "Telegram is not configured. Set TELEGRAM_BOT_TOKEN and "
+            "TELEGRAM_CHAT_ID.",
+        )
+    sent = notifier.send(
+        "TSAGE SOC connector test: if you can read this, alert push is working."
+    )
+    if not sent:
+        raise HTTPException(502, "Telegram rejected the test message.")
+    return {"data": {"sent": True}}
+
+
 @read.get("/soc/platform", tags=["assistant"])
 def get_soc_platform(principal: ReadPrincipal):
     snapshots = get_investigation_service().list_history(
@@ -754,6 +463,7 @@ def get_soc_platform(principal: ReadPrincipal):
             "approvals": "indefinite",
             "actions": "indefinite",
         },
+        wazuh_dashboard_url=settings.WAZUH_DASHBOARD_URL.strip() or None,
     )
     return {"data": _public_data(platform.model_dump(mode="json"))}
 

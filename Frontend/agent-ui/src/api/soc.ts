@@ -1,16 +1,16 @@
 import type {
   AgentChatResponse,
   AlertSummary,
+  AnalystReport,
+  AnalystReportList,
   ApprovalInput,
   AssistantCommandCatalog,
   ChatActivity,
-  FeedbackDisposition,
-  Finding,
-  FindingFeedback,
-  FindingList,
+  CommandExplanation,
   Investigation,
-  InvestigationHistory,
+  PrioritizedVulnerabilityList,
   ServicesHealth,
+  ShiftHandoff,
   SOCOverview,
   SOCPlatform,
   StorageHealth,
@@ -237,39 +237,6 @@ export function sendAgentMessage(
   })
 }
 
-export function createInvestigation(
-  alertId: string,
-  agentId?: string
-): Promise<Investigation> {
-  return request('/api/v1/investigations', {
-    method: 'POST',
-    body: JSON.stringify({
-      alert_id: alertId,
-      agent_id: agentId || null
-    })
-  })
-}
-
-export function getInvestigation(
-  investigationId: string
-): Promise<Investigation> {
-  return request(
-    `/api/v1/investigations/${encodeURIComponent(investigationId)}`
-  )
-}
-
-export function getInvestigationHistory(
-  limit = 25,
-  status?: string
-): Promise<InvestigationHistory> {
-  const query = new URLSearchParams({
-    limit: String(limit),
-    offset: '0'
-  })
-  if (status) query.set('status', status)
-  return request(`/api/v1/investigations?${query.toString()}`)
-}
-
 export function submitApproval(
   investigationId: string,
   input: ApprovalInput
@@ -283,43 +250,29 @@ export function submitApproval(
   )
 }
 
-export function getFindings(
-  hours = 24,
-  minLevel = 0,
-  limit = 50
-): Promise<FindingList> {
-  const query = new URLSearchParams({
-    hours: String(hours),
-    min_level: String(minLevel),
-    limit: String(limit)
-  })
-  return request(`/api/v1/findings?${query.toString()}`)
+export function getShiftHandoff(hours = 8): Promise<ShiftHandoff> {
+  return request(`/api/v1/soc/handoff?hours=${hours}`)
 }
 
-export function getFinding(findingId: string): Promise<Finding> {
-  return request(`/api/v1/findings/${encodeURIComponent(findingId)}`)
-}
-
-export function submitFindingFeedback(
-  findingId: string,
-  disposition: FeedbackDisposition,
-  notes?: string
-): Promise<FindingFeedback> {
-  return request(`/api/v1/findings/${encodeURIComponent(findingId)}/feedback`, {
+export function explainCommand(command: string): Promise<CommandExplanation> {
+  return request('/api/v1/soc/explain-command', {
     method: 'POST',
-    body: JSON.stringify({ disposition, notes: notes || undefined })
+    body: JSON.stringify({ command })
   })
 }
 
-export function executeApprovedResponse(
-  investigationId: string,
-  approvalId: string
-): Promise<Investigation> {
-  return request(
-    `/api/v1/investigations/${encodeURIComponent(investigationId)}/execute`,
-    {
-      method: 'POST',
-      body: JSON.stringify({ approval_id: approvalId })
-    }
-  )
+export function getPrioritizedVulnerabilities(): Promise<PrioritizedVulnerabilityList> {
+  return request('/api/v1/vulnerabilities/prioritized')
+}
+
+export function testTelegramConnector(): Promise<{ sent: boolean }> {
+  return request('/api/v1/soc/telegram/test', { method: 'POST' })
+}
+
+export function getReports(limit = 20): Promise<AnalystReportList> {
+  return request(`/api/v1/reports?limit=${limit}`)
+}
+
+export function getReport(reportId: string): Promise<AnalystReport> {
+  return request(`/api/v1/reports/${encodeURIComponent(reportId)}`)
 }

@@ -1,14 +1,20 @@
+import time
 from types import SimpleNamespace
 
 import httpx
 import pytest
 from pydantic import BaseModel
 
+from openai import RateLimitError
+
 from app.mape_k.llm import (
     LLMErrorCode,
     LLMInvocationError,
     LLMProvider,
+    LLMRateLimitedError,
+    LLMRateLimiter,
     classify_llm_error,
+    is_rate_limit_error,
 )
 
 
@@ -70,6 +76,37 @@ def test_timeout_and_rate_limit_are_classified_without_secret_text():
     assert rate_limit.safe_metadata()["http_status"] == 429
     assert "secret provider response" not in str(timeout)
     assert "secret provider response" not in str(rate_limit)
+
+
+def _openai_rate_limit_error() -> RateLimitError:
+    response = httpx.Response(429, request=httpx.Request("POST", "https://example.com"))
+    return RateLimitError("rate limited", response=response, body=None)
+
+
+def test_is_rate_limit_error_recognizes_raw_openai_error():
+    assert is_rate_limit_error(_openai_rate_limit_error()) is True
+
+
+def test_is_rate_limit_error_recognizes_classified_llm_invocation_error():
+    classified = classify_llm_error(
+        _openai_rate_limit_error(), attempt=1, duration_ms=5
+    )
+    assert is_rate_limit_error(classified) is True
+
+
+def test_is_rate_limit_error_walks_wrapped_exceptions():
+    try:
+        try:
+            raise _openai_rate_limit_error()
+        except RateLimitError as exc:
+            raise RuntimeError("graph step failed") from exc
+    except RuntimeError as wrapped:
+        assert is_rate_limit_error(wrapped) is True
+
+
+def test_is_rate_limit_error_is_false_for_unrelated_errors():
+    assert is_rate_limit_error(ValueError("not a rate limit")) is False
+    assert is_rate_limit_error(TimeoutError("slow")) is False
 
 
 def test_invalid_structured_output_is_classified():
@@ -138,3 +175,82 @@ def test_retryable_timeout_retries_once_then_returns_usage(monkeypatch):
     assert client.calls == 2
     assert usage["model_calls"] == 2
     assert usage["retries"] == 1
+
+
+def _clocked(monkeypatch):
+    clock = [0.0]
+    sleeps: list[float] = []
+
+    def fake_monotonic():
+        return clock[0]
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(time, "sleep", fake_sleep)
+    return clock, sleeps
+
+
+def test_llm_rate_limiter_allows_up_to_max_without_sleeping(monkeypatch):
+    clock, sleeps = _clocked(monkeypatch)
+    limiter = LLMRateLimiter(max_requests=4, period_seconds=60.0, max_wait_seconds=8.0)
+
+    for _ in range(4):
+        limiter.acquire()
+
+    assert sleeps == []
+    assert len(limiter._timestamps) == 4
+
+
+def test_llm_rate_limiter_blocks_until_a_slot_frees_up(monkeypatch):
+    clock, sleeps = _clocked(monkeypatch)
+    limiter = LLMRateLimiter(max_requests=2, period_seconds=60.0, max_wait_seconds=100.0)
+
+    limiter.acquire()  # t=0
+    clock[0] = 10.0
+    limiter.acquire()  # t=10, window now [0, 10]
+    limiter.acquire()  # window full - must wait until t=0's slot expires at t=60
+
+    assert sleeps  # it actually waited
+    assert clock[0] >= 60.0
+
+
+def test_llm_rate_limiter_gives_up_past_the_max_wait_cap(monkeypatch):
+    _clocked(monkeypatch)
+    limiter = LLMRateLimiter(max_requests=1, period_seconds=60.0, max_wait_seconds=5.0)
+
+    limiter.acquire()
+    with pytest.raises(LLMRateLimitedError) as error:
+        limiter.acquire()
+
+    assert error.value.wait_seconds > 5.0
+
+
+def test_get_client_wires_the_shared_rate_limiter(monkeypatch):
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def invoke(self, *args, **kwargs):
+            return "raw-response"
+
+    monkeypatch.setattr("langchain_openai.ChatOpenAI", FakeChatOpenAI)
+    monkeypatch.setattr("app.mape_k.llm.settings.LLM_PROVIDER", "oxy")
+    monkeypatch.setattr(
+        "app.mape_k.llm.settings.LLM_API_KEY",
+        SimpleNamespace(get_secret_value=lambda: "test-key"),
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        "app.mape_k.llm.llm_rate_limiter.acquire",
+        lambda: calls.append(1),
+    )
+
+    client = LLMProvider().get_client()
+    result = client.invoke("hello")
+
+    assert result == "raw-response"
+    assert calls == [1]

@@ -6,18 +6,17 @@ import {
   Box,
   Check,
   CheckCircle2,
-  ChevronRight,
   Clock3,
   Database,
+  ExternalLink,
   FileClock,
-  FileSearch,
-  Filter,
   Gauge,
   History,
   Network,
   Play,
   RefreshCw,
   Search,
+  Send,
   Server,
   Settings2,
   Shield,
@@ -32,12 +31,15 @@ import { toast } from 'sonner'
 import {
   getAgents,
   getAlerts,
+  getPrioritizedVulnerabilities,
   getServicesHealth,
   getStorageHealth,
-  submitApproval
+  submitApproval,
+  testTelegramConnector
 } from '@/api/soc'
 import type {
   AssistantCommand,
+  PrioritizedVulnerability,
   ServicesHealth,
   SOCPlatform,
   StorageHealth,
@@ -114,10 +116,12 @@ function WorkspaceHeader({
 function Panel({
   title,
   icon,
+  action,
   children
 }: {
   title: string
   icon: ReactNode
+  action?: ReactNode
   children: ReactNode
 }) {
   return (
@@ -127,6 +131,7 @@ function Panel({
           {icon}
           <h2>{title}</h2>
         </div>
+        {action}
       </header>
       {children}
     </section>
@@ -157,8 +162,6 @@ interface PlatformWorkspacesProps {
   platform: SOCPlatform | null
   platformBusy: boolean
   onRefreshPlatform: () => Promise<void>
-  onOpenInvestigation: (investigationId: string) => void
-  onInvestigateAlert: (alert: WazuhAlert) => void
   onRunCommand: (prompt: string) => void
 }
 
@@ -168,23 +171,18 @@ export default function PlatformWorkspaces({
   platform,
   platformBusy,
   onRefreshPlatform,
-  onOpenInvestigation,
-  onInvestigateAlert,
   onRunCommand
 }: PlatformWorkspacesProps) {
   const [alerts, setAlerts] = useState<WazuhAlert[]>([])
   const [alertTotal, setAlertTotal] = useState(0)
-  const [alertQuery, setAlertQuery] = useState('')
-  const [alertHours, setAlertHours] = useState(24)
-  const [alertLevel, setAlertLevel] = useState(7)
   const [alertsBusy, setAlertsBusy] = useState(false)
   const [agents, setAgents] = useState<WazuhAgent[]>([])
   const [agentTotal, setAgentTotal] = useState(0)
   const [agentQuery, setAgentQuery] = useState('')
   const [agentsBusy, setAgentsBusy] = useState(false)
-  const [huntIndicator, setHuntIndicator] = useState('')
-  const [huntType, setHuntType] = useState('ip')
-  const [huntHours, setHuntHours] = useState(24)
+  const [vulns, setVulns] = useState<PrioritizedVulnerability[]>([])
+  const [vulnsBusy, setVulnsBusy] = useState(false)
+  const [telegramTestBusy, setTelegramTestBusy] = useState(false)
   const [services, setServices] = useState<ServicesHealth | null>(null)
   const [storage, setStorage] = useState<StorageHealth | null>(null)
   const [healthBusy, setHealthBusy] = useState(false)
@@ -192,12 +190,7 @@ export default function PlatformWorkspaces({
   async function loadAlerts() {
     setAlertsBusy(true)
     try {
-      const result = await getAlerts(
-        alertHours,
-        alertLevel,
-        50,
-        alertQuery.trim() || undefined
-      )
+      const result = await getAlerts(24, 7, 10)
       setAlerts(result.affected_items)
       setAlertTotal(result.total_affected_items)
     } catch (error) {
@@ -224,6 +217,33 @@ export default function PlatformWorkspaces({
     }
   }
 
+  async function loadVulnerabilities() {
+    setVulnsBusy(true)
+    try {
+      setVulns((await getPrioritizedVulnerabilities()).items)
+    } catch {
+      setVulns([])
+    } finally {
+      setVulnsBusy(false)
+    }
+  }
+
+  async function handleTelegramTest() {
+    setTelegramTestBusy(true)
+    try {
+      await testTelegramConnector()
+      toast.success('Test message sent. Check your Telegram chat.')
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : 'The Telegram test message could not be sent.'
+      )
+    } finally {
+      setTelegramTestBusy(false)
+    }
+  }
+
   async function loadHealth() {
     setHealthBusy(true)
     const [serviceResult, storageResult] = await Promise.allSettled([
@@ -241,27 +261,18 @@ export default function PlatformWorkspaces({
 
   useEffect(() => {
     if (view === 'alerts' && alerts.length === 0) void loadAlerts()
-    if (view === 'assets' && agents.length === 0) void loadAgents()
+    if (view === 'assets' && agents.length === 0) {
+      void loadAgents()
+      void loadVulnerabilities()
+    }
     if (view === 'integrations') void loadHealth()
     // Each workspace loads its bounded data only when first opened.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view])
 
-  function handleAlertSearch(event: FormEvent) {
-    event.preventDefault()
-    void loadAlerts()
-  }
-
   function handleAgentSearch(event: FormEvent) {
     event.preventDefault()
     void loadAgents()
-  }
-
-  function handleHunt(event: FormEvent) {
-    event.preventDefault()
-    const indicator = huntIndicator.trim()
-    if (!indicator) return
-    onRunCommand(`/hunt ${indicator} --type ${huntType} --hours ${huntHours}`)
   }
 
   async function handleApproval(
@@ -293,63 +304,34 @@ export default function PlatformWorkspaces({
         <WorkspaceHeader
           eyebrow="Wazuh indexer"
           title="Alerts"
-          detail="Recent security events from the Wazuh alert index."
+          detail="Quick glance at the most recent level 7+ events. Use the SOC Assistant to filter, correlate, or hunt."
           action={
-            <button
-              className="icon-button"
-              onClick={() => void loadAlerts()}
-              disabled={alertsBusy}
-              title="Refresh alerts"
-              aria-label="Refresh alerts"
-            >
-              <RefreshCw size={17} className={alertsBusy ? 'spin' : ''} />
-            </button>
+            <div className="header-actions">
+              {platform?.wazuh_dashboard_url && (
+                <a
+                  className="button button-secondary"
+                  href={platform.wazuh_dashboard_url}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  <ExternalLink size={14} />
+                  Open in Wazuh
+                </a>
+              )}
+              <button
+                className="icon-button"
+                onClick={() => void loadAlerts()}
+                disabled={alertsBusy}
+                title="Refresh alerts"
+                aria-label="Refresh alerts"
+              >
+                <RefreshCw size={17} className={alertsBusy ? 'spin' : ''} />
+              </button>
+            </div>
           }
         />
-        <Panel title="Alert filters" icon={<Filter size={17} />}>
-          <form className="platform-filter" onSubmit={handleAlertSearch}>
-            <label>
-              <span>Search</span>
-              <input
-                value={alertQuery}
-                onChange={(event) => setAlertQuery(event.target.value)}
-                placeholder="Rule, host, user, or indicator"
-              />
-            </label>
-            <label>
-              <span>Minimum level</span>
-              <select
-                value={alertLevel}
-                onChange={(event) => setAlertLevel(Number(event.target.value))}
-              >
-                <option value={0}>All levels</option>
-                <option value={5}>Level 5+</option>
-                <option value={7}>Level 7+</option>
-                <option value={10}>Level 10+</option>
-                <option value={12}>Level 12+</option>
-              </select>
-            </label>
-            <label>
-              <span>Window</span>
-              <select
-                value={alertHours}
-                onChange={(event) => setAlertHours(Number(event.target.value))}
-              >
-                <option value={1}>1 hour</option>
-                <option value={6}>6 hours</option>
-                <option value={24}>24 hours</option>
-                <option value={72}>3 days</option>
-                <option value={168}>7 days</option>
-              </select>
-            </label>
-            <button className="button button-primary" type="submit">
-              <Search size={15} />
-              Search
-            </button>
-          </form>
-        </Panel>
         <Panel
-          title={`${alertTotal} matching alerts`}
+          title={`${alertTotal} matching alerts (last 24h, level 7+)`}
           icon={<ShieldAlert size={17} />}
         >
           <div className="platform-table">
@@ -365,114 +347,17 @@ export default function PlatformWorkspaces({
                 <Status value={`level_${alert.rule_level}`} />
                 <span>{alert.source_ip || alert.target_user || '-'}</span>
                 <time>{new Date(alert.timestamp).toLocaleString()}</time>
-                <button
-                  className="icon-button"
-                  onClick={() => onInvestigateAlert(alert)}
-                  title="Start investigation"
-                  aria-label={`Investigate ${alert.alert_id}`}
-                >
-                  <FileSearch size={15} />
-                </button>
               </article>
             ))}
             {!alertsBusy && alerts.length === 0 && (
               <EmptyState
                 icon={<ShieldAlert size={24} />}
                 title="No matching alerts"
-                detail="Adjust the Wazuh level, window, or search filter."
+                detail="Nothing at level 7+ in the last 24 hours."
               />
             )}
           </div>
         </Panel>
-      </div>
-    )
-  }
-
-  if (view === 'threat-hunting') {
-    return (
-      <div className="platform-workspace">
-        <WorkspaceHeader
-          eyebrow="Proactive investigation"
-          title="Threat Hunting"
-          detail="Search bounded Wazuh alerts and archived telemetry for one indicator."
-        />
-        <Panel title="New hunt" icon={<Search size={17} />}>
-          <form className="hunt-form" onSubmit={handleHunt}>
-            <label>
-              <span>Indicator</span>
-              <input
-                value={huntIndicator}
-                onChange={(event) => setHuntIndicator(event.target.value)}
-                placeholder="IP, domain, hash, process, user, or path"
-                required
-              />
-            </label>
-            <label>
-              <span>Type</span>
-              <select
-                value={huntType}
-                onChange={(event) => setHuntType(event.target.value)}
-              >
-                {[
-                  'ip',
-                  'domain',
-                  'hash',
-                  'process',
-                  'user',
-                  'path',
-                  'other'
-                ].map((value) => (
-                  <option key={value} value={value}>
-                    {titleCase(value)}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              <span>Window</span>
-              <select
-                value={huntHours}
-                onChange={(event) => setHuntHours(Number(event.target.value))}
-              >
-                <option value={6}>6 hours</option>
-                <option value={24}>24 hours</option>
-                <option value={72}>3 days</option>
-                <option value={168}>7 days</option>
-              </select>
-            </label>
-            <button className="button button-primary" type="submit">
-              <Play size={15} />
-              Run hunt
-            </button>
-          </form>
-        </Panel>
-        <div className="platform-columns">
-          <Panel title="Telemetry scope" icon={<Network size={17} />}>
-            <div className="settings-list">
-              <div>
-                <span>Wazuh alerts</span>
-                <Status value="active" />
-              </div>
-              <div>
-                <span>Archived logs</span>
-                <Status value="active" />
-              </div>
-              <div>
-                <span>Execution mode</span>
-                <strong>Read only</strong>
-              </div>
-            </div>
-          </Panel>
-          <Panel title="Hunt boundary" icon={<Shield size={17} />}>
-            <div className="platform-note">
-              <Shield size={18} />
-              <span>
-                Hunts use allowlisted search tools and return evidence
-                references. Response actions remain behind human approval.
-              </span>
-            </div>
-          </Panel>
-        </div>
       </div>
     )
   }
@@ -485,15 +370,28 @@ export default function PlatformWorkspaces({
           title="Assets"
           detail="Wazuh agents registered with the connected manager."
           action={
-            <button
-              className="icon-button"
-              onClick={() => void loadAgents()}
-              disabled={agentsBusy}
-              title="Refresh assets"
-              aria-label="Refresh assets"
-            >
-              <RefreshCw size={17} className={agentsBusy ? 'spin' : ''} />
-            </button>
+            <div className="header-actions">
+              {platform?.wazuh_dashboard_url && (
+                <a
+                  className="button button-secondary"
+                  href={platform.wazuh_dashboard_url}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  <ExternalLink size={14} />
+                  Open in Wazuh
+                </a>
+              )}
+              <button
+                className="icon-button"
+                onClick={() => void loadAgents()}
+                disabled={agentsBusy}
+                title="Refresh assets"
+                aria-label="Refresh assets"
+              >
+                <RefreshCw size={17} className={agentsBusy ? 'spin' : ''} />
+              </button>
+            </div>
           }
         />
         <Panel
@@ -550,6 +448,56 @@ export default function PlatformWorkspaces({
                 icon={<Server size={24} />}
                 title="No agents returned"
                 detail="Check the Wazuh manager connection or search filter."
+              />
+            )}
+          </div>
+        </Panel>
+
+        <Panel
+          title="Vulnerability priorities"
+          icon={<ShieldAlert size={17} />}
+          action={
+            <button
+              className="icon-button"
+              onClick={() => void loadVulnerabilities()}
+              disabled={vulnsBusy}
+              title="Refresh vulnerability priorities"
+              aria-label="Refresh vulnerability priorities"
+            >
+              <RefreshCw size={16} className={vulnsBusy ? 'spin' : ''} />
+            </button>
+          }
+        >
+          <div className="vuln-list">
+            {vulns.map((vuln, index) => (
+              <article key={`${vuln.cve}-${vuln.agent_id}-${index}`}>
+                <header>
+                  <strong>{vuln.cve}</strong>
+                  {vuln.known_exploited && (
+                    <span className="status-badge status-danger">
+                      Actively exploited
+                    </span>
+                  )}
+                  <Status value={vuln.severity.toLowerCase()} />
+                  <span className="vuln-score">
+                    {vuln.priority_score.toFixed(1)}
+                  </span>
+                </header>
+                <p>
+                  {vuln.package || 'unknown package'} on{' '}
+                  {vuln.agent_name || vuln.agent_id || 'unknown agent'}
+                  {vuln.epss != null &&
+                    ` - EPSS ${(vuln.epss * 100).toFixed(1)}%`}
+                  {vuln.cvss != null && ` - CVSS ${vuln.cvss}`}
+                </p>
+                <span>{vuln.reasons.join(' ')}</span>
+              </article>
+            ))}
+            {!vulnsBusy && vulns.length === 0 && (
+              <EmptyState
+                icon={<ShieldAlert size={24} />}
+                title="No vulnerability data"
+                detail="Requires the Wazuh vulnerability module (4.8+) and an indexer connection."
               />
             )}
           </div>
@@ -639,18 +587,13 @@ export default function PlatformWorkspaces({
             {pending.map((approval) => (
               <article key={approval.approval_id}>
                 <header>
-                  <button
-                    className="queue-title"
-                    onClick={() =>
-                      onOpenInvestigation(approval.investigation_id)
-                    }
-                  >
+                  <div className="queue-title">
                     <strong>{approval.investigation_id}</strong>
                     <span>
                       {approval.proposed_actions.length} proposed action
                       {approval.proposed_actions.length === 1 ? '' : 's'}
                     </span>
-                  </button>
+                  </div>
                   <Status value={approval.required_role || 'pending'} />
                 </header>
                 <div className="queue-actions">
@@ -752,16 +695,11 @@ export default function PlatformWorkspaces({
                   <strong>
                     {titleCase(action.action_type || 'response action')}
                   </strong>
-                  <button
-                    onClick={() => onOpenInvestigation(action.investigation_id)}
-                  >
-                    {action.investigation_id}
-                  </button>
+                  <span>{action.investigation_id}</span>
                 </div>
                 <Status value={action.status} />
                 <span>{action.target || '-'}</span>
                 <span>Risk {action.risk_level ?? '-'}</span>
-                <ChevronRight size={15} />
               </article>
             ))}
             {!platformBusy && actions.length === 0 && (
@@ -802,6 +740,28 @@ export default function PlatformWorkspaces({
         detail: 'Ephemeral cache, progress replay, locks, and rate limits',
         status: storage?.redis,
         icon: <Network size={18} />
+      },
+      {
+        name: 'Telegram',
+        detail:
+          services?.services.telegram?.detail ||
+          'Alert push and /alerts, /status chat commands',
+        status: services?.services.telegram?.status,
+        icon: <Send size={18} />,
+        action:
+          services?.services.telegram?.status === 'healthy' ? (
+            <button
+              className="button button-secondary"
+              onClick={(event) => {
+                event.stopPropagation()
+                void handleTelegramTest()
+              }}
+              disabled={telegramTestBusy}
+            >
+              <RefreshCw size={13} className={telegramTestBusy ? 'spin' : ''} />
+              Send test
+            </button>
+          ) : null
       }
     ]
     return (
@@ -831,6 +791,7 @@ export default function PlatformWorkspaces({
               </header>
               <strong>{integration.name}</strong>
               <p>{integration.detail}</p>
+              {integration.action}
             </article>
           ))}
         </div>
@@ -910,9 +871,8 @@ export default function PlatformWorkspaces({
         <Panel title="Recent events" icon={<History size={17} />}>
           <div className="audit-table">
             {platform?.audit_events.map((event, index) => (
-              <button
+              <div
                 key={`${event.investigation_id}-${event.timestamp}-${event.event}-${index}`}
-                onClick={() => onOpenInvestigation(event.investigation_id)}
               >
                 <span className="audit-marker" />
                 <div>
@@ -922,8 +882,7 @@ export default function PlatformWorkspaces({
                   </span>
                 </div>
                 <time>{new Date(event.timestamp).toLocaleString()}</time>
-                <ChevronRight size={15} />
-              </button>
+              </div>
             ))}
             {!platformBusy && !platform?.audit_events.length && (
               <EmptyState

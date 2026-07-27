@@ -2,14 +2,14 @@
 
 HTTP-only investigation request and response models can remain in this module
 when the investigation API is added. Internal graph models live under
-app.coreAgents.orchestration.
+app.orchestration.
 """
 
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.coreAgents.orchestration.schemas import (
+from app.orchestration.schemas import (
     ActionRisk,
     ApprovalChoice,
     ApprovalDecision,
@@ -24,7 +24,7 @@ from app.coreAgents.orchestration.schemas import (
     TierReport,
     WRITE_ACTIONS,
 )
-from app.coreAgents.orchestration.state import (
+from app.orchestration.state import (
     InvestigationStage,
     InvestigationState,
     InvestigationStatus,
@@ -33,15 +33,6 @@ from app.coreAgents.orchestration.state import (
 
 class APIModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
-
-
-class InvestigationCreate(APIModel):
-    alert_id: str = Field(min_length=1, max_length=256)
-    agent_id: str | None = Field(
-        default=None,
-        pattern=r"^\d+$",
-        max_length=32,
-    )
 
 
 class InvestigationHistoryItem(APIModel):
@@ -108,10 +99,6 @@ class ApprovalDecisionInput(APIModel):
     )
 
 
-class ResponseExecutionInput(APIModel):
-    approval_id: str = Field(min_length=1, max_length=100)
-
-
 class ChatHistoryMessage(APIModel):
     role: Literal["user", "assistant"]
     content: str = Field(min_length=1, max_length=8000)
@@ -124,6 +111,10 @@ class AgentChatRequest(APIModel):
         default_factory=list,
         max_length=20,
     )
+
+
+class CommandExplainInput(APIModel):
+    command: str = Field(min_length=1, max_length=4000)
 
 
 class OrchestratorChatRequest(APIModel):
@@ -155,7 +146,6 @@ __all__ = [
     "InvestigationStage",
     "InvestigationState",
     "InvestigationStatus",
-    "InvestigationCreate",
     "InvestigationHistoryItem",
     "L1Result",
     "L2Result",
@@ -163,7 +153,6 @@ __all__ = [
     "OrchestratorChatRequest",
     "ProposedAction",
     "ResponseActionHistoryItem",
-    "ResponseExecutionInput",
     "Severity",
     "StrictModel",
     "TierReport",

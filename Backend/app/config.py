@@ -105,6 +105,10 @@ class Settings(BaseSettings):
     WAZUH_INDEXER_PASSWORD: SecretStr = SecretStr("")
     WAZUH_ARCHIVE_INDEX: str = "wazuh-archives-*"
     WAZUH_BASE_URL: str = "https://127.0.0.1:55000"
+    # Browsable Wazuh Dashboard (Kibana-style UI), for "Open in Wazuh" links.
+    # Distinct from WAZUH_BASE_URL (manager API) and the indexer port; empty
+    # hides the links.
+    WAZUH_DASHBOARD_URL: str = ""
     WAZUH_USERNAME: str = "wazuh-wui"
     WAZUH_PASSWORD: SecretStr = SecretStr("")
     WAZUH_RESPONDER_USERNAME: str = ""
@@ -131,6 +135,9 @@ class Settings(BaseSettings):
     WAZUH_INGESTION_INTERVAL_SECONDS: int = 20
     WAZUH_INGESTION_PAGE_SIZE: int = 500
     WAZUH_INGESTION_MAX_PAGES_PER_RUN: int = 20
+    WAZUH_INGESTION_OVERLAP_SECONDS: int = 60
+    WAZUH_INGESTION_LEASE_TTL_SECONDS: int = 300
+    WAZUH_CONNECTION_PROFILE_ID: str = "default"
     WAZUH_INGESTION_ORGANIZATION_ID: str = "system"
 
     # Durable investigations and LangGraph checkpoints. Leave empty for the
@@ -164,6 +171,35 @@ class Settings(BaseSettings):
     SELF_HEALING_ENABLED: bool = False
     SELF_HEALING_SERVICE_ALLOWLIST: str = ""
     SYSTEM_COMMAND_TIMEOUT: int = 10
+
+    # Telegram connector: push alert notifications, and a command worker that
+    # answers /alerts, /status, /ask, etc. through the same SOCAssistant used
+    # by the web chat. Bot-token auth only; the bot can never approve or
+    # execute a response action, since those commands are not in its catalog.
+    TELEGRAM_BOT_TOKEN: SecretStr = SecretStr("")
+    TELEGRAM_CHAT_ID: str = ""
+    TELEGRAM_ALLOWED_CHAT_IDS: str = ""
+    TELEGRAM_MIN_FINDING_SEVERITY: str = "high"
+    TELEGRAM_NOTIFY_APPROVALS: bool = True
+    TELEGRAM_TIMEOUT_SECONDS: int = 10
+    TELEGRAM_POLL_TIMEOUT_SECONDS: int = 30
+
+    @field_validator("TELEGRAM_MIN_FINDING_SEVERITY")
+    @classmethod
+    def validate_telegram_min_severity(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {
+            "informational",
+            "low",
+            "medium",
+            "high",
+            "critical",
+        }:
+            raise ValueError(
+                "TELEGRAM_MIN_FINDING_SEVERITY must be informational, low, "
+                "medium, high, or critical."
+            )
+        return normalized
 
     @field_validator("MAPEK_EXECUTION_MODE")
     @classmethod

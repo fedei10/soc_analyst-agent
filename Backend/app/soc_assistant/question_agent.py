@@ -1,4 +1,5 @@
-"""Bounded, read-only SOC question answering through the Oxy provider."""
+"""Bounded, read-only SOC question answering through the centralized LLM
+provider."""
 
 from __future__ import annotations
 
@@ -7,6 +8,7 @@ from typing import Any
 
 from langsmith import traceable
 
+from app.config import settings
 from app.db.sanitization import sanitize_for_storage
 from app.mape_k.llm import LLMProvider, get_llm_provider
 from app.soc_assistant.schemas import QuestionAnswer
@@ -36,7 +38,12 @@ class SOCQuestionAgent:
     @traceable(
         run_type="chain",
         name="soc_assistant.question_agent",
-        tags=["tsage", "soc-assistant", "question-agent", "provider:oxy"],
+        tags=[
+            "tsage",
+            "soc-assistant",
+            "question-agent",
+            f"provider:{settings.LLM_PROVIDER.strip().lower()}",
+        ],
     )
     def answer(
         self,

@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from app.coreAgents.orchestration.schemas import AgentTier, TierReport
+from app.orchestration.schemas import AgentTier, TierReport
 
 
 def _generated_at(state: dict[str, Any], tier: AgentTier) -> datetime:

@@ -13,6 +13,7 @@ const FORWARDED_REQUEST_HEADERS = ['accept', 'content-type', 'x-request-id']
 
 const FORWARDED_RESPONSE_HEADERS = [
   'content-type',
+  'content-disposition',
   'www-authenticate',
   'x-request-id'
 ]

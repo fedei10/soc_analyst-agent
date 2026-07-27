@@ -7,6 +7,7 @@ import pytest
 from app.services.wazuh.models import AlertEvidence, AlertSearchResult
 from app.services.wazuh.normalization.aggregation import (
     aggregate_alerts,
+    aggregate_alerts_with_memberships,
     build_findings,
     severity_for_level,
 )
@@ -231,6 +232,20 @@ def test_auditd_hashes_command_line():
     assert "secret command" not in json.dumps(envelope.model_dump(), default=str)
 
 
+def test_auditd_falls_back_to_command_in_rule_description():
+    envelope = normalize_alert(
+        raw_alert(
+            "audit-no-exe-field",
+            decoder="auditd",
+            description="Audit: Command: /usr/bin/dash.",
+            data={},
+        )
+    )
+    assert envelope.normalized.process_name == "/usr/bin/dash"
+    assert "unknown executable" not in envelope.normalized.summary
+    assert "/usr/bin/dash" in envelope.normalized.summary
+
+
 def test_generic_missing_fields_invalid_timestamp_and_malformed_ip_are_safe():
     raw = {
         "_id": "generic-1",
@@ -264,6 +279,23 @@ def test_authentication_deduplication_and_finding_generation():
     assert findings[0].alert_count == 20
     assert findings[0].severity == "high"
     assert findings[0].evidence_refs
+
+
+def test_group_membership_remains_complete_when_report_evidence_is_bounded():
+    envelopes = [
+        normalize_alert(auth_raw(f"ssh-{index}", offset=index))
+        for index in range(25)
+    ]
+
+    groups, memberships = aggregate_alerts_with_memberships(
+        envelopes,
+        max_evidence_refs=5,
+    )
+
+    assert len(groups) == 1
+    assert len(groups[0].evidence_refs) == 5
+    assert groups[0].truncated_evidence_refs is True
+    assert len(memberships[groups[0].group_id]) == 25
 
 
 def test_authentication_events_do_not_split_at_fixed_clock_boundary():

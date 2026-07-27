@@ -18,9 +18,11 @@ from app.db.session import check_database, database_url
 from app.db.repositories.alert_memory import get_alert_memory_repository
 from app.config import settings
 from app.mape_k.llm import effective_llm_api_key
+from app.services.telegram.notifier import get_telegram_notifier
 from app.services.wazuh.dependencies import get_wazuh_gateway
 from app.services.wazuh.exceptions import WazuhAPIError, WazuhAuthError, WazuhPermissionError
 from app.services.wazuh.gateway import WazuhGateway
+from app.services.wazuh.ingestion import default_ingestion_source_name
 from app.services.redis.connection import check_redis
 
 # Diagnostics require auth: the meaning/fix strings below describe internal
@@ -251,7 +253,11 @@ def ingestion_health(response: Response):
             "durable": False,
             "detail": "PostgreSQL alert memory is not configured.",
         }
-    checkpoint = repository.checkpoint("wazuh-indexer")
+    checkpoint = repository.checkpoint(
+        default_ingestion_source_name(),
+        connection_profile_id=settings.WAZUH_CONNECTION_PROFILE_ID,
+        index_pattern="wazuh-alerts-*",
+    )
     if checkpoint is None:
         return {
             "status": "not_started",
@@ -263,11 +269,25 @@ def ingestion_health(response: Response):
     return {
         "status": checkpoint["status"],
         "durable": True,
+        "connection_profile_id": checkpoint["connection_profile_id"],
+        "index_pattern": checkpoint["index_pattern"],
+        "cursor_version": checkpoint["cursor_version"],
         "last_event_timestamp": checkpoint["last_event_timestamp"],
+        "last_index_name": checkpoint["last_index_name"],
         "last_document_id": checkpoint["last_document_id"],
         "last_run_started_at": checkpoint["last_run_started_at"],
         "last_run_completed_at": checkpoint["last_run_completed_at"],
-        "last_alert_count": checkpoint["last_alert_count"],
+        "checked_at": checkpoint["last_run_completed_at"],
+        "previous_check_at": checkpoint["previous_run_completed_at"],
+        "new_alert_count": checkpoint["last_alert_count"],
+        "duplicate_alert_count": checkpoint["last_duplicate_count"],
+        "new_finding_count": checkpoint["last_finding_count"],
+        "updated_finding_count": checkpoint["last_updated_finding_count"],
+        "new_incident_count": checkpoint["last_incident_count"],
+        "highest_new_rule_level": checkpoint["highest_new_rule_level"],
+        "has_new_alerts": checkpoint["last_alert_count"] > 0,
+        "cursor_advanced": checkpoint["last_cursor_advanced"],
+        "truncated": checkpoint["last_truncated"],
         "error_message": checkpoint["error_message"],
     }
 
@@ -305,6 +325,18 @@ def _build_services_health(gateway: WazuhGateway) -> tuple[ServicesHealthRespons
     except Exception as e:
         results["wazuh"] = ServiceCheck(status="unhealthy", **explain_failure(e))
 
-    healthy = all(r.status == "healthy" for r in results.values())
+    healthy = all(
+        results[name].status == "healthy" for name in ("central_llm", "wazuh")
+    )
+
+    telegram_configured = get_telegram_notifier().configured
+    results["telegram"] = ServiceCheck(
+        status="healthy" if telegram_configured else "disabled",
+        detail=(
+            "Bot token and chat ID configured."
+            if telegram_configured
+            else "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to enable alert push."
+        ),
+    )
     code = status.HTTP_200_OK if healthy else status.HTTP_503_SERVICE_UNAVAILABLE
     return ServicesHealthResponse(status="healthy" if healthy else "unhealthy", services=results), code

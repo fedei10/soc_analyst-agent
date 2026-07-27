@@ -51,6 +51,7 @@ Useful authenticated endpoints:
 - `GET /api/v1/health/storage`
 - `GET /api/v1/health/ingestion`
 - `GET /api/v1/health/wazuh`
+- `POST /api/v1/alerts/check`
 - `GET /api/v1/soc/assistant/commands`
 - `POST /api/v1/soc/orchestrator/chat`
 - `POST /api/v1/soc/orchestrator/chat/stream`
@@ -60,6 +61,12 @@ Useful authenticated endpoints:
 - `GET /api/v1/investigations/{id}/approvals`
 - `POST /api/v1/investigations/{id}/approval`
 - `POST /api/v1/investigations/{id}/execute`
+
+`POST /api/v1/alerts/check` runs one bounded Monitor cycle and returns a
+deterministic delta from the previous successful PostgreSQL checkpoint. It
+uses a 60-second overlap and deduplicates by Wazuh index plus document ID, so
+late indexing and equal timestamps do not invent or lose alerts. The Monitor
+path never calls an LLM; provider outages do not prevent ingestion.
 
 The formal workflow is a controlled MAPE-K state machine. SOC levels are human
 RBAC roles, not autonomous agents. Approval only records a decision. A separate

@@ -49,6 +49,35 @@ class AlertIngestionPage(BaseModel):
     total: int = Field(ge=0)
 
 
+class AlertPagePersistenceResult(BaseModel):
+    """Durable outcome for one idempotently persisted Indexer page."""
+
+    inserted_count: int = Field(ge=0)
+    duplicate_count: int = Field(ge=0)
+    highest_new_rule_level: int | None = Field(default=None, ge=0)
+    cursor_advanced: bool = False
+
+
+class NewAlertCheckResult(BaseModel):
+    """Deterministic result of one checkpointed Wazuh ingestion cycle."""
+
+    source: str
+    connection_profile_id: str
+    index_pattern: str
+    checked_at: datetime
+    previous_check_at: datetime | None = None
+    new_alert_count: int = Field(ge=0)
+    duplicate_alert_count: int = Field(ge=0)
+    new_finding_count: int = Field(ge=0)
+    updated_finding_count: int = Field(default=0, ge=0)
+    new_incident_count: int = Field(default=0, ge=0)
+    highest_new_rule_level: int | None = Field(default=None, ge=0)
+    has_new_alerts: bool
+    cursor_advanced: bool
+    truncated: bool
+    pages: int = Field(ge=0)
+
+
 class ArchivedLogSearchResult(BaseModel):
     index_pattern: str
     archive_status: Literal[
@@ -157,11 +186,17 @@ class EndpointInventory(BaseModel):
         "os",
         "network",
         "hotfixes",
+        "hardware",
     ]
     total: int = Field(ge=0)
     returned: int = Field(ge=0)
     truncated: bool
     items: list[dict[str, Any]]
+
+
+class AgentConnectivitySummary(BaseModel):
+    by_status: dict[str, int]
+    total: int = Field(ge=0)
 
 
 class DetectionEvidence(BaseModel):

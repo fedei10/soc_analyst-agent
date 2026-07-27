@@ -126,6 +126,18 @@ def combined_text(raw: dict[str, Any]) -> str:
     return " ".join(value for value in values if value).lower()
 
 
+def auditd_command_fields(raw: dict[str, Any]) -> str | None:
+    description = text(
+        raw, "rule.description", "description", "rule_description", "full_log"
+    )
+    if not description:
+        return None
+    match = re.search(r"Command:\s*(?P<exe>\S+)", description, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return match.group("exe").rstrip(".") or None
+
+
 def authentication_log_fields(
     raw: dict[str, Any],
 ) -> tuple[str | None, str | None, int | None]:

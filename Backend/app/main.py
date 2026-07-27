@@ -19,15 +19,14 @@ from fastapi.responses import JSONResponse
 from opensearchpy import exceptions as opensearch_exc
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.api.v1.endpoints.findings import read as finding_read_router
-from app.api.v1.endpoints.findings import write as finding_write_router
 from app.api.v1.endpoints.health import router as health_router
 from app.api.v1.endpoints.investigations import read as investigation_read_router
 from app.api.v1.endpoints.investigations import write as investigation_write_router
+from app.api.v1.endpoints.reports import read as report_read_router
 from app.api.v1.endpoints.wazuh import read as wazuh_read_router
 from app.api.v1.endpoints.wazuh import write as wazuh_write_router
 from app.services.wazuh.dependencies import close_wazuh_dependencies
-from app.coreAgents.orchestration.investigation_service import (
+from app.orchestration.investigation_service import (
     close_investigation_service,
     get_investigation_service,
 )
@@ -72,8 +71,7 @@ app.include_router(wazuh_read_router, prefix="/api/v1")
 app.include_router(wazuh_write_router, prefix="/api/v1")
 app.include_router(investigation_read_router, prefix="/api/v1")
 app.include_router(investigation_write_router, prefix="/api/v1")
-app.include_router(finding_read_router, prefix="/api/v1")
-app.include_router(finding_write_router, prefix="/api/v1")
+app.include_router(report_read_router, prefix="/api/v1")
 
 _HTTP_ERROR_CODES = {
     401: "unauthorized",
