@@ -54,6 +54,7 @@ def _feedback_priors(
     *,
     organization_id: str,
     since: datetime,
+    minimum_dispositions: int = 3,
 ) -> dict[str, Any] | None:
     """How analysts have historically dispositioned lookalike findings."""
 
@@ -93,8 +94,13 @@ def _feedback_priors(
         reviewed_findings += 1
         for entry in recent:
             dispositions[str(entry.get("disposition") or "unknown")] += 1
+            disposition = str(entry.get("disposition") or "unknown")
             note = str(entry.get("notes") or "").strip()
-            if note and len(notes) < 3:
+            if (
+                disposition in BENIGN_DISPOSITIONS | MALICIOUS_DISPOSITIONS
+                and note
+                and len(notes) < 3
+            ):
                 notes.append(note[:280])
 
     total = sum(dispositions.values())
@@ -110,14 +116,24 @@ def _feedback_priors(
         for disposition, count in dispositions.items()
         if disposition in MALICIOUS_DISPOSITIONS
     )
+    trusted_total = benign + malicious
+    if trusted_total < max(1, minimum_dispositions):
+        return None
     return {
         "matched_on": sorted(event_types or families),
         "similar_findings_reviewed": reviewed_findings,
         "total_dispositions": total,
         "dispositions": dict(dispositions),
-        "benign_rate": round(benign / total, 3),
-        "malicious_rate": round(malicious / total, 3),
+        "trusted_dispositions": trusted_total,
+        "benign_rate": round(benign / trusted_total, 3),
+        "malicious_rate": round(malicious / trusted_total, 3),
+        "confidence_weight": round(
+            min(1.0, trusted_total / max(minimum_dispositions * 3, 1)),
+            3,
+        ),
         "analyst_notes": notes,
+        "analyst_notes_untrusted": notes,
+        "notes_are_untrusted": True,
     }
 
 
@@ -195,6 +211,16 @@ def incident_priors(
             finding_repository,
             organization_id=organization_id,
             since=since,
+            minimum_dispositions=max(
+                1,
+                int(
+                    getattr(
+                        settings_obj,
+                        "MAPEK_LEARNING_MIN_DISPOSITIONS",
+                        3,
+                    )
+                ),
+            ),
         )
         if feedback:
             priors["analyst_feedback"] = feedback

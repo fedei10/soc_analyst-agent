@@ -58,6 +58,7 @@ import type {
   ChatActivity,
   ChatMessage,
   CommandExplanation,
+  Investigation,
   ShiftHandoff,
   SOCOverview,
   SOCPlatform,
@@ -79,6 +80,16 @@ const SUGGESTED_PROMPTS = [
   '/hunt 192.0.2.10 --type ip',
   '/investigate ALERT-ID --agent 001'
 ]
+
+const INVESTIGATION_POLL_ATTEMPTS = 6
+const INVESTIGATION_POLL_INTERVAL_MS = 2000
+const TERMINAL_INVESTIGATION_STATUSES = new Set([
+  'awaiting_approval',
+  'completed',
+  'escalated',
+  'failed',
+  'rejected'
+])
 
 const WORKSPACE_TITLES: Record<WorkspaceView, string> = {
   overview: 'Operations overview',
@@ -136,9 +147,16 @@ function statusTone(status?: string | null): string {
   )
     return 'danger'
   if (
-    ['awaiting_approval', 'running', 'high', 'medium', 'suspicious'].includes(
-      status
-    )
+    [
+      'queued',
+      'waiting_verification',
+      'awaiting_approval',
+      'escalated',
+      'running',
+      'high',
+      'medium',
+      'suspicious'
+    ].includes(status)
   )
     return 'warning'
   return 'neutral'
@@ -272,6 +290,26 @@ function ChatMessageItem({ message }: { message: ChatMessage }) {
         <p>{message.content}</p>
         {shouldShowResultDetails(message.response) && message.response && (
           <ResultDetails result={message.response} />
+        )}
+        {message.investigation && (
+          <div className="result-details investigation-summary">
+            <div className="result-facts">
+              <div>
+                <span>Investigation</span>
+                <strong>{message.investigation.investigation_id}</strong>
+              </div>
+              <div>
+                <span>Status</span>
+                <StatusBadge value={message.investigation.status} />
+              </div>
+              <div>
+                <span>Stage</span>
+                <strong>
+                  {titleCase(message.investigation.current_stage)}
+                </strong>
+              </div>
+            </div>
+          </div>
         )}
         {message.activities && message.activities.length > 0 && (
           <details className="message-activity">
@@ -475,6 +513,65 @@ export default function SocConsole() {
     }
   }
 
+  function updateInvestigationProgress(
+    investigationId: string,
+    status: string,
+    currentStage: string
+  ) {
+    setMessages((current) =>
+      current.map((message) =>
+        message.investigation?.investigation_id === investigationId
+          ? {
+              ...message,
+              investigation: {
+                ...message.investigation,
+                status,
+                current_stage: currentStage
+              }
+            }
+          : message
+      )
+    )
+  }
+
+  async function trackInvestigation(investigation: Investigation) {
+    for (let attempt = 0; attempt < INVESTIGATION_POLL_ATTEMPTS; attempt += 1) {
+      await new Promise((resolve) =>
+        setTimeout(resolve, INVESTIGATION_POLL_INTERVAL_MS)
+      )
+      try {
+        const nextOverview = await getSOCOverview()
+        setOverview(nextOverview)
+        const latest = nextOverview.recent_investigations.find(
+          (item) => item.investigation_id === investigation.investigation_id
+        )
+        if (!latest) continue
+        updateInvestigationProgress(
+          latest.investigation_id,
+          latest.status,
+          latest.current_stage
+        )
+        if (TERMINAL_INVESTIGATION_STATUSES.has(latest.status)) break
+      } catch {
+        break
+      }
+    }
+    await refreshPlatform()
+  }
+
+  function handleInvestigationQueued(investigation: Investigation) {
+    setMessages((current) => [
+      ...current,
+      createMessage(
+        'agent',
+        `Investigation ${investigation.investigation_id} was queued for alert ${investigation.alert_id || 'unknown'}.`,
+        { investigation }
+      )
+    ])
+    setView('chat')
+    void trackInvestigation(investigation)
+  }
+
   useEffect(() => {
     if (!userLoaded || !userId) return
     setMessages([])
@@ -547,6 +644,7 @@ export default function SocConsole() {
         ...current,
         createMessage('agent', result.assistant_message, {
           response: result.response,
+          investigation: result.investigation || undefined,
           tools: result.tools_used,
           activities: result.activities
         })
@@ -555,6 +653,12 @@ export default function SocConsole() {
       sessionStorage.setItem(conversationStorageKey, result.conversation_id)
       if (result.tools_used?.includes('save_report')) {
         void refreshReports()
+      }
+      if (result.tools_used?.includes('start_investigation')) {
+        void Promise.all([refreshOverview(), refreshPlatform()])
+      }
+      if (result.investigation) {
+        void trackInvestigation(result.investigation)
       }
     } catch (error) {
       const message =
@@ -1367,6 +1471,7 @@ export default function SocConsole() {
             platformBusy={platformBusy}
             onRefreshPlatform={refreshPlatform}
             onRunCommand={openAssistantPrompt}
+            onInvestigationQueued={handleInvestigationQueued}
           />
         )}
       </main>

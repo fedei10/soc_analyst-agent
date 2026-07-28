@@ -56,6 +56,15 @@ class ActionRegistry:
             key=lambda role: ROLE_LEVEL[role],
         )
 
+    def forward_action_for(
+        self,
+        rollback_action_type: ActionType,
+    ) -> ActionType | None:
+        for item in self._items.values():
+            if item.rollback_action_type == rollback_action_type:
+                return item.action_type
+        return None
+
 
 @dataclass(frozen=True)
 class VerificationCheckRegistration:

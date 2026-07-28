@@ -1,0 +1,66 @@
+[
+  {
+    "name": "privilege escalation",
+    "event_type": "process_execution",
+    "attack_family": "execution",
+    "mitre": ["T1068"],
+    "process_name": "/tmp/exploit",
+    "expected": "privilege_escalation_activity"
+  },
+  {
+    "name": "persistence",
+    "event_type": "registry_changed",
+    "attack_family": "endpoint_activity",
+    "mitre": ["T1547.001"],
+    "expected": "persistence_activity"
+  },
+  {
+    "name": "command and control",
+    "event_type": "network_connection",
+    "attack_family": "network_activity",
+    "mitre": ["T1071.001"],
+    "destination_ip": "198.51.100.20",
+    "expected": "command_and_control_activity"
+  },
+  {
+    "name": "exfiltration",
+    "event_type": "network_connection",
+    "attack_family": "network_activity",
+    "mitre": ["T1041"],
+    "destination_ip": "203.0.113.20",
+    "expected": "possible_data_exfiltration"
+  },
+  {
+    "name": "suspicious process",
+    "event_type": "process_created",
+    "attack_family": "endpoint_activity",
+    "mitre": [],
+    "process_name": "powershell.exe",
+    "expected": "suspicious_process_execution"
+  },
+  {
+    "name": "file integrity",
+    "event_type": "file_modified",
+    "attack_family": "file_change",
+    "mitre": [],
+    "file_path": "/etc/sudoers",
+    "expected": "suspicious_file_change"
+  },
+  {
+    "name": "vulnerability",
+    "event_type": "vulnerable_package",
+    "attack_family": "vulnerability_management",
+    "mitre": [],
+    "cve_id": "CVE-2026-0001",
+    "package_name": "openssl",
+    "expected": "high_risk_vulnerability_exposure"
+  },
+  {
+    "name": "software change",
+    "event_type": "package_installed",
+    "attack_family": "software_change",
+    "mitre": [],
+    "package_name": "unknown-agent",
+    "expected": "unauthorized_software_change"
+  }
+]

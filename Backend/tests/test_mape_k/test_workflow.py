@@ -988,6 +988,33 @@ def test_service_persists_the_controlled_snapshot():
     assert completed["executed_actions"][0]["status"] == "dry_run"
 
 
+def test_enqueue_persists_without_running_the_graph():
+    class EmptyGraph:
+        invoked = False
+
+        def get_state(self, _config):
+            return SimpleNamespace(values={}, next=[])
+
+        def invoke(self, *_args, **_kwargs):
+            self.invoked = True
+
+    graph = EmptyGraph()
+    service = InvestigationService(
+        graph=graph,
+        repository=InMemoryInvestigationRepository(),
+    )
+
+    snapshot = service.enqueue(
+        alert_id="alert-queued",
+        agent_id="001",
+        organization_id="user-1",
+    )
+
+    assert snapshot["status"] == "queued"
+    assert snapshot["current_stage"] == "monitor"
+    assert graph.invoked is False
+
+
 def test_service_rejects_execution_when_target_resource_is_locked():
     repository = InMemoryInvestigationRepository()
     graph = create_mape_k_graph(

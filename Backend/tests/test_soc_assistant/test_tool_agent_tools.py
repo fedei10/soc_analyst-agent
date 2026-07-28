@@ -2,10 +2,15 @@
 
 import json
 
+from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.errors import GraphRecursionError
 
 from app.db.repositories.reports import InMemoryReportRepository
-from app.soc_assistant.tool_agent import SOCToolAgent, build_tools
+from app.soc_assistant.tool_agent import (
+    SOCToolAgent,
+    _select_agent_tools,
+    build_tools,
+)
 
 
 def _tools(report_repository, organization_id="user_1", created_by="user_1"):
@@ -50,6 +55,45 @@ def test_save_report_persists_under_the_calling_context():
     assert repo.get(report_id, organization_id="someone_else") is None
 
 
+def test_save_report_is_idempotent_for_the_same_agent_call():
+    repo = InMemoryReportRepository()
+    tool = _tools(repo)["save_report"]
+    payload = {
+        "title": "Incident report",
+        "summary": "One bounded summary.",
+        "body_markdown": "## Summary\nEvidence-backed report.",
+        "related_alert_ids": ["alert-1"],
+    }
+
+    first = json.loads(tool.invoke(payload))
+    second = json.loads(tool.invoke(payload))
+
+    assert first["report_id"] == second["report_id"]
+    assert len(repo.list(organization_id="user_1", limit=10)) == 1
+
+
+def test_mutating_tools_are_only_exposed_for_matching_intent():
+    tools = list(_tools(InMemoryReportRepository()).values())
+
+    lookup = {item.name for item in _select_agent_tools("show alerts", tools)}
+    response = {
+        item.name
+        for item in _select_agent_tools(
+            "investigate and contain alert alert-1",
+            tools,
+        )
+    }
+    report = {
+        item.name
+        for item in _select_agent_tools("save an incident report", tools)
+    }
+
+    assert "start_investigation" not in lookup
+    assert "save_report" not in lookup
+    assert "start_investigation" in response
+    assert "save_report" in report
+
+
 def test_alert_id_from_tool_result_reads_get_alert_and_search_alerts():
     extract = SOCToolAgent._alert_id_from_tool_result
 
@@ -91,6 +135,43 @@ def test_answer_stops_cleanly_on_graph_recursion_limit(monkeypatch):
     assert tool_calls == []
     assert active_alert_id is None
     assert "reasoning-step limit" in answer
+
+
+def test_answer_flags_a_failed_tool_the_model_narrated_as_success(monkeypatch):
+    class FakeLLM:
+        def get_client(self):
+            return object()
+
+    class FakeAgent:
+        def invoke(self, *args, **kwargs):
+            return {
+                "messages": [
+                    ToolMessage(
+                        content="Error: relation \"soc_reports\" does not exist",
+                        name="save_report",
+                        tool_call_id="call-1",
+                        status="error",
+                    ),
+                    AIMessage(content="Report saved successfully."),
+                ]
+            }
+
+    monkeypatch.setattr(
+        "app.soc_assistant.tool_agent.create_react_agent",
+        lambda *args, **kwargs: FakeAgent(),
+    )
+    agent = SOCToolAgent(
+        gateway=None,
+        llm=FakeLLM(),
+        report_repository=InMemoryReportRepository(),
+        investigations=None,
+    )
+
+    answer, tool_calls, _ = agent.answer(question="save a report", history=[])
+
+    assert tool_calls == ["save_report"]
+    assert "Tool failure" in answer
+    assert "`save_report`" in answer
 
 
 def test_save_report_truncates_oversized_fields():

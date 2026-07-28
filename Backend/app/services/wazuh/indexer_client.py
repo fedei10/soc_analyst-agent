@@ -1,5 +1,7 @@
 """Bounded OpenSearch queries for the Wazuh Indexer on port 9200."""
 
+import hashlib
+import json
 import time
 from datetime import datetime
 from threading import Lock
@@ -296,10 +298,20 @@ class WazuhIndexerClient:
         source = hit.get("_source", {})
         if not isinstance(source, dict):
             source = {}
+        raw_hash = hashlib.sha256(
+            json.dumps(
+                source,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
         return RawAlertDocument(
             alert_id=str(hit.get("_id") or alert_id),
             normalized=self._normalize_alert(hit),
             raw_document=_bounded_raw_source(source),
+            index_name=str(hit.get("_index") or self.ALERT_INDEX),
+            raw_document_hash=raw_hash,
         )
 
     def search_alert_page(

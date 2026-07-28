@@ -109,7 +109,7 @@ def recover_expired_temporary_actions(
     now: datetime | None = None,
     limit: int = 100,
 ) -> dict[str, Any]:
-    """Claim and roll back expired actions; intended for a future scheduler."""
+    """Claim and roll back expired actions for the orchestration worker."""
 
     if not _real_recovery_enabled(settings_obj):
         return {

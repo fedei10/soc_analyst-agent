@@ -338,9 +338,10 @@ Real execution additionally requires:
 - an atomic claim for the exact action set; and
 - a registered restricted adapter.
 
-The default `InvestigationService` currently supplies the durable repository
-but does not wire a before-state provider. Consequently, real execution fails
-closed until that provider is implemented and connected.
+The default `InvestigationService` wires `WazuhBeforeStateProvider`. It records
+current agent connectivity and whether TSAGE's durable action ledger already
+contains the effect. This is sufficient for idempotent lab actions, while
+changes made outside TSAGE remain outside that snapshot's scope.
 
 The legacy direct Wazuh response routes are retained only as compatibility
 stubs and always return a conflict response. `MAPEK_EXECUTION_MODE` does not
@@ -376,10 +377,11 @@ or `verified`. Only the Verify stage can establish the final outcome.
 Temporary-action expiry and rollback lifecycle are durable in PostgreSQL. The
 repository can atomically claim overdue actions, recover stale rollback claims,
 enforce bounded retries, and complete a claim only with its token. The
-`recover_expired_temporary_actions()` service exposes a disabled-by-default
-scheduler boundary with a stable rollback idempotency key. A concrete Wazuh
-rollback-and-verification adapter and scheduler/outbox are still required
-before restart recovery is operational.
+`recover_expired_temporary_actions()` uses a stable rollback idempotency key.
+`app.workers.orchestration` polls this boundary and the
+`WazuhTemporaryActionRollbackAdapter` sends only registered inverse commands.
+It verifies manager acceptance and live agent connectivity; exact endpoint
+firewall/account state needs a lab-specific Active Response status command.
 
 ## Verification and rollback
 
@@ -617,33 +619,30 @@ Only ambiguous routing and bounded semantic analysis use Oxy. The model cannot
 invent tools, approve actions, execute commands, mutate workflow state, or
 access responder credentials.
 
-## Known production limitations
+## Current lab boundaries
 
-The following work is intentionally not described as complete:
+- `app.workers.orchestration` polls durable PostgreSQL snapshots instead of
+  requiring a separate broker. The worker must be running for queued
+  investigations, delayed verification, and TTL recovery to progress.
+- Before-state capture combines current Wazuh agent connectivity with TSAGE's
+  durable action ledger. It cannot prove firewall or account state changed
+  outside TSAGE.
+- TTL rollback verifies that the Wazuh manager accepted the registered inverse
+  command and that the target agent remains connected. Exact endpoint-state
+  verification requires a matching custom Active Response status command.
+- The primary alert records its exact Wazuh index, document ID, and hash.
+  Correlated alerts retain normalized hashes unless their raw documents are
+  separately loaded.
+- Checkpoints keep compact normalized evidence and bounded inventory samples;
+  they are not an ID-only event-sourced representation.
+- Runtime response remains intentionally limited to the three registered,
+  reversible SSH/authentication playbooks. The capability registry analyzes
+  privilege escalation, persistence, process, file, C2, exfiltration,
+  vulnerability, and package activity, but returns human-reviewed advisories
+  until matching response and verification adapters exist.
+- Lab deployments may keep `WAZUH_VERIFY_SSL=false`. This is an accepted
+  internship-lab tradeoff, not a blocker for the orchestration design.
 
-1. **Background resumption:** verification deadlines are durable and manual
-   server resume is safe, but no scheduler automatically resumes verification.
-2. **Before-state capture:** the executor contract requires it for real
-   execution, but the default service does not yet provide it.
-3. **TTL operations:** durable claim/retry recovery exists, but no scheduler,
-   outbox, or verified Wazuh rollback adapter runs it automatically.
-4. **State compaction:** major action/evidence duplications are removed and
-   audit history is bounded, but normalized evidence still makes checkpoints
-   larger than an ID-only state.
-5. **Audit immediacy:** durable audit rows are projected on service snapshot;
-   nodes do not yet write each event directly before the next transition.
-6. **Full provenance:** normalized evidence is hashed and resolvable, but exact
-   raw index and raw-document hash provenance are not yet available.
-7. **Rollback convergence:** ambiguous provider outcomes are durably recoverable
-   and shared target locks survive to TTL expiry, but inline rollback is not
-   yet a fully durable, independently verified outbox workflow.
-8. **Execution breadth:** analysis and advisory planning accept any
-   evidence-backed attack diagnosis, but runtime execution is intentionally
-   limited to the three registered SSH/authentication playbooks. Other attack
-   types require human-reviewed response until a dedicated playbook is added.
-9. **Request execution model:** investigation stages still run synchronously
-    in API request/resume paths rather than through a durable background job.
-
-Until these gaps are addressed and the Wazuh lab behavior is verified, keep
-dry run enabled, Wazuh read-only mode enabled, dangerous tools disabled, and
-direct response mode disabled.
+Keep dry run enabled, Wazuh read-only mode enabled, dangerous tools disabled,
+and direct response mode disabled until each lab Active Response command has
+been exercised and its rollback observed.

@@ -18,6 +18,7 @@ from app.api.v1.schemas.investigation import (
     AgentChatRequest,
     ApprovalDecisionInput,
     CommandExplainInput,
+    InvestigationStartInput,
 )
 from app.config import settings
 from app.orchestration.investigation_service import (
@@ -40,6 +41,10 @@ from app.soc_assistant.command_explainer import (
 from app.soc_assistant.handoff import build_shift_handoff
 from app.services.telegram.notifier import get_telegram_notifier
 from app.soc_assistant.overview import build_soc_overview, build_soc_platform
+from app.soc_assistant.references import (
+    InvestigationReferenceError,
+    resolve_investigation_reference,
+)
 from app.soc_assistant.schemas import AssistantRequest
 from app.soc_assistant.service import SOCAssistant
 
@@ -152,6 +157,43 @@ def _conversation_repository():
     from app.db.repositories.conversations import get_conversation_repository
 
     return get_conversation_repository()
+
+
+@read.post(
+    "/investigations",
+    tags=["investigations"],
+    status_code=202,
+    dependencies=[Depends(require_investigate)],
+)
+def queue_investigation(
+    request: InvestigationStartInput,
+    principal: InvestigatorPrincipal,
+    gateway: AssistantGateway,
+):
+    service = get_investigation_service()
+    try:
+        resolved = resolve_investigation_reference(
+            request.alert_id,
+            agent_id=request.agent_id,
+            organization_id=principal.scope_id,
+            gateway=gateway,
+            investigations=service,
+        )
+    except InvestigationReferenceError as exc:
+        raise HTTPException(400, exc.payload()) from exc
+    if resolved.existing_investigation is not None:
+        snapshot = resolved.existing_investigation
+    else:
+        snapshot = service.enqueue(
+            alert_id=resolved.alert_id,
+            finding_id=resolved.finding_id,
+            agent_id=resolved.agent_id,
+            initiated_by=principal.user_id,
+            initiation_reason=request.reason or "Queued through the API.",
+            organization_id=principal.scope_id,
+            owner_user_id=principal.user_id,
+        )
+    return {"data": _public_data(snapshot)}
 
 
 @write.post(
@@ -430,18 +472,22 @@ def get_soc_platform(principal: ReadPrincipal):
         organization_id=principal.scope_id,
     )
     assignments = [
-        {"role": "chat", "provider": "oxy", "model": None},
-        {"role": "l1", "provider": "cerebras", "model": None},
-        {"role": "l2", "provider": "groq", "model": None},
-        {"role": "l3", "provider": "oxy", "model": None},
-    ]
-    assignments.append(
         {
-            "role": "mape_k",
+            "role": "soc_assistant",
             "provider": settings.LLM_PROVIDER,
             "model": settings.LLM_MODEL,
-        }
-    )
+        },
+        {
+            "role": "intent_router",
+            "provider": settings.LLM_PROVIDER,
+            "model": settings.LLM_ROUTER_MODEL or settings.LLM_MODEL,
+        },
+        {
+            "role": "mape_k_analyze_and_plan",
+            "provider": settings.LLM_PROVIDER,
+            "model": settings.LLM_MODEL,
+        },
+    ]
     platform = build_soc_platform(
         investigations=snapshots,
         model_assignments=assignments,

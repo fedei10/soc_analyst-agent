@@ -107,6 +107,7 @@ def _traced(
 def _observed_node(
     node_name: str,
     function: Callable[[IncidentWorkflowState], dict[str, Any]],
+    audit_sink: Callable[..., None] | None = None,
 ) -> Callable[[IncidentWorkflowState], dict[str, Any]]:
     start_events = {
         "monitor": ("workflow_started", "evidence_collection_started"),
@@ -141,6 +142,15 @@ def _observed_node(
             logger.info(event_name, **metadata)
         started = time.perf_counter()
         update = function(state)
+        events = update.get("audit_events") or []
+        if audit_sink is not None and events:
+            audit_sink(
+                state.investigation_id,
+                organization_id=state.organization_id,
+                events=[
+                    item for item in events if isinstance(item, dict)
+                ],
+            )
         duration_ms = round((time.perf_counter() - started) * 1000, 2)
         completed_event = completed_events.get(
             node_name,
@@ -207,6 +217,7 @@ def create_mape_k_graph(
     executor: RestrictedExecutor | None = None,
     verifier: ResponseVerifier | None = None,
     checkpointer=None,
+    audit_sink: Callable[..., None] | None = None,
 ):
     monitor = monitor or WazuhMonitor()
     analyzer = analyzer or IncidentAnalyzer()
@@ -237,7 +248,14 @@ def create_mape_k_graph(
 
     builder = StateGraph(IncidentWorkflowState)
     for name, function in node_functions.items():
-        builder.add_node(name, _observed_node(name, _traced(name, function)))
+        builder.add_node(
+            name,
+            _observed_node(
+                name,
+                _traced(name, function),
+                audit_sink,
+            ),
+        )
 
     builder.add_edge(START, "monitor")
     builder.add_conditional_edges(

@@ -19,6 +19,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, ValidationError
 
 from app.config import settings
+from app.mape_k.capabilities import capability_for_incident
 from app.mape_k.llm import (
     LLMConfigurationError,
     LLMInputLimitError,
@@ -92,8 +93,10 @@ class PlanSelection:
     usage: dict[str, Any] = field(default_factory=dict)
 
 
-def _default_advisory_steps() -> dict[str, list[str]]:
-    return {
+def _default_advisory_steps(
+    diagnosis_type: str,
+) -> dict[str, list[str]]:
+    defaults = {
         "investigation_steps": [
             "Validate scope and timeline across affected assets and "
             "identities using the cited evidence.",
@@ -119,6 +122,18 @@ def _default_advisory_steps() -> dict[str, list[str]]:
             "detections and regression tests."
         ],
     }
+    capability = capability_for_incident(diagnosis_type)
+    if capability is None:
+        return defaults
+    if capability.investigation_steps:
+        defaults["investigation_steps"] = list(
+            capability.investigation_steps
+        )
+    if capability.containment_recommendations:
+        defaults["containment_recommendations"] = list(
+            capability.containment_recommendations
+        )
+    return defaults
 
 
 def _advisory_plan(
@@ -128,7 +143,7 @@ def _advisory_plan(
     decision: PlaybookSelection | None = None,
     rationale: str | None = None,
 ) -> AdvisoryPlan:
-    defaults = _default_advisory_steps()
+    defaults = _default_advisory_steps(diagnosis.incident_type)
 
     def recommendations(name: str) -> list[str]:
         proposed = list(getattr(decision, name, []) or [])

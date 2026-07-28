@@ -11,15 +11,19 @@ this agent never executes, blocks, or changes anything by itself.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from typing import Any, Literal
 
+import structlog
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.errors import GraphRecursionError
 from langgraph.prebuilt import create_react_agent
 
 from app.config import settings
+from app.core.observability.callbacks import observability_callbacks
 from app.db.repositories.findings import get_finding_repository
 from app.db.repositories.reports import ReportRepository, get_report_repository
 from app.mape_k.llm import LLMProvider, get_llm_provider
@@ -36,17 +40,54 @@ from app.soc_assistant.references import (
 )
 
 MAX_TOOL_OUTPUT_CHARS = 6000
-# Each reasoning round is model-call + tool-call (~2.2 graph steps per the
-# previous 20-steps/~9-rounds ratio). 12 steps bounds this to ~5 rounds.
-# It was 7 (~3 rounds) purely because intent routing shared the reasoning
-# provider's per-minute budget; routing now runs on the cheap tier, so the
-# analyst-facing loop can afford to actually correlate before answering.
-RECURSION_LIMIT = 12
+logger = structlog.get_logger("tsage.soc_tool_agent")
+_REPORT_INTENT = re.compile(r"\b(report|write[- ]?up|document|save)\b")
+_RESPONSE_INTENT = re.compile(
+    r"\b(contain|block|isolate|investigat|remediat|respond|escalat|do something)\w*"
+)
 
-SYSTEM_PROMPT = """You are the TSAGE SOC analyst assistant with read-only
-access to live Wazuh data through tools, a tool to save an analyst report on
-request, and a tool to start a formal investigation when the analyst wants a
-response.
+
+def _recursion_limit() -> int:
+    # A tool round consumes roughly two graph steps plus the final answer.
+    return max(4, int(settings.MAPEK_MAX_TOOL_CALLS_PER_STAGE) * 2 + 2)
+
+
+def _select_agent_tools(question: str, tools: list[Any]) -> list[Any]:
+    """Expose the smallest useful capability set for this question."""
+
+    text = question.lower()
+    selected = {
+        "search_alerts",
+        "alert_summary",
+        "get_alert",
+        "rule_mitre_context",
+        "list_findings",
+    }
+    if any(word in text for word in ("agent", "host", "endpoint")):
+        selected.update(
+            {
+                "agent_status",
+                "get_agent_context",
+                "get_agent_inventory",
+                "get_agent_detection_evidence",
+            }
+        )
+    if any(word in text for word in ("vulnerab", "cve", "patch")):
+        selected.update({"vulnerability_overview", "get_agent_context"})
+    if any(word in text for word in ("health", "wazuh", "connected")):
+        selected.add("wazuh_health_summary")
+    if _RESPONSE_INTENT.search(text):
+        selected.update({"start_investigation", "get_investigation_status"})
+    if "inv-" in text or "investigation status" in text:
+        selected.add("get_investigation_status")
+    if _REPORT_INTENT.search(text):
+        selected.add("save_report")
+    return [item for item in tools if item.name in selected]
+
+SYSTEM_PROMPT = """You are the TSAGE SOC analyst assistant with controlled
+read access to live Wazuh data, plus two scoped workflow tools: save an
+analyst report when explicitly requested, and queue a formal investigation
+when the analyst wants a response. You cannot directly execute a response.
 
 How to work:
 - Use the minimum number of tools necessary. Prefer one broad query over
@@ -447,7 +488,8 @@ def build_tools(
                     "existing": True,
                 }
             )
-        snapshot = investigations.start(
+        start = getattr(investigations, "enqueue", investigations.start)
+        snapshot = start(
             alert_id=resolved.alert_id,
             finding_id=resolved.finding_id,
             agent_id=resolved.agent_id,
@@ -462,6 +504,7 @@ def build_tools(
                 "status": snapshot["status"],
                 "current_stage": snapshot["current_stage"],
                 "pending_nodes": snapshot.get("pending_nodes", []),
+                "queued": snapshot.get("status") == "queued",
                 "diagnosis": snapshot.get("diagnosis"),
                 "advisory_plan": snapshot.get("advisory_plan"),
             }
@@ -509,6 +552,24 @@ def build_tools(
         two sentences, body_markdown is the full write-up (use ## headings
         for Summary / Evidence / Recommendations). Only call this when the
         analyst asked for a report or a saved write-up."""
+        idempotency_key = hashlib.sha256(
+            json.dumps(
+                {
+                    "organization_id": organization_id,
+                    "conversation_id": conversation_id,
+                    "created_by": created_by,
+                    "title": title[:256],
+                    "summary": summary[:2000],
+                    "body_markdown": body_markdown[:20000],
+                    "severity": severity,
+                    "related_alert_ids": sorted(related_alert_ids or []),
+                    "related_finding_ids": sorted(
+                        related_finding_ids or []
+                    ),
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
         record = report_repository.create(
             organization_id=organization_id,
             title=title[:256],
@@ -519,6 +580,7 @@ def build_tools(
             conversation_id=conversation_id,
             related_alert_ids=related_alert_ids or [],
             related_finding_ids=related_finding_ids or [],
+            idempotency_key=idempotency_key,
         )
         return _clip(
             {
@@ -585,6 +647,35 @@ class SOCToolAgent:
             return str(alert_id) if alert_id else None
         return None
 
+    @staticmethod
+    def _evidence_refs_from_tool_result(raw_content: Any) -> list[str]:
+        try:
+            payload = json.loads(raw_content)
+        except (TypeError, ValueError):
+            return []
+        found: list[str] = []
+
+        def visit(value: Any) -> None:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key in {
+                        "alert_id",
+                        "finding_id",
+                        "evidence_id",
+                        "investigation_id",
+                    } and isinstance(item, (str, int)):
+                        rendered = str(item)
+                        if rendered and rendered not in found:
+                            found.append(rendered)
+                    else:
+                        visit(item)
+            elif isinstance(value, list):
+                for item in value:
+                    visit(item)
+
+        visit(payload)
+        return found[:12]
+
     def answer(
         self,
         *,
@@ -605,22 +696,26 @@ class SOCToolAgent:
             if item.get("role") in {"user", "assistant"}
         ]
         messages.append({"role": "user", "content": question[:4000]})
+        available_tools = build_tools(
+            self.gateway,
+            report_repository=self.report_repository,
+            investigations=self.investigations,
+            organization_id=organization_id,
+            created_by=created_by,
+            conversation_id=conversation_id,
+        )
         agent = create_react_agent(
             self.llm.get_client(),
-            build_tools(
-                self.gateway,
-                report_repository=self.report_repository,
-                investigations=self.investigations,
-                organization_id=organization_id,
-                created_by=created_by,
-                conversation_id=conversation_id,
-            ),
+            _select_agent_tools(question, available_tools),
             prompt=SYSTEM_PROMPT,
         )
         try:
             result = agent.invoke(
                 {"messages": messages},
-                config={"recursion_limit": RECURSION_LIMIT},
+                config={
+                    "recursion_limit": _recursion_limit(),
+                    "callbacks": observability_callbacks(),
+                },
             )
         except GraphRecursionError:
             # A bounded stop, not a failure - do not fall through to another
@@ -633,17 +728,34 @@ class SOCToolAgent:
                 None,
             )
         tool_calls: list[str] = []
+        failed_tools: list[str] = []
         active_alert_id: str | None = None
+        evidence_refs: list[str] = []
+        input_tokens = 0
+        output_tokens = 0
         answer = ""
         for message in result["messages"]:
             if isinstance(message, ToolMessage):
                 tool_calls.append(str(message.name))
+                # ToolNode swallows tool exceptions and hands the text back to
+                # the model, which is free to narrate success anyway. Record
+                # the failure here so the answer cannot hide it.
+                if getattr(message, "status", None) == "error":
+                    failed_tools.append(str(message.name))
                 found = self._alert_id_from_tool_result(
                     str(message.name), message.content
                 )
                 if found:
                     active_alert_id = found
+                for reference in self._evidence_refs_from_tool_result(
+                    message.content
+                ):
+                    if reference not in evidence_refs:
+                        evidence_refs.append(reference)
             elif isinstance(message, AIMessage) and message.content:
+                usage = getattr(message, "usage_metadata", None) or {}
+                input_tokens += int(usage.get("input_tokens") or 0)
+                output_tokens += int(usage.get("output_tokens") or 0)
                 answer = (
                     message.content
                     if isinstance(message.content, str)
@@ -651,4 +763,30 @@ class SOCToolAgent:
                 )
         if not answer:
             raise RuntimeError("The tool agent returned no answer.")
+        uncited = [
+            reference
+            for reference in evidence_refs
+            if reference not in answer
+        ]
+        if uncited:
+            rendered = ", ".join(f"`{item}`" for item in uncited[:8])
+            answer = f"{answer}\n\nEvidence references: {rendered}"
+        if failed_tools:
+            rendered = ", ".join(
+                f"`{name}`" for name in dict.fromkeys(failed_tools)
+            )
+            answer = (
+                f"{answer}\n\n**Tool failure:** {rendered} did not complete. "
+                "Anything above that depended on it - including any claim "
+                "that a report was saved - is unverified."
+            )
+        logger.info(
+            "soc_tool_agent_completed",
+            tool_calls=len(tool_calls),
+            unique_tools=sorted(set(tool_calls)),
+            failed_tools=sorted(set(failed_tools)),
+            evidence_references=len(evidence_refs),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
         return answer, tool_calls, active_alert_id

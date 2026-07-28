@@ -19,12 +19,26 @@ logger = structlog.get_logger("tsage.auth")
 _bearer = HTTPBearer(auto_error=False)
 
 
+# Single-tenant install: every signed-in user holds every role, and all data
+# lives under one scope. Authentication still applies - authorization does
+# not. Restoring tiers means putting the user-id allowlists back in
+# _principal_from_payload and the membership checks back in require_approve
+# and require_execute; nothing else reads roles directly.
+ALL_ROLES: tuple[str, ...] = (
+    "auditor",
+    "security_admin",
+    "soc_l1",
+    "soc_l2",
+    "soc_l3",
+)
+
+
 @dataclass(frozen=True)
 class AuthPrincipal:
     user_id: str
     session_id: str | None
     scope_id: str
-    roles: tuple[str, ...] = ("soc_l1",)
+    roles: tuple[str, ...] = ALL_ROLES
 
 
 def _secret(value) -> str | None:
@@ -82,31 +96,14 @@ def _principal_from_payload(payload: dict[str, Any]) -> AuthPrincipal:
     user_id = str(payload.get("sub") or "").strip()
     if not user_id:
         raise HTTPException(401, "Clerk session token has no subject.")
-    roles = {"soc_l1"}
-    role_settings = {
-        "soc_l2": settings.CLERK_SOC_L2_USER_IDS,
-        "soc_l3": settings.CLERK_SOC_L3_USER_IDS,
-        "security_admin": settings.CLERK_SECURITY_ADMIN_USER_IDS,
-        "auditor": settings.CLERK_AUDITOR_USER_IDS,
-    }
-    for role, configured_users in role_settings.items():
-        if user_id in {
-            value.strip()
-            for value in configured_users.split(",")
-            if value.strip()
-        }:
-            roles.add(role)
-    if user_id in {
-        value.strip()
-        for value in settings.CLERK_EXECUTOR_USER_IDS.split(",")
-        if value.strip()
-    }:
-        roles.add("soc_l3")
     return AuthPrincipal(
         user_id=user_id,
         session_id=str(payload.get("sid") or "").strip() or None,
-        scope_id=user_id,
-        roles=tuple(sorted(roles)),
+        # One scope for the whole install, and the same one the ingestion
+        # worker writes alerts and findings under - a per-user scope hid
+        # that shared telemetry from the analyst reading it.
+        scope_id=settings.WAZUH_INGESTION_ORGANIZATION_ID,
+        roles=ALL_ROLES,
     )
 
 
@@ -170,35 +167,11 @@ async def require_authenticated(
     return principal
 
 
+# Every gate is now "be signed in". Kept as separate names so the call sites
+# still say which privilege they need, and so restoring a tier is a change
+# here rather than across every endpoint.
 require_read = require_authenticated
 require_investigate = require_authenticated
-
-
-async def require_approve(
-    principal: AuthPrincipal = Depends(require_principal),
-) -> AuthPrincipal:
-    if not {"soc_l2", "soc_l3", "security_admin"} & set(principal.roles):
-        raise HTTPException(
-            403,
-            "SOC L2, SOC L3, or security administrator approval is required.",
-        )
-    return principal
-
-
-async def require_execute(
-    principal: AuthPrincipal = Depends(require_principal),
-) -> AuthPrincipal:
-    allowed = {
-        value.strip()
-        for value in settings.CLERK_EXECUTOR_USER_IDS.split(",")
-        if value.strip()
-    }
-    if principal.user_id not in allowed:
-        raise HTTPException(
-            403,
-            "This Clerk user is not authorized to execute response actions.",
-        )
-    return principal
-
-
-require_write = require_execute
+require_approve = require_authenticated
+require_execute = require_authenticated
+require_write = require_authenticated

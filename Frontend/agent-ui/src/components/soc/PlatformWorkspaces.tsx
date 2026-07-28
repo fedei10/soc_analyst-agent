@@ -34,11 +34,13 @@ import {
   getPrioritizedVulnerabilities,
   getServicesHealth,
   getStorageHealth,
+  queueInvestigation,
   submitApproval,
   testTelegramConnector
 } from '@/api/soc'
 import type {
   AssistantCommand,
+  Investigation,
   PrioritizedVulnerability,
   ServicesHealth,
   SOCPlatform,
@@ -74,9 +76,17 @@ function tone(value?: string | null): string {
   )
     return 'danger'
   if (
-    ['pending', 'awaiting_approval', 'proposed', 'degraded', 'high'].includes(
-      value
-    )
+    [
+      'pending',
+      'queued',
+      'running',
+      'waiting_verification',
+      'awaiting_approval',
+      'escalated',
+      'proposed',
+      'degraded',
+      'high'
+    ].includes(value)
   )
     return 'warning'
   return 'neutral'
@@ -163,6 +173,7 @@ interface PlatformWorkspacesProps {
   platformBusy: boolean
   onRefreshPlatform: () => Promise<void>
   onRunCommand: (prompt: string) => void
+  onInvestigationQueued: (investigation: Investigation) => void | Promise<void>
 }
 
 export default function PlatformWorkspaces({
@@ -171,7 +182,8 @@ export default function PlatformWorkspaces({
   platform,
   platformBusy,
   onRefreshPlatform,
-  onRunCommand
+  onRunCommand,
+  onInvestigationQueued
 }: PlatformWorkspacesProps) {
   const [alerts, setAlerts] = useState<WazuhAlert[]>([])
   const [alertTotal, setAlertTotal] = useState(0)
@@ -186,6 +198,9 @@ export default function PlatformWorkspaces({
   const [services, setServices] = useState<ServicesHealth | null>(null)
   const [storage, setStorage] = useState<StorageHealth | null>(null)
   const [healthBusy, setHealthBusy] = useState(false)
+  const [investigatingAlertId, setInvestigatingAlertId] = useState<
+    string | null
+  >(null)
 
   async function loadAlerts() {
     setAlertsBusy(true)
@@ -298,6 +313,29 @@ export default function PlatformWorkspaces({
     }
   }
 
+  async function handleQueueInvestigation(alert: WazuhAlert) {
+    setInvestigatingAlertId(alert.alert_id)
+    try {
+      const investigation = await queueInvestigation({
+        alert_id: alert.alert_id,
+        agent_id: alert.agent_id,
+        reason: 'Queued from the alerts workspace.'
+      })
+      toast.success(
+        `Investigation ${investigation.investigation_id}: ${titleCase(investigation.status)}.`
+      )
+      await onInvestigationQueued(investigation)
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : 'The investigation could not be queued.'
+      )
+    } finally {
+      setInvestigatingAlertId(null)
+    }
+  }
+
   if (view === 'alerts') {
     return (
       <div className="platform-workspace">
@@ -347,6 +385,20 @@ export default function PlatformWorkspaces({
                 <Status value={`level_${alert.rule_level}`} />
                 <span>{alert.source_ip || alert.target_user || '-'}</span>
                 <time>{new Date(alert.timestamp).toLocaleString()}</time>
+                <button
+                  className="icon-button"
+                  type="button"
+                  onClick={() => void handleQueueInvestigation(alert)}
+                  disabled={investigatingAlertId === alert.alert_id}
+                  title={`Investigate alert ${alert.alert_id}`}
+                  aria-label={`Investigate alert ${alert.alert_id}`}
+                >
+                  {investigatingAlertId === alert.alert_id ? (
+                    <RefreshCw size={14} className="spin" />
+                  ) : (
+                    <Play size={14} />
+                  )}
+                </button>
               </article>
             ))}
             {!alertsBusy && alerts.length === 0 && (

@@ -48,12 +48,19 @@ class Settings(BaseSettings):
     LLM_FALLBACK_API_KEY: SecretStr = SecretStr("")
     LLM_FALLBACK_BASE_URL: str = ""
     LLM_FALLBACK_MODEL: str = ""
-    # Request budget per tier. Shared across workers through Redis when it is
-    # reachable, per-process otherwise.
-    LLM_RATE_LIMIT_MAX_REQUESTS: int = 4
+    # Token budget per window, shared by every tier and across workers through
+    # Redis when it is reachable, per-process otherwise. Groq's free tier
+    # reports 8000 tokens/minute on `x-ratelimit-limit-tokens`; 7500 leaves
+    # room for the gap between our estimate and what the provider counts.
+    LLM_RATE_LIMIT_MAX_TOKENS: int = 7500
     LLM_RATE_LIMIT_WINDOW_SECONDS: float = 60.0
-    LLM_RATE_LIMIT_MAX_WAIT_SECONDS: float = 8.0
-    LLM_ROUTER_RATE_LIMIT_MAX_REQUESTS: int = 12
+    # Must exceed the window, or a full budget raises instead of pacing.
+    LLM_RATE_LIMIT_MAX_WAIT_SECONDS: float = 65.0
+    # Charged up front alongside the estimated prompt, since a reply's real
+    # size (reasoning tokens included) is only known after the call. Too high
+    # wastes budget on short replies, too low risks a real 429 on long ones;
+    # measured replies from gpt-oss-120b land well under this.
+    LLM_OUTPUT_TOKEN_RESERVE: int = 1000
     MAPEK_ANALYSIS_CONFIDENCE_THRESHOLD: float = 0.75
     MAPEK_MAX_ANALYSIS_ATTEMPTS: int = 2
     MAPEK_MAX_PLANNING_RETRIES: int = 1
@@ -81,6 +88,8 @@ class Settings(BaseSettings):
     MAPEK_MAX_EXECUTION_RETRIES: int = 1
     MAPEK_EXECUTION_LOCK_TTL_SECONDS: int = 300
     MAPEK_TEMPORARY_BLOCK_TTL_SECONDS: int = 900
+    MAPEK_WORKER_INTERVAL_SECONDS: int = 5
+    MAPEK_WORKER_BATCH_SIZE: int = 25
     MAPEK_PROTECTED_IPS: str = ""
     MAPEK_APPROVED_ADMIN_IPS: str = ""
     MAPEK_PROTECTED_ACCOUNTS: str = "root,wazuh"
@@ -96,6 +105,11 @@ class Settings(BaseSettings):
     # building priors for the model.
     MAPEK_LEARNING_LOOKBACK_DAYS: int = 30
     MAPEK_LEARNING_ENABLED: bool = True
+    MAPEK_LEARNING_MIN_DISPOSITIONS: int = 3
+    # Optional accounting rates. Zero keeps cost reporting disabled when a
+    # provider does not publish a stable price for the configured model.
+    LLM_INPUT_COST_PER_1M_TOKENS_USD: float = 0.0
+    LLM_OUTPUT_COST_PER_1M_TOKENS_USD: float = 0.0
 
     # Clerk authenticates every application API request. The secret and
     # optional PEM JWT key are server-only and must never be exposed through a

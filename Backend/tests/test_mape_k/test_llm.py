@@ -15,6 +15,7 @@ from app.mape_k.llm import (
     LLMRateLimiter,
     classify_llm_error,
     is_rate_limit_error,
+    token_cost_usd,
 )
 
 
@@ -195,18 +196,18 @@ def _clocked(monkeypatch):
 
 def test_llm_rate_limiter_allows_up_to_max_without_sleeping(monkeypatch):
     clock, sleeps = _clocked(monkeypatch)
-    limiter = LLMRateLimiter(max_requests=4, period_seconds=60.0, max_wait_seconds=8.0)
+    limiter = LLMRateLimiter(max_units=4, period_seconds=60.0, max_wait_seconds=8.0)
 
     for _ in range(4):
         limiter.acquire()
 
     assert sleeps == []
-    assert len(limiter._timestamps) == 4
+    assert len(limiter._entries) == 4
 
 
 def test_llm_rate_limiter_blocks_until_a_slot_frees_up(monkeypatch):
     clock, sleeps = _clocked(monkeypatch)
-    limiter = LLMRateLimiter(max_requests=2, period_seconds=60.0, max_wait_seconds=100.0)
+    limiter = LLMRateLimiter(max_units=2, period_seconds=60.0, max_wait_seconds=100.0)
 
     limiter.acquire()  # t=0
     clock[0] = 10.0
@@ -217,9 +218,39 @@ def test_llm_rate_limiter_blocks_until_a_slot_frees_up(monkeypatch):
     assert clock[0] >= 60.0
 
 
+def test_llm_rate_limiter_spends_the_budget_in_tokens_not_requests(monkeypatch):
+    clock, sleeps = _clocked(monkeypatch)
+    limiter = LLMRateLimiter(
+        max_units=7500, period_seconds=60.0, max_wait_seconds=100.0
+    )
+
+    limiter.acquire(5000)  # t=0
+    clock[0] = 10.0
+    limiter.acquire(2000)  # t=10, 7000 of 7500 spent
+
+    assert sleeps == []
+
+    limiter.acquire(2000)  # over budget on tokens after only three calls
+
+    assert sleeps  # waited for the t=0 charge to age out
+    assert clock[0] >= 60.0
+
+
+def test_llm_rate_limiter_admits_a_call_larger_than_the_whole_budget(monkeypatch):
+    _clock, sleeps = _clocked(monkeypatch)
+    limiter = LLMRateLimiter(
+        max_units=7500, period_seconds=60.0, max_wait_seconds=100.0
+    )
+
+    # No amount of waiting makes room for this, so it must not hang.
+    limiter.acquire(20000)
+
+    assert sleeps == []
+
+
 def test_llm_rate_limiter_gives_up_past_the_max_wait_cap(monkeypatch):
     _clocked(monkeypatch)
-    limiter = LLMRateLimiter(max_requests=1, period_seconds=60.0, max_wait_seconds=5.0)
+    limiter = LLMRateLimiter(max_units=1, period_seconds=60.0, max_wait_seconds=5.0)
 
     limiter.acquire()
     with pytest.raises(LLMRateLimitedError) as error:
@@ -246,14 +277,18 @@ def test_get_client_wires_the_shared_rate_limiter(monkeypatch):
     calls = []
     monkeypatch.setattr(
         "app.mape_k.llm.llm_rate_limiter.acquire",
-        lambda: calls.append(1),
+        lambda cost: calls.append(cost),
+    )
+    monkeypatch.setattr(
+        "app.mape_k.llm.settings.LLM_OUTPUT_TOKEN_RESERVE", 2000
     )
 
     client = LLMProvider().get_client()
     result = client.invoke("hello")
 
     assert result == "raw-response"
-    assert calls == [1]
+    # The prompt is charged as tokens, not as one flat request slot.
+    assert calls == [2000 + (len('"hello"') + 3) // 4]
 
 
 class FakeSlotCache:
@@ -272,7 +307,7 @@ def test_shared_window_governs_when_redis_answers(monkeypatch):
     _clocked(monkeypatch)
     cache = FakeSlotCache([0.0])
     limiter = LLMRateLimiter(
-        max_requests=1,
+        max_units=1,
         period_seconds=60.0,
         max_wait_seconds=8.0,
         cache=cache,
@@ -282,14 +317,14 @@ def test_shared_window_governs_when_redis_answers(monkeypatch):
 
     assert cache.calls == 1
     # The local deque stays untouched, so a slot is never spent twice.
-    assert list(limiter._timestamps) == []
+    assert list(limiter._entries) == []
 
 
 def test_shared_window_waits_then_admits(monkeypatch):
     _clock, sleeps = _clocked(monkeypatch)
     cache = FakeSlotCache([2.0, 0.0])
     limiter = LLMRateLimiter(
-        max_requests=1,
+        max_units=1,
         period_seconds=60.0,
         max_wait_seconds=8.0,
         cache=cache,
@@ -304,7 +339,7 @@ def test_shared_window_waits_then_admits(monkeypatch):
 def test_shared_window_gives_up_past_the_cap(monkeypatch):
     _clocked(monkeypatch)
     limiter = LLMRateLimiter(
-        max_requests=1,
+        max_units=1,
         period_seconds=60.0,
         max_wait_seconds=5.0,
         cache=FakeSlotCache([30.0]),
@@ -319,7 +354,7 @@ def test_falls_back_to_local_window_when_redis_is_down(monkeypatch):
     # None means "Redis unreachable" - the in-process deque takes over.
     cache = FakeSlotCache([None, None])
     limiter = LLMRateLimiter(
-        max_requests=1,
+        max_units=1,
         period_seconds=60.0,
         max_wait_seconds=5.0,
         cache=cache,
@@ -327,7 +362,7 @@ def test_falls_back_to_local_window_when_redis_is_down(monkeypatch):
 
     limiter.acquire()
 
-    assert len(limiter._timestamps) == 1
+    assert len(limiter._entries) == 1
     with pytest.raises(LLMRateLimitedError):
         limiter.acquire()
 
@@ -373,3 +408,17 @@ def test_no_fallback_configured_still_raises_the_primary_error(monkeypatch):
         provider.invoke_structured(TinyResult, [{"role": "user", "content": "{}"}])
 
     assert raised.value.code == LLMErrorCode.MODEL_TIMEOUT
+
+
+def test_token_cost_uses_configured_per_million_rates(monkeypatch):
+    monkeypatch.setattr(
+        "app.mape_k.llm.settings.LLM_INPUT_COST_PER_1M_TOKENS_USD",
+        2.0,
+    )
+    monkeypatch.setattr(
+        "app.mape_k.llm.settings.LLM_OUTPUT_COST_PER_1M_TOKENS_USD",
+        4.0,
+    )
+
+    assert token_cost_usd(1_000_000, 500_000) == 4.0
+    assert token_cost_usd(None, 10) is None

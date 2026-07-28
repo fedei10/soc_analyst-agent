@@ -6,6 +6,7 @@ from fastapi import HTTPException
 from starlette.requests import Request
 
 from app.api.auth import deps
+from app.config import settings
 
 
 def _state(
@@ -25,36 +26,32 @@ def _principal(monkeypatch, state):
     return asyncio.run(deps.require_principal(request, None))
 
 
-def test_authenticated_l1_user_cannot_approve(monkeypatch):
+def test_every_gate_admits_any_authenticated_user(monkeypatch):
+    """Single-tenant install: signing in is the only authorization tier."""
+
     principal = _principal(monkeypatch, _state())
 
-    assert asyncio.run(deps.require_read(principal)) == principal
-    assert asyncio.run(deps.require_investigate(principal)) == principal
-    with pytest.raises(HTTPException) as error:
-        asyncio.run(deps.require_approve(principal))
-    assert error.value.status_code == 403
+    for gate in (
+        deps.require_read,
+        deps.require_investigate,
+        deps.require_approve,
+        deps.require_execute,
+        deps.require_write,
+    ):
+        assert asyncio.run(gate(principal)) == principal
+    assert set(principal.roles) == set(deps.ALL_ROLES)
 
 
-def test_approval_does_not_grant_response_execution(monkeypatch):
-    principal = _principal(monkeypatch, _state(user_id="user_analyst"))
+def test_scope_is_shared_rather_than_per_user(monkeypatch):
+    """Two users land in one scope, so neither hides data from the other."""
 
-    assert asyncio.run(deps.require_approve(principal)) == principal
-    with pytest.raises(HTTPException) as error:
-        asyncio.run(deps.require_execute(principal))
-    assert error.value.status_code == 403
+    first = _principal(monkeypatch, _state(user_id="user_one"))
+    second = _principal(monkeypatch, _state(user_id="user_two"))
 
-
-def test_allowlisted_responder_can_execute(monkeypatch):
-    principal = _principal(monkeypatch, _state(user_id="user_responder"))
-
-    assert asyncio.run(deps.require_execute(principal)) == principal
-    assert asyncio.run(deps.require_write(principal)) == principal
-
-
-def test_user_id_is_the_private_data_scope(monkeypatch):
-    principal = _principal(monkeypatch, _state(user_id="user_personal"))
-
-    assert principal.scope_id == "user_personal"
+    assert first.user_id != second.user_id
+    assert first.scope_id == second.scope_id
+    # The same scope the ingestion worker writes alerts and findings under.
+    assert first.scope_id == settings.WAZUH_INGESTION_ORGANIZATION_ID
 
 
 def test_subject_is_required(monkeypatch):

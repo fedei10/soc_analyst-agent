@@ -31,6 +31,11 @@ class RawAlertDocument(BaseModel):
     alert_id: str
     normalized: AlertEvidence
     raw_document: dict[str, Any]
+    index_name: str | None = None
+    raw_document_hash: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9]{64}$",
+    )
 
 
 class AlertIngestionDocument(BaseModel):

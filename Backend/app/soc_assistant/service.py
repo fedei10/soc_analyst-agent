@@ -565,17 +565,28 @@ class SOCAssistant:
                     ),
                     history=conversation_history or [],
                 )
-            except Exception:
+            except Exception as exc:
+                # "Unavailable" sends the analyst hunting for an outage; a
+                # rate limit only means "try again shortly". Same handling as
+                # the tool-agent path above, so both say which one it was.
+                rate_limited = is_rate_limit_error(exc)
                 return (
                     (
-                        "I could not generate the SOC explanation because the "
-                        "question-answer model is unavailable. Deterministic "
-                        "commands such as `/alerts`, `/status`, and `/health` "
-                        "are still available."
+                        "The AI provider's rate limit was reached. Please "
+                        "wait a moment and try again."
+                        if rate_limited
+                        else "I could not generate the SOC explanation "
+                        "because the question-answer model is unavailable. "
+                        "Deterministic commands such as `/alerts`, "
+                        "`/status`, and `/health` are still available."
                     ),
                     {
                         "display_mode": "conversation",
-                        "answer_type": "model_unavailable",
+                        "answer_type": (
+                            "rate_limited"
+                            if rate_limited
+                            else "model_unavailable"
+                        ),
                     },
                     [],
                     {},
@@ -1037,7 +1048,11 @@ class SOCAssistant:
             snapshot = self._run_tool(
                 tool_name="start_investigation",
                 inputs=tool_inputs,
-                fn=lambda: self.investigations.start(**tool_inputs),
+                fn=lambda: getattr(
+                    self.investigations,
+                    "enqueue",
+                    self.investigations.start,
+                )(**tool_inputs),
             )
             return (
                 (

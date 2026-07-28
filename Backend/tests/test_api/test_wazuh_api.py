@@ -183,7 +183,9 @@ def test_analyst_cannot_request_direct_response_actions(client, responder):
     response = client.put(
         "/api/v1/agents/001/restart", headers=READ, json={}
     )
-    assert response.status_code == 403
+    # 409, not 403: the role gate is gone, but the direct-response route
+    # stays retired, so the agent is still never restarted from here.
+    assert response.status_code == 409
     assert restarted == []
 
 

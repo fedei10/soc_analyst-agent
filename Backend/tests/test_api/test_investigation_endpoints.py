@@ -8,6 +8,7 @@ from app.api.v1.endpoints import investigations
 from app.api.v1.schemas.investigation import (
     AgentChatRequest,
     ApprovalDecisionInput,
+    InvestigationStartInput,
     L1Result,
     L2Result,
 )
@@ -17,6 +18,7 @@ from app.soc_assistant.schemas import (
     AssistantRequest,
     AssistantResponse,
 )
+from app.soc_assistant.references import ResolvedInvestigationReference
 
 
 class FakeAgent:
@@ -49,6 +51,7 @@ def test_investigation_and_chat_routes_are_registered():
     paths = app.openapi()["paths"]
 
     assert "/api/v1/investigations/{investigation_id}/approval" in paths
+    assert "/api/v1/investigations" in paths
     assert "/api/v1/health/database" in paths
     assert "/api/v1/health/storage" in paths
     assert "/api/v1/health/ingestion" in paths
@@ -77,11 +80,12 @@ def test_soc_platform_metadata_does_not_initialize_model_providers(monkeypatch):
 
     assignments = response["data"]["model_assignments"]
     assert [(item["role"], item["provider"]) for item in assignments] == [
-        ("chat", "oxy"),
-        ("l1", "cerebras"),
-        ("l2", "groq"),
-        ("l3", "oxy"),
-        ("mape_k", investigations.settings.LLM_PROVIDER),
+        ("soc_assistant", investigations.settings.LLM_PROVIDER),
+        ("intent_router", investigations.settings.LLM_PROVIDER),
+        (
+            "mape_k_analyze_and_plan",
+            investigations.settings.LLM_PROVIDER,
+        ),
     ]
     assert response["data"]["response_policy"]["human_approval_required"] is True
 
@@ -91,6 +95,46 @@ def test_public_api_data_hides_internal_scope():
         "organization_id": "user_test",
         "nested": [{"organization_id": "user_test", "status": "running"}],
     }) == {"nested": [{"status": "running"}]}
+
+
+def test_queue_investigation_returns_without_running_the_graph(monkeypatch):
+    captured = {}
+
+    class FakeService:
+        def enqueue(self, **kwargs):
+            captured.update(kwargs)
+            return {
+                "investigation_id": "INV-QUEUED",
+                "organization_id": "user_test",
+                "alert_id": kwargs["alert_id"],
+                "status": "queued",
+                "current_stage": "monitor",
+            }
+
+    monkeypatch.setattr(
+        investigations,
+        "get_investigation_service",
+        lambda: FakeService(),
+    )
+    monkeypatch.setattr(
+        investigations,
+        "resolve_investigation_reference",
+        lambda *args, **kwargs: ResolvedInvestigationReference(
+            reference_type="wazuh_document_id",
+            alert_id="alert-1",
+            agent_id="001",
+        ),
+    )
+
+    response = investigations.queue_investigation(
+        InvestigationStartInput(alert_id="alert-1"),
+        PRINCIPAL,
+        gateway=object(),
+    )
+
+    assert response["data"]["status"] == "queued"
+    assert "organization_id" not in response["data"]
+    assert captured["organization_id"] == "user_test"
 
 
 def test_approval_endpoint_uses_verified_server_actor(monkeypatch):

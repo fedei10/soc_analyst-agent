@@ -99,6 +99,16 @@ class ApprovalDecisionInput(APIModel):
     )
 
 
+class InvestigationStartInput(APIModel):
+    alert_id: str = Field(min_length=1, max_length=256)
+    agent_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=32,
+    )
+    reason: str | None = Field(default=None, max_length=1000)
+
+
 class ChatHistoryMessage(APIModel):
     role: Literal["user", "assistant"]
     content: str = Field(min_length=1, max_length=8000)
@@ -144,6 +154,7 @@ __all__ = [
     "ChatHistoryMessage",
     "Classification",
     "InvestigationStage",
+    "InvestigationStartInput",
     "InvestigationState",
     "InvestigationStatus",
     "InvestigationHistoryItem",

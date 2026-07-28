@@ -8,6 +8,7 @@ import type {
   ChatActivity,
   CommandExplanation,
   Investigation,
+  InvestigationStartInput,
   PrioritizedVulnerabilityList,
   ServicesHealth,
   ShiftHandoff,
@@ -234,6 +235,15 @@ export function sendAgentMessage(
       message,
       conversation_id: conversationId
     })
+  })
+}
+
+export function queueInvestigation(
+  input: InvestigationStartInput
+): Promise<Investigation> {
+  return request('/api/v1/investigations', {
+    method: 'POST',
+    body: JSON.stringify(input)
   })
 }
 

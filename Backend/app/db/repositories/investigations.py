@@ -331,6 +331,13 @@ class InvestigationRepository(Protocol):
         status: str | None = None,
     ) -> int: ...
 
+    def list_worker_candidates(
+        self,
+        *,
+        statuses: tuple[str, ...],
+        limit: int,
+    ) -> list[dict[str, Any]]: ...
+
     def get_active_for_alert(
         self,
         alert_id: str,
@@ -373,6 +380,14 @@ class InvestigationRepository(Protocol):
         organization_id: str,
     ) -> list[dict[str, Any]]: ...
 
+    def append_audit_events(
+        self,
+        investigation_id: str,
+        *,
+        organization_id: str,
+        events: list[dict[str, Any]],
+    ) -> None: ...
+
     def list_approvals(
         self,
         investigation_id: str,
@@ -386,6 +401,8 @@ class InvestigationRepository(Protocol):
         *,
         organization_id: str,
     ) -> list[dict[str, Any]]: ...
+
+    def list_response_action_organizations(self) -> list[str]: ...
 
     def claim_response_actions(
         self,
@@ -735,6 +752,22 @@ class InMemoryInvestigationRepository:
         values.reverse()
         return deepcopy(values[offset:offset + limit])
 
+    def list_worker_candidates(
+        self,
+        *,
+        statuses: tuple[str, ...],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        wanted = set(statuses)
+        with self._lock:
+            values = [
+                item
+                for item in self._snapshots.values()
+                if item.get("status") in wanted
+            ]
+        values.reverse()
+        return deepcopy(values[:limit])
+
     def get_active_for_alert(
         self,
         alert_id: str,
@@ -875,6 +908,35 @@ class InMemoryInvestigationRepository:
         )
         return deepcopy(snapshot.get("audit_events", [])) if snapshot else []
 
+    def append_audit_events(
+        self,
+        investigation_id: str,
+        *,
+        organization_id: str,
+        events: list[dict[str, Any]],
+    ) -> None:
+        with self._lock:
+            snapshot = self._snapshots.get(
+                (organization_id, investigation_id)
+            )
+            if snapshot is None:
+                raise ValueError("Investigation must be persisted first.")
+            existing = snapshot.setdefault("audit_events", [])
+            fingerprints = {
+                json.dumps(item, sort_keys=True, default=str)
+                for item in existing
+                if isinstance(item, dict)
+            }
+            for event in events:
+                fingerprint = json.dumps(
+                    event,
+                    sort_keys=True,
+                    default=str,
+                )
+                if fingerprint not in fingerprints:
+                    existing.append(deepcopy(event))
+                    fingerprints.add(fingerprint)
+
     def list_response_actions(
         self,
         investigation_id: str,
@@ -895,6 +957,12 @@ class InMemoryInvestigationRepository:
             )
         )
         return deepcopy(records)
+
+    def list_response_action_organizations(self) -> list[str]:
+        with self._lock:
+            return sorted(
+                {organization_id for organization_id, _ in self._response_actions}
+            )
 
     def list_approvals(
         self,
@@ -2969,6 +3037,26 @@ class SQLAlchemyInvestigationRepository:
                 for record in session.scalars(statement).all()
             ]
 
+    def list_worker_candidates(
+        self,
+        *,
+        statuses: tuple[str, ...],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        if not statuses:
+            return []
+        statement = (
+            select(InvestigationRecord)
+            .where(InvestigationRecord.status.in_(statuses))
+            .order_by(InvestigationRecord.updated_at.asc())
+            .limit(max(1, min(limit, 1000)))
+        )
+        with self._session_factory() as session:
+            return [
+                self._record_snapshot(record)
+                for record in session.scalars(statement).all()
+            ]
+
     def get_report(
         self,
         investigation_id: str,
@@ -3084,6 +3172,34 @@ class SQLAlchemyInvestigationRepository:
                 for record in session.scalars(statement).all()
             ]
 
+    def append_audit_events(
+        self,
+        investigation_id: str,
+        *,
+        organization_id: str,
+        events: list[dict[str, Any]],
+    ) -> None:
+        if not events:
+            return
+        with self._session_factory.begin() as session:
+            investigation = session.scalar(
+                select(InvestigationRecord).where(
+                    InvestigationRecord.investigation_id == investigation_id,
+                    InvestigationRecord.organization_id == organization_id,
+                )
+            )
+            if investigation is None:
+                raise ValueError("Investigation must be persisted first.")
+            self._save_audit_events(
+                session,
+                {
+                    "investigation_id": investigation_id,
+                    "organization_id": organization_id,
+                    "owner_user_id": investigation.owner_user_id,
+                    "audit_events": events,
+                },
+            )
+
     def list_approvals(
         self,
         investigation_id: str,
@@ -3136,6 +3252,15 @@ class SQLAlchemyInvestigationRepository:
                 _response_action_payload(record)
                 for record in session.scalars(statement).all()
             ]
+
+    def list_response_action_organizations(self) -> list[str]:
+        statement = (
+            select(ResponseActionRecord.organization_id)
+            .distinct()
+            .order_by(ResponseActionRecord.organization_id)
+        )
+        with self._session_factory() as session:
+            return [str(value) for value in session.scalars(statement).all()]
 
 
 @lru_cache(maxsize=1)

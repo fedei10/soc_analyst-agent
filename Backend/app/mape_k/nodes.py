@@ -176,6 +176,7 @@ def analyze_node(
     actual_input = usage.get("actual_input_tokens")
     actual_output = usage.get("actual_output_tokens")
     cached_input = usage.get("cached_input_tokens")
+    actual_cost = usage.get("actual_cost_usd")
     return {
         "diagnosis": diagnosis,
         "analysis_attempts": attempts,
@@ -210,6 +211,15 @@ def analyze_node(
         + int(usage.get("retries") or 0),
         "model_provider": usage.get("provider") or state.model_provider,
         "model_name": usage.get("model") or state.model_name,
+        "estimated_cost_usd": (
+            state.estimated_cost_usd
+            + float(usage.get("estimated_cost_usd") or 0)
+        ),
+        "actual_cost_usd": (
+            (state.actual_cost_usd or 0) + float(actual_cost)
+            if actual_cost is not None
+            else state.actual_cost_usd
+        ),
         "stage": next_stage,
         "current_stage": next_stage,
         "status": (
@@ -255,6 +265,7 @@ def _planning_usage_update(
     actual_input = usage.get("actual_input_tokens")
     actual_output = usage.get("actual_output_tokens")
     cached_input = usage.get("cached_input_tokens")
+    actual_cost = usage.get("actual_cost_usd")
     return {
         "llm_input_tokens": (
             state.llm_input_tokens + int(usage.get("input_tokens") or 0)
@@ -291,6 +302,15 @@ def _planning_usage_update(
         + int(usage.get("retries") or 0),
         "model_provider": usage.get("provider") or state.model_provider,
         "model_name": usage.get("model") or state.model_name,
+        "estimated_cost_usd": (
+            state.estimated_cost_usd
+            + float(usage.get("estimated_cost_usd") or 0)
+        ),
+        "actual_cost_usd": (
+            (state.actual_cost_usd or 0) + float(actual_cost)
+            if actual_cost is not None
+            else state.actual_cost_usd
+        ),
     }
 
 

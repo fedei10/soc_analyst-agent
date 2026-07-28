@@ -7,6 +7,7 @@ from datetime import timedelta
 from typing import Any
 
 from app.config import settings
+from app.mape_k.capabilities import capability_for_alert
 from app.mape_k.schemas import (
     AuthenticationEvidenceSummary,
     EvidenceReference,
@@ -100,6 +101,7 @@ class WazuhMonitor:
         primary_envelope = normalize_alerts(
             [primary.model_dump(mode="json", exclude_none=True)]
         )[0]
+        primary_capability = capability_for_alert(primary_envelope.normalized)
         primary_is_ssh = primary_envelope.normalized.event_type in SSH_EVENT_TYPES
         window_seconds = self._correlation_window_seconds(state)
         correlation_start = primary.timestamp - timedelta(seconds=window_seconds)
@@ -240,6 +242,10 @@ class WazuhMonitor:
 
         evidence: list[EvidenceReference] = []
         evidence_records: list[dict[str, Any]] = []
+        try:
+            raw_primary = self.gateway.get_raw_alert_by_id(state.alert_id)
+        except Exception:
+            raw_primary = None
         for envelope in envelopes:
             alert = envelope.normalized
             safe_payload = alert.model_dump(mode="json")
@@ -260,9 +266,19 @@ class WazuhMonitor:
                     "source_type": "wazuh_alert",
                     "source_ref": reference.source_ref,
                     "raw_source_type": "wazuh_opensearch",
-                    "raw_source_index": settings.WAZUH_ARCHIVE_INDEX,
+                    "raw_source_index": (
+                        raw_primary.index_name
+                        if raw_primary is not None
+                        and raw_primary.alert_id == alert.alert_id
+                        else settings.WAZUH_ARCHIVE_INDEX
+                    ),
                     "raw_source_document_id": alert.alert_id,
-                    "raw_document_hash": None,
+                    "raw_document_hash": (
+                        raw_primary.raw_document_hash
+                        if raw_primary is not None
+                        and raw_primary.alert_id == alert.alert_id
+                        else None
+                    ),
                     "normalized_document_hash": digest,
                     "normalizer_name": envelope.normalizer_name,
                     "normalizer_version": envelope.normalizer_version,
@@ -282,15 +298,31 @@ class WazuhMonitor:
         inventory_errors: list[dict[str, str]] = []
         agent_id = state.agent_id or primary.agent_id
         if agent_id and not primary_is_ssh:
-            components = ("ports", "processes", "network", "os")[
-                : settings.MAPEK_MAX_TOOL_CALLS_PER_STAGE
-            ]
+            profiles = {
+                "identity_and_process": ("processes", "os"),
+                "persistence_and_file_integrity": ("processes", "os"),
+                "network_and_process": ("ports", "network", "processes"),
+                "network_and_data_access": ("ports", "network", "processes"),
+                "process_and_parent": ("processes", "os"),
+                "file_integrity_and_process": ("processes", "os"),
+                "vulnerability_and_asset": ("packages", "os"),
+                "package_and_process": ("packages", "processes"),
+            }
+            profile = (
+                primary_capability.evidence_profile
+                if primary_capability is not None
+                else "generic_inventory"
+            )
+            components = profiles.get(
+                profile,
+                ("ports", "processes"),
+            )[: settings.MAPEK_MAX_TOOL_CALLS_PER_STAGE]
 
             def fetch(component: str):
                 return lambda: self.gateway.get_agent_inventory(
                     agent_id=agent_id,
                     component=component,
-                    limit=25,
+                    limit=10,
                 )
 
             # Independent inventory reads: one round trip's latency, not four.
@@ -302,7 +334,9 @@ class WazuhMonitor:
                         {"component": component, "error": type(result).__name__}
                     )
                 else:
-                    inventory[component] = result.model_dump(mode="json")
+                    compact = result.model_dump(mode="json")
+                    compact["items"] = compact.get("items", [])[:5]
+                    inventory[component] = compact
 
         fingerprint_material = [
             group.group_key for group in groups
@@ -343,7 +377,18 @@ class WazuhMonitor:
             "evidence_version": evidence_version,
             "monitor_context": {
                 "evidence_profile": (
-                    "ssh_authentication" if primary_is_ssh else "generic_inventory"
+                    "ssh_authentication"
+                    if primary_is_ssh
+                    else (
+                        primary_capability.evidence_profile
+                        if primary_capability is not None
+                        else "generic_inventory"
+                    )
+                ),
+                "capability_id": (
+                    primary_capability.capability_id
+                    if primary_capability is not None
+                    else None
                 ),
                 "inventory": inventory,
                 "inventory_errors": inventory_errors,
@@ -359,6 +404,7 @@ class WazuhMonitor:
                     "window_seconds": window_seconds,
                     "collection_pass": state.analysis_attempts + 1,
                 },
+                "related_alerts_truncated": related.truncated,
             },
             "audit_events": [
                 audit_event(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -26,7 +27,10 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-def _report_id() -> str:
+def _report_id(idempotency_key: str | None = None) -> str:
+    if idempotency_key:
+        digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+        return f"RPT-{digest[:40].upper()}"
     return f"RPT-{uuid.uuid4().hex[:12].upper()}"
 
 
@@ -43,6 +47,7 @@ class ReportRepository(Protocol):
         severity: str | None = None,
         related_alert_ids: list[str] | None = None,
         related_finding_ids: list[str] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]: ...
 
     def get(
@@ -78,10 +83,15 @@ class InMemoryReportRepository:
         severity: str | None = None,
         related_alert_ids: list[str] | None = None,
         related_finding_ids: list[str] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         with self._lock:
+            report_id = _report_id(idempotency_key)
+            existing = self._records.get(report_id)
+            if existing is not None:
+                return deepcopy(existing)
             record = {
-                "report_id": _report_id(),
+                "report_id": report_id,
                 "organization_id": organization_id,
                 "title": title,
                 "summary": summary,
@@ -159,10 +169,15 @@ class SQLAlchemyReportRepository:
         severity: str | None = None,
         related_alert_ids: list[str] | None = None,
         related_finding_ids: list[str] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         with self._session_factory.begin() as session:
+            report_id = _report_id(idempotency_key)
+            existing = session.get(AnalystReportRecord, report_id)
+            if existing is not None:
+                return _report_record_dict(existing)
             record = AnalystReportRecord(
-                report_id=_report_id(),
+                report_id=report_id,
                 organization_id=organization_id,
                 title=title,
                 summary=summary,

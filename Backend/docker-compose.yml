@@ -1,4 +1,52 @@
 services:
+  api:
+    build: .
+    env_file:
+      - path: .env
+        required: false
+      - path: ${TSAGE_ENV_FILE:-.env.local}
+        required: true
+    # Wazuh is reached through SSH forwards bound to host loopback.
+    network_mode: host
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  alert-ingestion:
+    build: .
+    command: ["python", "-m", "app.workers.alert_ingestion"]
+    env_file:
+      - path: .env
+        required: false
+      - path: ${TSAGE_ENV_FILE:-.env.local}
+        required: true
+    network_mode: host
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  orchestration:
+    build: .
+    command: ["python", "-m", "app.workers.orchestration"]
+    env_file:
+      - path: .env
+        required: false
+      - path: ${TSAGE_ENV_FILE:-.env.local}
+        required: true
+    network_mode: host
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
   postgres:
     image: postgres:16-alpine
     environment:

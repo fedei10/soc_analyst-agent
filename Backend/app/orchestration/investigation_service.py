@@ -17,11 +17,13 @@ from app.mape_k.graph import (
     investigation_config,
 )
 from app.mape_k.schemas import (
+    IncidentWorkflowState,
     TrustedApprovalSubmission,
     VerificationResumeAuthorization,
 )
 from app.mape_k.executor import RestrictedExecutor
 from app.mape_k.utils import response_resource_namespace
+from app.mape_k.wazuh_response import WazuhBeforeStateProvider
 from app.db.checkpointer import (
     CheckpointerHandle,
     create_investigation_checkpointer,
@@ -104,7 +106,13 @@ class InvestigationService:
             self._checkpointer = create_investigation_checkpointer()
             graph = create_mape_k_graph(
                 checkpointer=self._checkpointer.saver,
-                executor=RestrictedExecutor(action_repository=self.repository),
+                audit_sink=self.repository.append_audit_events,
+                executor=RestrictedExecutor(
+                    action_repository=self.repository,
+                    before_state_provider=WazuhBeforeStateProvider(
+                        repository=self.repository,
+                    ),
+                ),
             )
         self.graph = graph
         self._lock = RLock()
@@ -160,6 +168,111 @@ class InvestigationService:
             "errors": [],
         }
 
+    def _enqueue(
+        self,
+        *,
+        alert_id: str,
+        finding_id: str | None = None,
+        agent_id: str | None = None,
+        initiated_by: str = "api",
+        initiation_reason: str | None = None,
+        organization_id: str = "local",
+        owner_user_id: str | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        try:
+            lease = self.repository.acquire_resource_lease(
+                organization_id=organization_id,
+                resource_type="alert_investigation",
+                resource_id=alert_id,
+                owner_id=f"enqueue-{uuid.uuid4().hex}",
+                lease_seconds=30,
+            )
+        except ResourceLeaseConflictError as exc:
+            existing = self.repository.get_active_for_alert(
+                alert_id,
+                organization_id=organization_id,
+            )
+            if existing is not None:
+                return existing, False
+            raise ResponseExecutionConflictError(
+                "Another worker is queuing this alert."
+            ) from exc
+        try:
+            with self._lock:
+                existing = self.repository.get_active_for_alert(
+                    alert_id,
+                    organization_id=organization_id,
+                )
+                if existing is not None:
+                    return existing, False
+                investigation_id = f"INV-{uuid.uuid4().hex[:12].upper()}"
+                state = self.initial_state(
+                    investigation_id,
+                    alert_id=alert_id,
+                    finding_id=finding_id,
+                    agent_id=agent_id,
+                    initiated_by=initiated_by,
+                    initiation_reason=initiation_reason,
+                    organization_id=organization_id,
+                    owner_user_id=owner_user_id,
+                )
+                state["status"] = "queued"
+                try:
+                    self.repository.save_snapshot(
+                        {
+                            **state,
+                            "pending_nodes": [],
+                            "specialist_runs": [],
+                            "final_report": None,
+                        }
+                    )
+                except IntegrityError:
+                    existing = self.repository.get_active_for_alert(
+                        alert_id,
+                        organization_id=organization_id,
+                    )
+                    if existing is not None:
+                        return existing, False
+                    raise
+            return self.snapshot(
+                investigation_id,
+                organization_id=organization_id,
+            ), True
+        finally:
+            try:
+                self.repository.release_resource_lease(
+                    organization_id=organization_id,
+                    resource_type="alert_investigation",
+                    resource_id=alert_id,
+                    lease_token=str(lease["lease_token"]),
+                )
+            except ResourceLeaseConflictError:
+                pass
+
+    def enqueue(
+        self,
+        *,
+        alert_id: str,
+        finding_id: str | None = None,
+        agent_id: str | None = None,
+        initiated_by: str = "api",
+        initiation_reason: str | None = None,
+        organization_id: str = "local",
+        owner_user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist an investigation for the background worker and return."""
+
+        snapshot, _ = self._enqueue(
+            alert_id=alert_id,
+            finding_id=finding_id,
+            agent_id=agent_id,
+            initiated_by=initiated_by,
+            initiation_reason=initiation_reason,
+            organization_id=organization_id,
+            owner_user_id=owner_user_id,
+        )
+        return snapshot
+
     def start(
         self,
         *,
@@ -171,55 +284,30 @@ class InvestigationService:
         organization_id: str = "local",
         owner_user_id: str | None = None,
     ) -> dict[str, Any]:
-        # Only claiming the alert needs mutual exclusion. Running the graph
-        # does not: LangGraph isolates by thread_id and this investigation_id
-        # is freshly minted, so no other caller can be inside it. Holding the
-        # lock across the whole run pinned every other investigation in this
-        # process behind one incident's Wazuh calls, LLM latency and
-        # rate-limiter sleeps.
-        with self._lock:
-            existing = self.repository.get_active_for_alert(
-                alert_id,
-                organization_id=organization_id,
-            )
-            if existing is not None:
-                return existing
-            investigation_id = f"INV-{uuid.uuid4().hex[:12].upper()}"
-            state = self.initial_state(
-                investigation_id,
-                alert_id=alert_id,
-                finding_id=finding_id,
-                agent_id=agent_id,
-                initiated_by=initiated_by,
-                initiation_reason=initiation_reason,
-                organization_id=organization_id,
-                owner_user_id=owner_user_id,
-            )
-            try:
-                self.repository.save_snapshot(
-                    {
-                        **state,
-                        "pending_nodes": [],
-                        "specialist_runs": [],
-                        "final_report": None,
-                    }
-                )
-            except IntegrityError:
-                # Another worker claimed the same alert between our read and
-                # our write; the unique constraint is the real arbiter.
-                existing = self.repository.get_active_for_alert(
-                    alert_id,
-                    organization_id=organization_id,
-                )
-                if existing is not None:
-                    return existing
-                raise
+        """Synchronous compatibility path used by tests and local scripts."""
+
+        snapshot, created = self._enqueue(
+            alert_id=alert_id,
+            finding_id=finding_id,
+            agent_id=agent_id,
+            initiated_by=initiated_by,
+            initiation_reason=initiation_reason,
+            organization_id=organization_id,
+            owner_user_id=owner_user_id,
+        )
+        if not created:
+            return snapshot
+        investigation_id = str(snapshot["investigation_id"])
+        state = IncidentWorkflowState.model_validate(snapshot)
 
         self.graph.invoke(
-            state,
+            state.model_dump(mode="json"),
             config=investigation_config(investigation_id),
         )
-        return self._sync_snapshot(investigation_id)
+        return self._sync_snapshot(
+            investigation_id,
+            organization_id=organization_id,
+        )
 
     def _checkpoint_view(
         self,
@@ -424,6 +512,140 @@ class InvestigationService:
             alert_id,
             organization_id=organization_id,
         )
+
+    def run_queued(
+        self,
+        investigation_id: str,
+        *,
+        organization_id: str,
+    ) -> dict[str, Any]:
+        """Claim and run one durable queued investigation."""
+
+        snapshot = self.repository.get_snapshot(
+            investigation_id,
+            organization_id=organization_id,
+        )
+        if snapshot is None:
+            raise InvestigationNotFoundError(investigation_id)
+        if snapshot.get("status") != "queued":
+            return self.snapshot(
+                investigation_id,
+                organization_id=organization_id,
+            )
+        lock_namespace = response_resource_namespace(settings)
+        lease = self.repository.acquire_resource_lease(
+            organization_id=lock_namespace,
+            resource_type="incident",
+            resource_id=str(snapshot["incident_id"]),
+            owner_id=f"worker-{uuid.uuid4().hex}",
+            lease_seconds=int(settings.MAPEK_EXECUTION_LOCK_TTL_SECONDS),
+        )
+        try:
+            latest = self.repository.get_snapshot(
+                investigation_id,
+                organization_id=organization_id,
+            )
+            if latest is None:
+                raise InvestigationNotFoundError(investigation_id)
+            if latest.get("status") != "queued":
+                return self.snapshot(
+                    investigation_id,
+                    organization_id=organization_id,
+                )
+            state = IncidentWorkflowState.model_validate(latest)
+            self.graph.invoke(
+                state.model_dump(mode="json"),
+                config=investigation_config(investigation_id),
+            )
+            return self._sync_snapshot(
+                investigation_id,
+                organization_id=organization_id,
+            )
+        finally:
+            try:
+                self.repository.release_resource_lease(
+                    organization_id=lock_namespace,
+                    resource_type="incident",
+                    resource_id=str(snapshot["incident_id"]),
+                    lease_token=str(lease["lease_token"]),
+                )
+            except ResourceLeaseConflictError:
+                pass
+
+    def process_background_once(self, *, limit: int | None = None) -> dict[str, Any]:
+        """Run queued work and ready verification checkpoints once."""
+
+        batch_size = max(
+            1,
+            min(
+                int(limit or settings.MAPEK_WORKER_BATCH_SIZE),
+                1000,
+            ),
+        )
+        candidates = self.repository.list_worker_candidates(
+            statuses=("queued", "waiting_verification"),
+            limit=batch_size,
+        )
+        results: list[dict[str, Any]] = []
+        now = datetime.now(UTC)
+        for candidate in candidates:
+            investigation_id = str(candidate["investigation_id"])
+            organization_id = str(candidate["organization_id"])
+            status = str(candidate.get("status") or "")
+            try:
+                if status == "queued":
+                    snapshot = self.run_queued(
+                        investigation_id,
+                        organization_id=organization_id,
+                    )
+                    operation = "investigation"
+                else:
+                    ready_value = candidate.get("verification_not_before")
+                    ready_at = (
+                        datetime.fromisoformat(
+                            str(ready_value).replace("Z", "+00:00")
+                        )
+                        if ready_value
+                        else None
+                    )
+                    if ready_at is not None and ready_at.tzinfo is None:
+                        ready_at = ready_at.replace(tzinfo=UTC)
+                    if ready_at is None or ready_at > now:
+                        continue
+                    snapshot = self.resume_verification(
+                        investigation_id,
+                        resumed_by="tsage-orchestration-worker",
+                        executor_roles=[],
+                        organization_id=organization_id,
+                    )
+                    operation = "verification"
+                results.append(
+                    {
+                        "investigation_id": investigation_id,
+                        "operation": operation,
+                        "status": snapshot.get("status"),
+                    }
+                )
+            except ResourceLeaseConflictError:
+                continue
+            except Exception as exc:
+                results.append(
+                    {
+                        "investigation_id": investigation_id,
+                        "operation": (
+                            "investigation"
+                            if status == "queued"
+                            else "verification"
+                        ),
+                        "status": "failed",
+                        "error": type(exc).__name__,
+                    }
+                )
+        return {
+            "candidates": len(candidates),
+            "processed": len(results),
+            "results": results,
+        }
 
     def _resume_trusted(
         self,

@@ -68,6 +68,7 @@ export interface ChatMessage {
   role: 'user' | 'agent' | 'error'
   content: string
   response?: Record<string, unknown>
+  investigation?: Investigation
   tools?: string[]
   activities?: ChatActivity[]
   createdAt: number
@@ -302,6 +303,12 @@ export interface Investigation {
   errors: Array<Record<string, unknown>>
   audit_events: AuditEvent[]
   pending_nodes: string[]
+}
+
+export interface InvestigationStartInput {
+  alert_id: string
+  agent_id?: string | null
+  reason?: string
 }
 
 export interface ApprovalInput {

@@ -147,7 +147,11 @@ def classify_llm_error(
 
 
 def is_rate_limit_error(exc: BaseException) -> bool:
-    """True if exc, or anything it wraps, is a provider 429.
+    """True if exc, or anything it wraps, is a rate limit.
+
+    Covers both the provider's 429 and our own budget refusing the call
+    before it is sent; callers treat the two the same way, and only one of
+    them ever reaches the network.
 
     LangGraph/LangChain often re-raise the original provider error inside
     another exception (e.g. a graph-step failure) - walk __cause__/__context__
@@ -155,7 +159,7 @@ def is_rate_limit_error(exc: BaseException) -> bool:
     """
     current: BaseException | None = exc
     while current is not None:
-        if isinstance(current, RateLimitError):
+        if isinstance(current, (RateLimitError, LLMRateLimitedError)):
             return True
         if (
             isinstance(current, LLMInvocationError)
@@ -180,32 +184,36 @@ class LLMRateLimitedError(RuntimeError):
 class LLMRateLimiter:
     """Sliding-window gate in front of every real LLM call.
 
-    The provider enforces a hard per-minute request cap. When Redis is
-    reachable the window lives there, so several gunicorn workers share one
-    budget instead of each independently rediscovering the provider's 429s;
-    when it is not, the in-process deque keeps a single worker paced.
-    Synchronous (threading.Lock + time.sleep) because this codebase has no
-    asyncio anywhere - sync FastAPI handlers, sync gateway/LLM calls.
+    The budget is in whatever unit the caller charges. Groq's binding limit
+    is tokens per minute (`x-ratelimit-limit-tokens`, 8000 on the free tier),
+    not requests, so the LLM call sites charge estimated tokens; a plain
+    counter would let one big prompt blow the cap while four small ones
+    wasted it. When Redis is reachable the window lives there, so several
+    gunicorn workers share one budget instead of each independently
+    rediscovering the provider's 429s; when it is not, the in-process deque
+    keeps a single worker paced. Synchronous (threading.Lock + time.sleep)
+    because this codebase has no asyncio anywhere - sync FastAPI handlers,
+    sync gateway/LLM calls.
     """
 
     def __init__(
         self,
-        max_requests: int,
+        max_units: int,
         period_seconds: float,
         max_wait_seconds: float,
         *,
         cache: Any | None = None,
         subject: str = "reasoning",
     ) -> None:
-        self.max_requests = max_requests
+        self.max_units = max_units
         self.period_seconds = period_seconds
         self.max_wait_seconds = max_wait_seconds
         self.subject = subject
         self._cache = cache
-        self._timestamps: deque[float] = deque()
+        self._entries: deque[tuple[float, int]] = deque()
         self._lock = threading.Lock()
 
-    def _shared_wait(self) -> float | None:
+    def _shared_wait(self, cost: int) -> float | None:
         """Seconds to wait per the cross-worker window, None if unavailable."""
 
         if self._cache is None:
@@ -213,31 +221,36 @@ class LLMRateLimiter:
         return self._cache.acquire_rate_slot(
             organization_id="llm",
             subject=self.subject,
-            limit=self.max_requests,
+            limit=self.max_units,
             window_seconds=self.period_seconds,
+            cost=cost,
         )
 
-    def _local_wait(self) -> float:
+    def _local_wait(self, cost: int) -> float:
         with self._lock:
             now = time.monotonic()
             while (
-                self._timestamps
-                and now - self._timestamps[0] >= self.period_seconds
+                self._entries
+                and now - self._entries[0][0] >= self.period_seconds
             ):
-                self._timestamps.popleft()
-            if len(self._timestamps) < self.max_requests:
-                self._timestamps.append(now)
+                self._entries.popleft()
+            spent = sum(units for _, units in self._entries)
+            # `not self._entries` admits a single call larger than the whole
+            # budget instead of waiting forever for room that cannot exist.
+            if spent + cost <= self.max_units or not self._entries:
+                self._entries.append((now, cost))
                 return 0.0
-            return self.period_seconds - (now - self._timestamps[0])
+            return self.period_seconds - (now - self._entries[0][0])
 
-    def acquire(self) -> None:
+    def acquire(self, cost: int = 1) -> None:
+        cost = max(int(cost), 1)
         while True:
             # Exactly one window governs a given call: the shared one when
             # Redis answers, the local one otherwise. Consuming both would
-            # burn two slots per request and halve the effective budget.
-            wait = self._shared_wait()
+            # charge every request twice and halve the effective budget.
+            wait = self._shared_wait(cost)
             if wait is None:
-                wait = self._local_wait()
+                wait = self._local_wait(cost)
             if wait <= 0:
                 return
             if wait > self.max_wait_seconds:
@@ -249,7 +262,7 @@ def _reasoning_rate_limiter() -> LLMRateLimiter:
     from app.services.redis.ephemeral import EphemeralRedis
 
     return LLMRateLimiter(
-        max_requests=settings.LLM_RATE_LIMIT_MAX_REQUESTS,
+        max_units=settings.LLM_RATE_LIMIT_MAX_TOKENS,
         period_seconds=settings.LLM_RATE_LIMIT_WINDOW_SECONDS,
         max_wait_seconds=settings.LLM_RATE_LIMIT_MAX_WAIT_SECONDS,
         cache=EphemeralRedis(),
@@ -260,16 +273,21 @@ def _reasoning_rate_limiter() -> LLMRateLimiter:
 # Conservative margin under the real provider ceiling.
 llm_rate_limiter = _reasoning_rate_limiter()
 
-router_rate_limiter = LLMRateLimiter(
-    max_requests=settings.LLM_ROUTER_RATE_LIMIT_MAX_REQUESTS,
-    period_seconds=settings.LLM_RATE_LIMIT_WINDOW_SECONDS,
-    max_wait_seconds=settings.LLM_RATE_LIMIT_MAX_WAIT_SECONDS,
-    cache=None,
-    subject="router",
-)
+# One budget, not one per tier: the provider meters the account, so two
+# independent windows just take turns discovering the same 429.
+router_rate_limiter = llm_rate_limiter
 
 
-SUPPORTED_LLM_PROVIDERS = {"oxy", "mistral"}
+def estimated_tokens(payload: Any) -> int:
+    """Rough prompt size. Four characters per token is close enough for a
+    budget that already sits below the provider ceiling."""
+
+    return (len(json.dumps(payload, default=str)) + 3) // 4
+
+
+# All three speak the OpenAI wire format, so one ChatOpenAI client with a
+# different base_url covers them; langchain-groq buys nothing here.
+SUPPORTED_LLM_PROVIDERS = {"oxy", "mistral", "groq"}
 
 
 class LLMTier(StrEnum):
@@ -288,6 +306,27 @@ class LLMTier(StrEnum):
 
 def effective_llm_api_key() -> str:
     return settings.LLM_API_KEY.get_secret_value().strip()
+
+
+def token_cost_usd(
+    input_tokens: int | None,
+    output_tokens: int | None,
+) -> float | None:
+    if input_tokens is None or output_tokens is None:
+        return None
+    input_rate = max(
+        0.0,
+        float(settings.LLM_INPUT_COST_PER_1M_TOKENS_USD),
+    )
+    output_rate = max(
+        0.0,
+        float(settings.LLM_OUTPUT_COST_PER_1M_TOKENS_USD),
+    )
+    return round(
+        (int(input_tokens) * input_rate + int(output_tokens) * output_rate)
+        / 1_000_000,
+        8,
+    )
 
 
 def _fallback_endpoint() -> dict[str, Any] | None:
@@ -375,7 +414,14 @@ class LLMProvider:
         original_invoke = client.invoke
 
         def rate_limited_invoke(*args: Any, **kwargs: Any) -> Any:
-            limiter.acquire()
+            prompt = args[0] if args else kwargs.get("input")
+            # ponytail: charged up front from an estimate, never reconciled
+            # against the reply's real token count. The reserve absorbs the
+            # gap; if 429s appear anyway, raise LLM_OUTPUT_TOKEN_RESERVE
+            # before reaching for post-call accounting.
+            limiter.acquire(
+                estimated_tokens(prompt) + settings.LLM_OUTPUT_TOKEN_RESERVE
+            )
             return original_invoke(*args, **kwargs)
 
         object.__setattr__(client, "invoke", rate_limited_invoke)
@@ -488,11 +534,20 @@ class LLMProvider:
             "output_tokens",
             token_usage.get("completion_tokens"),
         )
+        # `or {}` rather than a .get default: providers send these keys with an
+        # explicit null (Groq does), which a default never replaces.
         cached_input = (
-            usage_metadata.get("input_token_details", {}).get("cache_read")
-            or token_usage.get("prompt_tokens_details", {}).get("cached_tokens")
+            (usage_metadata.get("input_token_details") or {}).get("cache_read")
+            or (token_usage.get("prompt_tokens_details") or {}).get(
+                "cached_tokens"
+            )
         )
         estimated_output_tokens = (len(result.model_dump_json()) + 3) // 4
+        estimated_cost = token_cost_usd(
+            estimated_input_tokens,
+            estimated_output_tokens,
+        )
+        actual_cost = token_cost_usd(actual_input, actual_output)
         return result, {
             # Compatibility fields remain estimates when provider usage is absent.
             "input_tokens": actual_input or estimated_input_tokens,
@@ -502,6 +557,8 @@ class LLMProvider:
             "actual_input_tokens": actual_input,
             "actual_output_tokens": actual_output,
             "cached_input_tokens": cached_input,
+            "estimated_cost_usd": estimated_cost or 0.0,
+            "actual_cost_usd": actual_cost,
             "model_calls": (last_error.attempt + 1 if last_error else 1),
             "retries": last_error.attempt if last_error else 0,
             "provider": settings.LLM_PROVIDER,

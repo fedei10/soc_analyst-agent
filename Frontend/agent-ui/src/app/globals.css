@@ -862,6 +862,11 @@ time {
   text-overflow: ellipsis;
 }
 
+.investigation-summary .status-badge {
+  display: inline-flex;
+  margin-top: 3px;
+}
+
 .raw-result {
   margin-top: 13px;
 }

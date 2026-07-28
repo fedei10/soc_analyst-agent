@@ -36,6 +36,25 @@ terminal:
 make ingest-worker
 ```
 
+Run queued investigations, delayed verification, and temporary-action recovery
+in another terminal:
+
+```bash
+make orchestration-worker
+```
+
+`POST /api/v1/investigations` and the assistant's `/investigate` command return
+a durable `queued` snapshot immediately. The orchestration worker claims it,
+runs MAPE-K, pauses at approval or verification, and resumes verification when
+the observation deadline is ready. Use `make orchestration-once` to test one
+cycle.
+
+To run the API, both workers, PostgreSQL, and Redis together:
+
+```bash
+make stack-up
+```
+
 Use `make ingest-once` for one bounded cycle during setup or troubleshooting.
 The worker pages through `wazuh-alerts-*`, inserts raw alerts idempotently,
 normalizes new rows, links correlated findings, and advances its PostgreSQL
@@ -81,6 +100,12 @@ executable remediation plan or a typed analyst advisory covering investigation,
 containment, eradication, recovery, and detection improvement. Advisory plans
 are always non-executable and require human review; only code-owned, reversible
 playbooks can reach policy approval and execution.
+
+Deterministic capability modules currently cover SSH authentication, privilege
+escalation, persistence, suspicious process execution, file-integrity changes,
+command and control, possible exfiltration, vulnerable packages, and software
+changes. Unmatched attacks still use bounded evidence-only semantic analysis
+and receive a non-executable advisory when no registered playbook fits.
 
 The SOC assistant accepts deterministic slash commands and natural-language
 requests. Its server-owned capability catalog is exposed to the frontend for
