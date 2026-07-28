@@ -14,7 +14,15 @@ def after_monitor(state: IncidentWorkflowState) -> str:
 
 
 def after_analyze(state: IncidentWorkflowState) -> str:
-    return "plan" if state.stage == WorkflowStage.PLAN else "knowledge"
+    if state.stage == WorkflowStage.PLAN:
+        return "plan"
+    # An inconclusive diagnosis used to dead-end at escalation, which left
+    # analysis_attempts/MAPEK_MAX_ANALYSIS_ATTEMPTS unreachable. Sending it
+    # back to Monitor with a wider window is the actual MAPE-K loop; the
+    # attempt counter bounds it.
+    if state.stage == WorkflowStage.MONITOR:
+        return "monitor"
+    return "knowledge"
 
 
 def after_plan(state: IncidentWorkflowState) -> str:

@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from langgraph.types import interrupt
+from pydantic import ValidationError
 
 from app.config import settings
 from app.mape_k.analyze import IncidentAnalyzer
@@ -58,6 +59,30 @@ def _failure(stage: WorkflowStage, exc: Exception) -> dict[str, Any]:
                 stage=stage,
                 error_code=error.code,
             )
+        ],
+    }
+
+
+def _approval_escalation(
+    *,
+    code: str,
+    message: str,
+    reason: str,
+    **payload: Any,
+) -> dict[str, Any]:
+    """Refuse an approval resume without escaping the graph."""
+
+    return {
+        "stage": WorkflowStage.POLICY_GATE,
+        "current_stage": WorkflowStage.POLICY_GATE,
+        "status": WorkflowStatus.ESCALATED,
+        "error": WorkflowError(
+            stage=WorkflowStage.POLICY_GATE,
+            code=code,
+            message=message,
+        ),
+        "audit_events": [
+            audit_event("approval_invalidated", reason=reason, **payload)
         ],
     }
 
@@ -132,16 +157,28 @@ def analyze_node(
         diagnosis, usage = analyzer.run(state)
     except Exception as exc:
         return _failure(WorkflowStage.ANALYZE, exc)
-    escalated = (
+    inconclusive = (
         diagnosis.confidence < settings.MAPEK_ANALYSIS_CONFIDENCE_THRESHOLD
         or diagnosis.needs_more_evidence
     )
+    attempts = state.analysis_attempts + 1
+    # Inconclusive with attempts left is not a dead end: go back to Monitor,
+    # collect over a wider window, and diagnose again. Only the last attempt
+    # escalates to a human.
+    recollect = inconclusive and attempts < settings.MAPEK_MAX_ANALYSIS_ATTEMPTS
+    escalated = inconclusive and not recollect
+    if recollect:
+        next_stage = WorkflowStage.MONITOR
+    elif escalated:
+        next_stage = WorkflowStage.ANALYZE
+    else:
+        next_stage = WorkflowStage.PLAN
     actual_input = usage.get("actual_input_tokens")
     actual_output = usage.get("actual_output_tokens")
     cached_input = usage.get("cached_input_tokens")
     return {
         "diagnosis": diagnosis,
-        "analysis_attempts": state.analysis_attempts + 1,
+        "analysis_attempts": attempts,
         "llm_input_tokens": state.llm_input_tokens + usage["input_tokens"],
         "llm_output_tokens": state.llm_output_tokens + usage["output_tokens"],
         "estimated_input_tokens": (
@@ -173,12 +210,8 @@ def analyze_node(
         + int(usage.get("retries") or 0),
         "model_provider": usage.get("provider") or state.model_provider,
         "model_name": usage.get("model") or state.model_name,
-        "stage": (
-            WorkflowStage.ANALYZE if escalated else WorkflowStage.PLAN
-        ),
-        "current_stage": (
-            WorkflowStage.ANALYZE if escalated else WorkflowStage.PLAN
-        ),
+        "stage": next_stage,
+        "current_stage": next_stage,
         "status": (
             WorkflowStatus.ESCALATED
             if escalated
@@ -193,7 +226,24 @@ def analyze_node(
                 provider=usage.get("provider"),
                 model=usage.get("model"),
                 model_calls=usage.get("model_calls", 0),
-            )
+            ),
+            *(
+                [
+                    audit_event(
+                        "analysis_recollect_requested",
+                        attempt=attempts,
+                        max_attempts=settings.MAPEK_MAX_ANALYSIS_ATTEMPTS,
+                        reason=(
+                            "needs_more_evidence"
+                            if diagnosis.needs_more_evidence
+                            else "low_confidence"
+                        ),
+                        confidence=diagnosis.confidence,
+                    )
+                ]
+                if recollect
+                else []
+            ),
         ],
     }
 
@@ -215,7 +265,7 @@ def plan_node(
             ],
         }
     try:
-        plan = planner.run(state)
+        selection = planner.plan(state)
     except Exception as exc:
         return {
             "stage": WorkflowStage.PLAN,
@@ -230,7 +280,8 @@ def plan_node(
                 audit_event("planning_escalated", reason="no_approved_playbook")
             ],
         }
-    return {
+    plan = selection.plan
+    update: dict[str, Any] = {
         "remediation_plan": plan,
         "planning_attempts": state.planning_attempts + 1,
         "stage": WorkflowStage.POLICY_GATE,
@@ -240,9 +291,39 @@ def plan_node(
                 "plan_selected",
                 playbook_id=plan.playbook_id,
                 playbook_version=plan.playbook_version,
+                selected_by=selection.selected_by,
+                incident_type=selection.canonical_incident_type,
             )
         ],
     }
+    if (
+        selection.selected_by == "model"
+        and state.diagnosis is not None
+        and selection.canonical_incident_type != state.diagnosis.incident_type
+    ):
+        # Rewrite the diagnosis onto the playbook's published incident type
+        # so the policy engine keeps re-validating deterministically, and
+        # record the original label the model mapped from.
+        original = state.diagnosis.incident_type
+        entities = {
+            **state.diagnosis.affected_entities,
+            "original_incident_type": original,
+        }
+        update["diagnosis"] = state.diagnosis.model_copy(
+            update={
+                "incident_type": selection.canonical_incident_type,
+                "affected_entities": entities,
+            }
+        )
+        update["audit_events"].append(
+            audit_event(
+                "plan_incident_type_canonicalized",
+                original_incident_type=original,
+                canonical_incident_type=selection.canonical_incident_type,
+                rationale=(selection.rationale or "")[:600],
+            )
+        )
+    return update
 
 
 def policy_node(
@@ -344,9 +425,25 @@ def approval_node(state: IncidentWorkflowState) -> dict[str, Any]:
             "expires_at": request.expires_at.isoformat(),
         }
     )
-    submission = TrustedApprovalSubmission.model_validate(payload)
+    # A malformed or mismatched resume must land as an audited escalation,
+    # exactly like execution_authorization_node handles the same case. Raising
+    # here escaped graph.invoke() and surfaced as an unexplained 500 with no
+    # audit trail and the workflow stuck mid-interrupt.
+    try:
+        submission = TrustedApprovalSubmission.model_validate(payload)
+    except ValidationError:
+        return _approval_escalation(
+            code="APPROVAL_PAYLOAD_INVALID",
+            message="The approval submission is not a valid payload.",
+            reason="invalid_payload",
+        )
     if submission.approval_id != request.approval_id:
-        raise ValueError("Approval ID does not match this incident.")
+        return _approval_escalation(
+            code="APPROVAL_ID_MISMATCH",
+            message="Approval ID does not match this incident.",
+            reason="approval_id_mismatch",
+            approval_id=submission.approval_id,
+        )
     try:
         _validate_approval_binding(state, request)
     except ValueError as exc:
@@ -444,7 +541,25 @@ def execution_authorization_node(
             "action_ids": request.action_ids,
         }
     )
-    authorization = ExecutionAuthorization.model_validate(payload)
+    try:
+        authorization = ExecutionAuthorization.model_validate(payload)
+    except ValidationError:
+        return {
+            "stage": WorkflowStage.POLICY_GATE,
+            "current_stage": WorkflowStage.POLICY_GATE,
+            "status": WorkflowStatus.ESCALATED,
+            "error": WorkflowError(
+                stage=WorkflowStage.POLICY_GATE,
+                code="EXECUTION_AUTHORIZATION_INVALID",
+                message="The execution authorization is not a valid payload.",
+            ),
+            "audit_events": [
+                audit_event(
+                    "execution_authorization_denied",
+                    reason="invalid_payload",
+                )
+            ],
+        }
     if authorization.approval_id != decision.approval_id:
         return {
             "stage": WorkflowStage.POLICY_GATE,

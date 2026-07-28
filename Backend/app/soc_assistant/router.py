@@ -7,7 +7,7 @@ import re
 import shlex
 from typing import Any
 
-from app.mape_k.llm import LLMProvider, get_llm_provider
+from app.mape_k.llm import LLMProvider, LLMTier, get_llm_provider
 from app.soc_assistant.catalog import COMMANDS, COMMAND_BY_SLASH
 from app.soc_assistant.schemas import AssistantCommandName, AssistantIntent
 
@@ -45,7 +45,10 @@ VAGUE_NO_TARGET_PATTERN = re.compile(
 
 class AssistantIntentRouter:
     def __init__(self, llm: LLMProvider | None = None) -> None:
-        self.llm = llm or get_llm_provider()
+        # Intent classification is a small structured pick, not reasoning -
+        # keeping it on the cheap tier leaves the reasoning budget for
+        # diagnosis and the analyst chat loop.
+        self.llm = llm or get_llm_provider(LLMTier.ROUTER)
 
     @staticmethod
     def _arguments(tokens: list[str]) -> tuple[list[str], dict[str, Any]]:

@@ -13,6 +13,7 @@ import structlog
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
+from app.config import settings
 from app.mape_k import nodes, routes
 from app.mape_k.analyze import IncidentAnalyzer
 from app.mape_k.executor import RestrictedExecutor
@@ -67,6 +68,40 @@ def _safe_transition_metadata(
         "provider": update.get("model_provider") or state.model_provider,
         "model": update.get("model_name") or state.model_name,
     }
+
+
+def _langsmith_metadata() -> dict[str, Any]:
+    return {
+        "service": settings.SERVICE_NAME,
+        "environment": settings.ENVIRONMENT,
+        "revision_id": settings.REVISION_ID,
+        "llm_provider": settings.LLM_PROVIDER,
+        "llm_model": settings.LLM_MODEL,
+        "workflow": "mape-k",
+    }
+
+
+def _traced(
+    node_name: str,
+    function: Callable[[IncidentWorkflowState], dict[str, Any]],
+) -> Callable[[IncidentWorkflowState], dict[str, Any]]:
+    """Give each node its own LangSmith span.
+
+    The chat paths were traceable and the graph - the harder flow to
+    reconstruct after the fact - was not. Tracing is opt-in via
+    LANGSMITH_TRACING; when it is off, @traceable is a no-op passthrough, so
+    this stays free.
+    """
+
+    try:
+        from langsmith import traceable
+    except ImportError:  # pragma: no cover - langsmith is a hard dependency
+        return function
+    return traceable(
+        run_type="chain",
+        name=f"mapek.{node_name}",
+        metadata=_langsmith_metadata(),
+    )(function)
 
 
 def _observed_node(
@@ -202,7 +237,7 @@ def create_mape_k_graph(
 
     builder = StateGraph(IncidentWorkflowState)
     for name, function in node_functions.items():
-        builder.add_node(name, _observed_node(name, function))
+        builder.add_node(name, _observed_node(name, _traced(name, function)))
 
     builder.add_edge(START, "monitor")
     builder.add_conditional_edges(
@@ -213,7 +248,7 @@ def create_mape_k_graph(
     builder.add_conditional_edges(
         "analyze",
         routes.after_analyze,
-        {"plan": "plan", "knowledge": "knowledge"},
+        {"plan": "plan", "monitor": "monitor", "knowledge": "knowledge"},
     )
     builder.add_conditional_edges(
         "plan",

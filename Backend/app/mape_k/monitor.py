@@ -22,6 +22,7 @@ from app.services.wazuh.normalization import (
     build_findings,
     normalize_alerts,
 )
+from app.utils.helpers import gather
 
 
 SSH_EVENT_TYPES = {
@@ -66,6 +67,31 @@ class WazuhMonitor:
         self.gateway = gateway or WazuhGateway()
         self.cache = cache or EphemeralRedis()
 
+    # A week is the widest correlation the indexer query itself accepts, so
+    # widening past it would silently do nothing.
+    MAX_CORRELATION_WINDOW_SECONDS = 168 * 3600
+
+    @staticmethod
+    def _correlation_window_seconds(state: IncidentWorkflowState) -> int:
+        """Widen the window on each re-collect pass.
+
+        Analyze sends an inconclusive incident back here rather than
+        escalating it; looking at the same window again would return the same
+        evidence and the same verdict, so each pass multiplies the window.
+        """
+
+        base = max(1, settings.MAPEK_CORRELATION_WINDOW_SECONDS)
+        attempts = max(int(getattr(state, "analysis_attempts", 0) or 0), 0)
+        if not attempts:
+            return base
+        factor = max(float(settings.MAPEK_EVIDENCE_WIDEN_FACTOR), 1.0)
+        return int(
+            min(
+                base * (factor**attempts),
+                WazuhMonitor.MAX_CORRELATION_WINDOW_SECONDS,
+            )
+        )
+
     def run(self, state: IncidentWorkflowState) -> dict[str, Any]:
         primary = self.gateway.get_alert_by_id(state.alert_id)
         if primary is None:
@@ -75,7 +101,7 @@ class WazuhMonitor:
             [primary.model_dump(mode="json", exclude_none=True)]
         )[0]
         primary_is_ssh = primary_envelope.normalized.event_type in SSH_EVENT_TYPES
-        window_seconds = max(1, settings.MAPEK_CORRELATION_WINDOW_SECONDS)
+        window_seconds = self._correlation_window_seconds(state)
         correlation_start = primary.timestamp - timedelta(seconds=window_seconds)
         correlation_end = primary.timestamp + timedelta(seconds=window_seconds)
         related = self.gateway.get_related_alerts(
@@ -256,20 +282,27 @@ class WazuhMonitor:
         inventory_errors: list[dict[str, str]] = []
         agent_id = state.agent_id or primary.agent_id
         if agent_id and not primary_is_ssh:
-            for component in ("ports", "processes", "network", "os")[
+            components = ("ports", "processes", "network", "os")[
                 : settings.MAPEK_MAX_TOOL_CALLS_PER_STAGE
-            ]:
-                try:
-                    result = self.gateway.get_agent_inventory(
-                        agent_id=agent_id,
-                        component=component,
-                        limit=25,
-                    )
-                    inventory[component] = result.model_dump(mode="json")
-                except Exception as exc:
+            ]
+
+            def fetch(component: str):
+                return lambda: self.gateway.get_agent_inventory(
+                    agent_id=agent_id,
+                    component=component,
+                    limit=25,
+                )
+
+            # Independent inventory reads: one round trip's latency, not four.
+            for component, result in gather(
+                [(component, fetch(component)) for component in components]
+            ).items():
+                if isinstance(result, Exception):
                     inventory_errors.append(
-                        {"component": component, "error": type(exc).__name__}
+                        {"component": component, "error": type(result).__name__}
                     )
+                else:
+                    inventory[component] = result.model_dump(mode="json")
 
         fingerprint_material = [
             group.group_key for group in groups
@@ -323,6 +356,8 @@ class WazuhMonitor:
                     "truncated": related.truncated,
                     "window_start": correlation_start.isoformat(),
                     "window_end": correlation_end.isoformat(),
+                    "window_seconds": window_seconds,
+                    "collection_pass": state.analysis_attempts + 1,
                 },
             },
             "audit_events": [
@@ -331,6 +366,8 @@ class WazuhMonitor:
                     alert_count=len(normalized),
                     finding_count=len(findings),
                     inventory_errors=inventory_errors,
+                    window_seconds=window_seconds,
+                    collection_pass=state.analysis_attempts + 1,
                 )
             ],
         }

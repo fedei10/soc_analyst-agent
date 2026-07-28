@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Annotated, Any, Literal
@@ -16,6 +17,8 @@ from app.services.wazuh.normalization.schemas import NormalizedAlert
 
 
 MAX_CHECKPOINT_AUDIT_EVENTS = 64
+
+ACCOUNT_TARGET_PATTERN = re.compile(r"[A-Za-z0-9._@-]{1,64}")
 
 
 def merge_bounded_audit_events(
@@ -152,6 +155,14 @@ class RemediationAction(StrictModel):
             except ValueError as exc:
                 raise ValueError("IP actions require a valid IP target.") from exc
             self.target = str(parsed_target)
+        if self.action_type in {ActionType.DISABLE_USER, ActionType.ENABLE_USER}:
+            # The target is passed to a Wazuh Active Response script as an
+            # argument, so it is a trust boundary: constrain it to an account
+            # name shape rather than forwarding arbitrary text.
+            if not ACCOUNT_TARGET_PATTERN.fullmatch(self.target):
+                raise ValueError(
+                    "Account actions require a plain account name target."
+                )
         if self.action_type == ActionType.BLOCK_IP and self.ttl_seconds is None:
             raise ValueError("Temporary IP blocks require ttl_seconds.")
         if any(key in self.parameters for key in ("command", "shell", "argv")):

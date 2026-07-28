@@ -255,6 +255,108 @@ def test_low_confidence_diagnosis_escalates_without_planning():
 
     assert snapshot["status"] == WorkflowStatus.ESCALATED
     assert snapshot["remediation_plan"] is None
+    # It escalates only after exhausting its re-collect attempts, not on the
+    # first inconclusive pass.
+    assert snapshot["analysis_attempts"] == settings.MAPEK_MAX_ANALYSIS_ATTEMPTS
+
+
+def test_inconclusive_analysis_recollects_over_a_wider_window():
+    """The MAPE-K loop: look wider and re-diagnose before giving up."""
+
+    windows: list[int] = []
+
+    class WindowRecordingMonitor(WazuhMonitor):
+        def run(self, state):
+            windows.append(self._correlation_window_seconds(state))
+            return super().run(state)
+
+    class ImprovingAnalyzer:
+        """Inconclusive first, decisive once more evidence arrives."""
+
+        def __init__(self):
+            self.calls = 0
+
+        def run(self, state):
+            self.calls += 1
+            inconclusive = self.calls == 1
+            return (
+                Diagnosis(
+                    incident_type="unknown" if inconclusive else "ssh_brute_force",
+                    summary="Summary",
+                    root_cause="Root cause",
+                    evidence_ids=[state.evidence[0].evidence_id],
+                    affected_entities={} if inconclusive else {"source_ip": "10.0.0.9"},
+                    confidence=0.2 if inconclusive else 0.96,
+                    needs_more_evidence=inconclusive,
+                ),
+                {"input_tokens": 10, "output_tokens": 5},
+            )
+
+    analyzer = ImprovingAnalyzer()
+    graph = create_mape_k_graph(
+        monitor=WindowRecordingMonitor(
+            gateway=FakeWazuhGateway(),
+            cache=MemoryCache(),
+        ),
+        analyzer=analyzer,
+    )
+    snapshot = graph.invoke(
+        initial_state("INV-RECOLLECT").model_dump(),
+        config=investigation_config("INV-RECOLLECT"),
+    )
+
+    assert analyzer.calls == 2, "Analyze must run again after re-collection"
+    assert len(windows) == 2, "Monitor must run again"
+    assert windows[1] > windows[0], "The second pass must look wider"
+    assert snapshot["status"] != WorkflowStatus.ESCALATED
+    assert snapshot["remediation_plan"] is not None
+
+
+@pytest.mark.parametrize(
+    ("resume_payload", "expected_code"),
+    (
+        (
+            {
+                "approval_id": "APR-SOMEONE-ELSES",
+                "decision": "approve",
+                "actor_user_id": "user-l2",
+                "actor_roles": ["soc_l2"],
+            },
+            "APPROVAL_ID_MISMATCH",
+        ),
+        (
+            {"decision": "maybe", "actor_user_id": "user-l2"},
+            "APPROVAL_PAYLOAD_INVALID",
+        ),
+    ),
+)
+def test_bad_approval_resume_escalates_instead_of_raising(
+    resume_payload,
+    expected_code,
+):
+    """A bad resume is an audited refusal, not an exception out of the graph."""
+
+    graph = create_mape_k_graph(
+        monitor=WazuhMonitor(gateway=FakeWazuhGateway(), cache=MemoryCache()),
+        analyzer=IncidentAnalyzer(llm=NoLLM(), cache=MemoryCache()),
+        executor=RestrictedExecutor(cache=MemoryCache()),
+    )
+    config = investigation_config(f"INV-BAD-{expected_code}")
+    snapshot = graph.invoke(
+        initial_state(f"INV-BAD-{expected_code}").model_dump(),
+        config=config,
+    )
+    assert snapshot["status"] == WorkflowStatus.AWAITING_APPROVAL
+
+    snapshot = graph.invoke(Command(resume=resume_payload), config=config)
+
+    assert snapshot["status"] == WorkflowStatus.ESCALATED
+    assert snapshot["error"].code == expected_code
+    assert snapshot["execution_results"] == []
+    assert any(
+        event["event"] == "approval_invalidated"
+        for event in snapshot["audit_events"]
+    )
 
 
 def test_unknown_action_and_arbitrary_command_are_rejected():
@@ -428,8 +530,8 @@ def test_executor_timeout_is_recorded_without_retrying():
 @pytest.mark.parametrize(
     ("action_type", "action_present", "expected_reason"),
     (
-        (ActionType.BLOCK_IP, True, "block_already_present"),
-        (ActionType.UNBLOCK_IP, False, "block_already_absent"),
+        (ActionType.BLOCK_IP, True, "effect_already_present"),
+        (ActionType.UNBLOCK_IP, False, "effect_already_absent"),
     ),
 )
 def test_executor_skips_provider_when_firewall_state_is_already_satisfied(

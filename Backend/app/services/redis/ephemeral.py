@@ -312,6 +312,53 @@ class EphemeralRedis:
             })
         return events
 
+    # Sliding window over a sorted set: drop expired entries, admit if the
+    # window has room, otherwise report how long until the oldest entry ages
+    # out. Atomic so several workers share one provider budget instead of
+    # each rediscovering the provider's 429s on its own.
+    _RATE_SLOT_SCRIPT = """
+    local now = tonumber(ARGV[1])
+    local window = tonumber(ARGV[2])
+    local limit = tonumber(ARGV[3])
+    redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - window)
+    if redis.call('ZCARD', KEYS[1]) < limit then
+      redis.call('ZADD', KEYS[1], now, ARGV[4])
+      redis.call('EXPIRE', KEYS[1], math.ceil(window))
+      return '0'
+    end
+    local oldest = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+    return tostring(window - (now - tonumber(oldest[2])))
+    """
+
+    def acquire_rate_slot(
+        self,
+        *,
+        organization_id: str,
+        subject: str,
+        limit: int,
+        window_seconds: float,
+    ) -> float | None:
+        """Claim one slot in a cross-worker sliding window.
+
+        Returns 0.0 when the slot was granted, the seconds to wait when the
+        window is full, and None when Redis is unreachable so callers can
+        fall back to their own in-process gate.
+        """
+
+        try:
+            raw = self._redis().eval(
+                self._RATE_SLOT_SCRIPT,
+                1,
+                self._key("rate-slot", organization_id, subject),
+                datetime.now(UTC).timestamp(),
+                max(float(window_seconds), 0.001),
+                max(int(limit), 1),
+                secrets.token_urlsafe(12),
+            )
+        except (RedisNotConfiguredError, redis.RedisError, OSError):
+            return None
+        return max(float(raw), 0.0)
+
     def check_rate_limit(
         self,
         *,

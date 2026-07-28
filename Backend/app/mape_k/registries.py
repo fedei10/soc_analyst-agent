@@ -130,6 +130,24 @@ class PlaybookRegistry:
             raise LookupError(f"Playbook {playbook_id}@{version} is not registered.")
         return item
 
+    def known_incident_types(self) -> set[str]:
+        """Every diagnosis label that some registered playbook can act on."""
+
+        return {
+            incident_type
+            for item in self._items.values()
+            for incident_type in item.incident_types
+        }
+
+    def for_incident_type(self, incident_type: str) -> list[PlaybookRegistration]:
+        """Registered playbooks that publish support for this diagnosis."""
+
+        return [
+            item
+            for item in self._items.values()
+            if incident_type in item.incident_types
+        ]
+
     def validate_plan(
         self,
         plan: RemediationPlan,
@@ -211,6 +229,25 @@ ACTION_REGISTRY.register(
         allowed_parameter_keys=frozenset({"reverts_action_id"}),
     )
 )
+# Locking an account cuts off a human being's access, so it sits a role
+# above an IP block even though both are reversible.
+ACTION_REGISTRY.register(
+    ActionRegistration(
+        action_type=ActionType.DISABLE_USER,
+        executor_key="wazuh_active_response.disable_account",
+        minimum_role="soc_l3",
+        rollback_action_type=ActionType.ENABLE_USER,
+        allowed_parameter_keys=frozenset({"scope"}),
+    )
+)
+ACTION_REGISTRY.register(
+    ActionRegistration(
+        action_type=ActionType.ENABLE_USER,
+        executor_key="wazuh_active_response.disable_account_delete",
+        minimum_role="soc_l3",
+        allowed_parameter_keys=frozenset({"reverts_action_id"}),
+    )
+)
 
 VERIFICATION_CHECK_REGISTRY = VerificationCheckRegistry(
     version=VERIFICATION_CATALOGUE_VERSION
@@ -242,6 +279,11 @@ for _check in (
         handler_name="_verify_management_ssh_reachable",
         required=False,
     ),
+    VerificationCheckRegistration(
+        name="no_new_auth_success_for_user",
+        category="security",
+        handler_name="_verify_no_new_auth_success_for_user",
+    ),
 ):
     VERIFICATION_CHECK_REGISTRY.register(_check)
 
@@ -249,6 +291,14 @@ PLAYBOOK_REGISTRY = PlaybookRegistry(
     actions=ACTION_REGISTRY,
     checks=VERIFICATION_CHECK_REGISTRY,
 )
+_SSH_HEALTH_CHECKS = frozenset(
+    {
+        "wazuh_agent_connected",
+        "ssh_port_listening",
+        "management_ssh_reachable",
+    }
+)
+
 PLAYBOOK_REGISTRY.register(
     PlaybookRegistration(
         playbook_id="ssh-bruteforce-v1",
@@ -259,12 +309,43 @@ PLAYBOOK_REGISTRY.register(
         security_checks=frozenset(
             {"ssh_attempts_stopped", "no_new_critical_alerts"}
         ),
+        health_checks=_SSH_HEALTH_CHECKS,
+        action_count=1,
+        rollback_action_count=1,
+    )
+)
+# Spraying is the same containment as brute force - one source, many
+# accounts - but it stays a separate published playbook so an approver sees
+# which detection actually fired.
+PLAYBOOK_REGISTRY.register(
+    PlaybookRegistration(
+        playbook_id="ssh-password-spray-v1",
+        version="1.0",
+        incident_types=frozenset({"ssh_password_spraying"}),
+        action_types=frozenset({ActionType.BLOCK_IP}),
+        rollback_action_types=frozenset({ActionType.UNBLOCK_IP}),
+        security_checks=frozenset(
+            {"ssh_attempts_stopped", "no_new_critical_alerts"}
+        ),
+        health_checks=_SSH_HEALTH_CHECKS,
+        action_count=1,
+        rollback_action_count=1,
+    )
+)
+# A login that succeeded after repeated failures is an account problem, not
+# a network one: blocking the source leaves working credentials in play.
+PLAYBOOK_REGISTRY.register(
+    PlaybookRegistration(
+        playbook_id="credential-compromise-v1",
+        version="1.0",
+        incident_types=frozenset({"ssh_success_after_failures"}),
+        action_types=frozenset({ActionType.DISABLE_USER}),
+        rollback_action_types=frozenset({ActionType.ENABLE_USER}),
+        security_checks=frozenset(
+            {"no_new_auth_success_for_user", "no_new_critical_alerts"}
+        ),
         health_checks=frozenset(
-            {
-                "wazuh_agent_connected",
-                "ssh_port_listening",
-                "management_ssh_reachable",
-            }
+            {"wazuh_agent_connected", "management_ssh_reachable"}
         ),
         action_count=1,
         rollback_action_count=1,

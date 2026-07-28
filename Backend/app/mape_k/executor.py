@@ -6,8 +6,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.config import settings
+from app.mape_k.registries import ACTION_REGISTRY
 from app.mape_k.schemas import (
-    ActionType,
     ExecutionResult,
     IncidentWorkflowState,
     RemediationAction,
@@ -15,6 +15,19 @@ from app.mape_k.schemas import (
 from app.mape_k.utils import stable_id
 from app.services.redis.ephemeral import EphemeralRedis
 from app.services.wazuh.exceptions import WazuhAPIError, WazuhTimeoutError
+
+
+# The only provider commands this executor may ever issue, keyed by the
+# registry's executor_key. Adding an action type to the catalogue is not
+# enough to make it executable - it also needs an entry here, which is the
+# single place to audit what the agent can physically do to a host. The
+# names are Wazuh Active Response commands configured on the manager.
+ACTIVE_RESPONSE_COMMANDS = {
+    "wazuh_active_response.firewall_drop": "firewall-drop",
+    "wazuh_active_response.firewall_drop_delete": "firewall-drop-delete",
+    "wazuh_active_response.disable_account": "disable-account",
+    "wazuh_active_response.disable_account_delete": "disable-account-delete",
+}
 
 
 class RestrictedExecutor:
@@ -54,7 +67,13 @@ class RestrictedExecutor:
         action: RemediationAction,
         state: IncidentWorkflowState,
     ) -> dict[str, Any]:
-        if action.action_type not in {ActionType.BLOCK_IP, ActionType.UNBLOCK_IP}:
+        registration = ACTION_REGISTRY.get(action.action_type)
+        command = (
+            ACTIVE_RESPONSE_COMMANDS.get(registration.executor_key)
+            if registration is not None
+            else None
+        )
+        if command is None:
             raise ValueError("No restricted adapter is registered for this action.")
         if self.responder is None:
             from app.services.wazuh.dependencies import get_wazuh_responder
@@ -62,11 +81,6 @@ class RestrictedExecutor:
             self.responder = get_wazuh_responder()
         if not state.agent_id or not str(state.agent_id).isdigit():
             raise ValueError("A numeric Wazuh agent ID is required.")
-        command = (
-            "firewall-drop"
-            if action.action_type == ActionType.BLOCK_IP
-            else "firewall-drop-delete"
-        )
         return self.responder.run_active_response(
             agent_id=str(state.agent_id),
             command=command,
@@ -117,14 +131,24 @@ class RestrictedExecutor:
         action: RemediationAction,
         before_state: dict[str, Any],
     ) -> str | None:
+        """Skip the provider when the desired state already holds.
+
+        Direction comes from the registry: a forward action publishes a
+        rollback counterpart, a rollback action does not. That keeps this
+        correct for every registered action pair instead of naming two.
+        """
+
         action_present = before_state.get("action_present")
-        if action.action_type == ActionType.BLOCK_IP and action_present is True:
-            return "block_already_present"
-        if (
-            action.action_type == ActionType.UNBLOCK_IP
-            and action_present is False
-        ):
-            return "block_already_absent"
+        if action_present is None:
+            return None
+        registration = ACTION_REGISTRY.get(action.action_type)
+        applies = registration is not None and (
+            registration.rollback_action_type is not None
+        )
+        if applies and action_present is True:
+            return "effect_already_present"
+        if not applies and action_present is False:
+            return "effect_already_absent"
         return None
 
     def run(self, state: IncidentWorkflowState) -> list[ExecutionResult]:

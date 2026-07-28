@@ -254,3 +254,122 @@ def test_get_client_wires_the_shared_rate_limiter(monkeypatch):
 
     assert result == "raw-response"
     assert calls == [1]
+
+
+class FakeSlotCache:
+    """Stands in for EphemeralRedis.acquire_rate_slot."""
+
+    def __init__(self, waits):
+        self.waits = list(waits)
+        self.calls = 0
+
+    def acquire_rate_slot(self, **_kwargs):
+        self.calls += 1
+        return self.waits.pop(0) if self.waits else 0.0
+
+
+def test_shared_window_governs_when_redis_answers(monkeypatch):
+    _clocked(monkeypatch)
+    cache = FakeSlotCache([0.0])
+    limiter = LLMRateLimiter(
+        max_requests=1,
+        period_seconds=60.0,
+        max_wait_seconds=8.0,
+        cache=cache,
+    )
+
+    limiter.acquire()
+
+    assert cache.calls == 1
+    # The local deque stays untouched, so a slot is never spent twice.
+    assert list(limiter._timestamps) == []
+
+
+def test_shared_window_waits_then_admits(monkeypatch):
+    _clock, sleeps = _clocked(monkeypatch)
+    cache = FakeSlotCache([2.0, 0.0])
+    limiter = LLMRateLimiter(
+        max_requests=1,
+        period_seconds=60.0,
+        max_wait_seconds=8.0,
+        cache=cache,
+    )
+
+    limiter.acquire()
+
+    assert sleeps == [2.0]
+    assert cache.calls == 2
+
+
+def test_shared_window_gives_up_past_the_cap(monkeypatch):
+    _clocked(monkeypatch)
+    limiter = LLMRateLimiter(
+        max_requests=1,
+        period_seconds=60.0,
+        max_wait_seconds=5.0,
+        cache=FakeSlotCache([30.0]),
+    )
+
+    with pytest.raises(LLMRateLimitedError):
+        limiter.acquire()
+
+
+def test_falls_back_to_local_window_when_redis_is_down(monkeypatch):
+    _clocked(monkeypatch)
+    # None means "Redis unreachable" - the in-process deque takes over.
+    cache = FakeSlotCache([None, None])
+    limiter = LLMRateLimiter(
+        max_requests=1,
+        period_seconds=60.0,
+        max_wait_seconds=5.0,
+        cache=cache,
+    )
+
+    limiter.acquire()
+
+    assert len(limiter._timestamps) == 1
+    with pytest.raises(LLMRateLimitedError):
+        limiter.acquire()
+
+
+def test_retryable_failure_falls_over_to_the_secondary_provider(monkeypatch):
+    request = httpx.Request("POST", "https://provider.invalid/chat")
+    primary = FakeClient(
+        [
+            httpx.ReadTimeout("timed out", request=request),
+            httpx.ReadTimeout("timed out again", request=request),
+        ]
+    )
+    secondary = FakeClient([_response(parsed=TinyResult(answer="from-fallback"))])
+    monkeypatch.setattr("app.mape_k.llm.time.sleep", lambda _seconds: None)
+
+    provider = LLMProvider(client=primary)
+    monkeypatch.setattr(provider, "get_fallback_client", lambda: secondary)
+
+    result, _usage = provider.invoke_structured(
+        TinyResult,
+        [{"role": "user", "content": "{}"}],
+    )
+
+    assert result.answer == "from-fallback"
+    assert primary.calls == 2
+    assert secondary.calls == 1
+
+
+def test_no_fallback_configured_still_raises_the_primary_error(monkeypatch):
+    request = httpx.Request("POST", "https://provider.invalid/chat")
+    primary = FakeClient(
+        [
+            httpx.ReadTimeout("timed out", request=request),
+            httpx.ReadTimeout("timed out again", request=request),
+        ]
+    )
+    monkeypatch.setattr("app.mape_k.llm.time.sleep", lambda _seconds: None)
+
+    provider = LLMProvider(client=primary)
+    monkeypatch.setattr(provider, "get_fallback_client", lambda: None)
+
+    with pytest.raises(LLMInvocationError) as raised:
+        provider.invoke_structured(TinyResult, [{"role": "user", "content": "{}"}])
+
+    assert raised.value.code == LLMErrorCode.MODEL_TIMEOUT

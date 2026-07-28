@@ -392,27 +392,32 @@ def test_ip_actions_and_protected_lists_use_canonical_ipv6(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("action_type", "rollback_type", "target", "reason_code"),
+    ("action_type", "rollback_type", "target", "reason_code", "unregistered"),
     (
+        # disable_user is a registered action now, so only the protected
+        # account guard should stop it - that guard is what must hold.
         (
             ActionType.DISABLE_USER,
             ActionType.ENABLE_USER,
             "root",
             "PROTECTED_ACCOUNT",
+            False,
         ),
         (
             ActionType.STOP_SERVICE,
             ActionType.START_SERVICE,
             "sshd",
             "PROTECTED_SERVICE",
+            True,
         ),
     ),
 )
-def test_policy_rejects_unregistered_protected_mutations(
+def test_policy_rejects_protected_mutations(
     action_type,
     rollback_type,
     target,
     reason_code,
+    unregistered,
 ):
     state = _planned_state()
     action = RemediationAction(
@@ -443,7 +448,7 @@ def test_policy_rejects_unregistered_protected_mutations(
     )
 
     assert decision.allowed is False
-    assert "UNREGISTERED_ACTION" in decision.reason_codes
+    assert ("UNREGISTERED_ACTION" in decision.reason_codes) is unregistered
     assert reason_code in decision.reason_codes
 
 

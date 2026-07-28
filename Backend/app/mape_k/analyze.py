@@ -7,12 +7,15 @@ from collections import defaultdict
 from typing import Any
 
 from app.config import settings
+from app.mape_k.learning import incident_priors
 from app.mape_k.llm import LLMConfigurationError, LLMProvider, get_llm_provider
+from app.mape_k.registries import PLAYBOOK_REGISTRY
 from app.mape_k.schemas import (
     Diagnosis,
     IncidentWorkflowState,
     SSHDetectionPolicy,
 )
+from app.mape_k.utils import content_hash
 from app.services.redis.ephemeral import EphemeralRedis
 
 
@@ -270,13 +273,49 @@ class IncidentAnalyzer:
             deterministic=True,
         )
 
+    @staticmethod
+    def _alert_context(state: IncidentWorkflowState) -> dict[str, dict[str, Any]]:
+        """Structured detection facts per alert, keyed by evidence source_ref.
+
+        The normalizer already extracted rule IDs, levels, groups and MITRE
+        techniques; sending only `summary` strings asked the model to
+        rediscover them from prose it could not see.
+        """
+
+        context: dict[str, dict[str, Any]] = {}
+        for alert in state.normalized_alerts:
+            context[f"wazuh:alert:{alert.alert_id}"] = {
+                "rule_id": alert.rule_id,
+                "rule_level": alert.rule_level,
+                "rule_description": alert.rule_description,
+                "rule_groups": alert.rule_groups[:6],
+                "mitre_techniques": alert.mitre_techniques[:6],
+                "event_type": alert.event_type,
+                "attack_family": alert.attack_family,
+                "outcome": alert.outcome,
+                "source_ip": alert.source_ip,
+                "target_user": alert.target_user,
+                "process_name": alert.process_name,
+                "file_path": alert.file_path,
+                "cve_id": alert.cve_id,
+                "observed_at": alert.timestamp.isoformat(),
+            }
+        return context
+
+    def _priors(self, state: IncidentWorkflowState) -> dict[str, Any]:
+        return incident_priors(state)
+
     def run(
         self,
         state: IncidentWorkflowState,
     ) -> tuple[Diagnosis, dict[str, Any]]:
+        # Priors participate in the cache key: once analysts disposition a
+        # lookalike finding, the previous cached diagnosis must not mask it.
+        priors = self._priors(state)
+        priors_digest = content_hash(priors)[:16] if priors else "none"
         cache_key = (
             f"{state.incident_fingerprint}:{state.evidence_version}:"
-            f"{self.ssh_policy.model_dump_json()}:diagnosis-v2"
+            f"{self.ssh_policy.model_dump_json()}:{priors_digest}:diagnosis-v3"
         )
         cached = self.cache.get_json(
             namespace="mapek-analysis",
@@ -300,16 +339,33 @@ class IncidentAnalyzer:
             )
             return deterministic, {"input_tokens": 0, "output_tokens": 0}
 
+        alert_context = self._alert_context(state)
+        monitor_context = getattr(state, "monitor_context", None)
+        if not isinstance(monitor_context, dict):
+            monitor_context = {}
         selected_evidence = [
             {
                 "evidence_id": item.evidence_id,
                 "source_type": item.source_type,
                 "summary": item.summary,
+                "observed_at": (
+                    item.observed_at.isoformat() if item.observed_at else None
+                ),
+                # Detection facts for this exact evidence item, so a rule ID
+                # or MITRE technique can be cited rather than inferred.
+                **{
+                    key: value
+                    for key, value in alert_context.get(
+                        item.source_ref,
+                        {},
+                    ).items()
+                    if value not in (None, [], "")
+                },
             }
             for item in state.evidence[:20]
         ]
         prompt_payload: dict[str, Any] = {
-            "schema_version": "1.0",
+            "schema_version": "1.1",
             "incident_id": state.incident_id,
             "incident_fingerprint": state.incident_fingerprint,
             "findings": state.findings[:3],
@@ -322,7 +378,20 @@ class IncidentAnalyzer:
             "evidence_truncated": len(state.evidence) > len(selected_evidence),
             "asset_context": {
                 "agent_id": state.agent_id,
+                "monitor_profile": monitor_context.get("evidence_profile"),
+                "correlated_group_count": monitor_context.get(
+                    "correlated_group_count"
+                ),
+                "correlation": monitor_context.get("correlation"),
             },
+            # What this SOC already concluded about incidents like this one.
+            "prior_knowledge": priors,
+            # The vocabulary that can actually reach a response. An
+            # incident_type outside this list is still valid output, it just
+            # means no approved playbook exists and the case escalates.
+            "actionable_incident_types": sorted(
+                PLAYBOOK_REGISTRY.known_incident_types()
+            ),
             "questions": [
                 "What incident type best fits the supplied evidence?",
                 "Which facts are confirmed by the supplied evidence IDs?",
@@ -335,7 +404,20 @@ class IncidentAnalyzer:
                 "role": "system",
                 "content": (
                     "Diagnose the incident using only supplied evidence IDs. "
-                    "Do not invent evidence or remediation actions."
+                    "Do not invent evidence or remediation actions. "
+                    "Cite rule IDs, MITRE techniques and counts that appear "
+                    "in the evidence rather than describing them generically. "
+                    "When an entry in actionable_incident_types genuinely "
+                    "fits the evidence, use that exact string as "
+                    "incident_type; otherwise use the most accurate label you "
+                    "can and do not force a fit. "
+                    "prior_knowledge records how analysts previously "
+                    "dispositioned similar findings and how noisy this asset "
+                    "normally is: weigh it as evidence about base rates, but "
+                    "never let it override what the current evidence shows. "
+                    "Set needs_more_evidence when the supplied evidence "
+                    "cannot settle the question - the workflow can collect "
+                    "more and ask again."
                 ),
             },
             {

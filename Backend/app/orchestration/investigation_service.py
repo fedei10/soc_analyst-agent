@@ -169,6 +169,12 @@ class InvestigationService:
         organization_id: str = "local",
         owner_user_id: str | None = None,
     ) -> dict[str, Any]:
+        # Only claiming the alert needs mutual exclusion. Running the graph
+        # does not: LangGraph isolates by thread_id and this investigation_id
+        # is freshly minted, so no other caller can be inside it. Holding the
+        # lock across the whole run pinned every other investigation in this
+        # process behind one incident's Wazuh calls, LLM latency and
+        # rate-limiter sleeps.
         with self._lock:
             existing = self.repository.get_active_for_alert(
                 alert_id,
@@ -197,6 +203,8 @@ class InvestigationService:
                     }
                 )
             except IntegrityError:
+                # Another worker claimed the same alert between our read and
+                # our write; the unique constraint is the real arbiter.
                 existing = self.repository.get_active_for_alert(
                     alert_id,
                     organization_id=organization_id,
@@ -204,11 +212,12 @@ class InvestigationService:
                 if existing is not None:
                     return existing
                 raise
-            self.graph.invoke(
-                state,
-                config=investigation_config(investigation_id),
-            )
-            return self._sync_snapshot(investigation_id)
+
+        self.graph.invoke(
+            state,
+            config=investigation_config(investigation_id),
+        )
+        return self._sync_snapshot(investigation_id)
 
     def _checkpoint_view(
         self,

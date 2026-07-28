@@ -37,6 +37,23 @@ class Settings(BaseSettings):
     LLM_BASE_URL: str = "https://api.oxyy.ai/v1"
     LLM_MODEL: str = "gpt-oss-120b"
     LLM_TIMEOUT_SECONDS: int = 30
+    # Cheap tier for intent routing and short structured picks, so the
+    # reasoning budget is spent on diagnosis rather than classification.
+    # Empty means "reuse the reasoning model".
+    LLM_ROUTER_MODEL: str = ""
+    LLM_ROUTER_TIMEOUT_SECONDS: int = 15
+    # Optional secondary provider tried once when the primary fails with a
+    # retryable error. Empty API key disables the fallback entirely.
+    LLM_FALLBACK_PROVIDER: str = ""
+    LLM_FALLBACK_API_KEY: SecretStr = SecretStr("")
+    LLM_FALLBACK_BASE_URL: str = ""
+    LLM_FALLBACK_MODEL: str = ""
+    # Request budget per tier. Shared across workers through Redis when it is
+    # reachable, per-process otherwise.
+    LLM_RATE_LIMIT_MAX_REQUESTS: int = 4
+    LLM_RATE_LIMIT_WINDOW_SECONDS: float = 60.0
+    LLM_RATE_LIMIT_MAX_WAIT_SECONDS: float = 8.0
+    LLM_ROUTER_RATE_LIMIT_MAX_REQUESTS: int = 12
     MAPEK_ANALYSIS_CONFIDENCE_THRESHOLD: float = 0.75
     MAPEK_MAX_ANALYSIS_ATTEMPTS: int = 2
     MAPEK_MAX_PLANNING_RETRIES: int = 1
@@ -71,6 +88,14 @@ class Settings(BaseSettings):
     MAPEK_PROTECTED_SERVICES: str = "sshd,wazuh-agent"
     MAPEK_PROTECTED_PORTS: str = "22,55000,9200"
     MAPEK_MAINTENANCE_WINDOW_ACTIVE: bool = False
+    # Each re-collect pass multiplies the correlation window by this factor
+    # before Monitor runs again, so an inconclusive diagnosis can look wider
+    # instead of dead-ending at escalation.
+    MAPEK_EVIDENCE_WIDEN_FACTOR: float = 4.0
+    # How far back Analyze reads analyst feedback and alert prevalence when
+    # building priors for the model.
+    MAPEK_LEARNING_LOOKBACK_DAYS: int = 30
+    MAPEK_LEARNING_ENABLED: bool = True
 
     # Clerk authenticates every application API request. The secret and
     # optional PEM JWT key are server-only and must never be exposed through a
@@ -139,6 +164,9 @@ class Settings(BaseSettings):
     WAZUH_INGESTION_LEASE_TTL_SECONDS: int = 300
     WAZUH_CONNECTION_PROFILE_ID: str = "default"
     WAZUH_INGESTION_ORGANIZATION_ID: str = "system"
+    # Rule and MITRE definitions are reference data; they change on rule
+    # deploys, not between two questions about the same alert.
+    WAZUH_RULE_CONTEXT_TTL_SECONDS: int = 900
 
     # Durable investigations and LangGraph checkpoints. Leave empty for the
     # in-memory development fallback.

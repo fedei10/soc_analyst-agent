@@ -3,6 +3,8 @@
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
+from app.config import settings
+from app.services.redis.ephemeral import EphemeralRedis
 from app.services.wazuh.indexer_client import WazuhIndexerClient
 from app.services.wazuh.models import (
     AgentConnectivitySummary,
@@ -49,9 +51,11 @@ class WazuhGateway:
         self,
         server: WazuhServerClient | None = None,
         indexer: WazuhIndexerClient | None = None,
+        cache: Any | None = None,
     ) -> None:
         self.server = server or WazuhServerClient()
         self.indexer = indexer or WazuhIndexerClient()
+        self._cache = cache or EphemeralRedis()
 
     # FastAPI's explicitly defined read routes use these internal adapters. They
     # are never registered as LLM tools.
@@ -407,6 +411,37 @@ class WazuhGateway:
         )
 
     def get_rule_and_mitre_context(self, rule_id: str) -> RuleMitreContext | None:
+        """Rule and MITRE reference data for a rule ID.
+
+        Cached: rule definitions change when rules are deployed, not between
+        two questions about the same alert, and this costs two round trips.
+        Deliberately not applied to agent status or inventory - the verifier
+        reads those to decide whether a response actually worked, and a stale
+        answer there is a wrong security verdict, not a slow one.
+        """
+
+        cached = self._cache.get_json(
+            namespace="wazuh-rule-context",
+            organization_id=settings.WAZUH_INGESTION_ORGANIZATION_ID,
+            cache_key=str(rule_id),
+        )
+        if cached is not None:
+            return RuleMitreContext.model_validate(cached)
+        context = self._load_rule_and_mitre_context(rule_id)
+        if context is not None:
+            self._cache.set_json(
+                namespace="wazuh-rule-context",
+                organization_id=settings.WAZUH_INGESTION_ORGANIZATION_ID,
+                cache_key=str(rule_id),
+                value=context.model_dump(mode="json"),
+                ttl_seconds=settings.WAZUH_RULE_CONTEXT_TTL_SECONDS,
+            )
+        return context
+
+    def _load_rule_and_mitre_context(
+        self,
+        rule_id: str,
+    ) -> RuleMitreContext | None:
         rule_payload = self.server.get("/rules", params={"rule_ids": rule_id, "limit": 1})
         rules = _items(rule_payload)
         if not rules:

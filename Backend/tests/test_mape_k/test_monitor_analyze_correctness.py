@@ -11,6 +11,7 @@ from app.mape_k.schemas import (
 )
 from app.services.wazuh.gateway import WazuhGateway
 from app.services.wazuh.models import AlertEvidence, AlertSearchResult
+from app.services.wazuh.normalization import normalize_alerts
 
 
 BASE_TIME = datetime(2026, 7, 25, 12, 0, tzinfo=UTC)
@@ -291,14 +292,72 @@ def test_semantic_analysis_prompt_is_structured_bounded_json():
 
     assert diagnosis.incident_type == "unknown"
     assert llm.payload["incident_id"] == "INC-GENERIC"
+    # With no normalized alert behind it, an evidence entry carries only its
+    # own bounded fields - no invented detection facts.
     assert llm.payload["evidence"] == [
         {
             "evidence_id": evidence.evidence_id,
             "source_type": "wazuh_alert",
             "summary": "Generic bounded evidence",
+            "observed_at": None,
         }
     ]
     assert "questions" in llm.payload
+    assert "actionable_incident_types" in llm.payload
+    assert llm.payload["prior_knowledge"] == {}
+
+
+def test_analysis_prompt_carries_detection_facts_for_each_alert():
+    """Rule IDs and MITRE techniques the normalizer already extracted must
+    reach the model instead of being left for it to infer from prose."""
+
+    alert = ssh_alert(0)
+    normalized = normalize_alerts(
+        [alert.model_dump(mode="json", exclude_none=True)]
+    )[0].normalized
+    evidence = EvidenceReference(
+        evidence_id="EV-AAAABBBBCCCC",
+        source_type="wazuh_alert",
+        source_ref=f"wazuh:alert:{normalized.alert_id}",
+        summary="SSH failure",
+        content_hash="b" * 64,
+    )
+    state = IncidentWorkflowState(
+        incident_id="INC-FACTS",
+        investigation_id="INV-FACTS",
+        alert_id=normalized.alert_id,
+        evidence=[evidence],
+        normalized_alerts=[normalized],
+        incident_fingerprint="FP-FACTS",
+        evidence_version="version-1",
+    )
+
+    class CapturingLLM:
+        def __init__(self):
+            self.payload = None
+
+        def invoke_structured(self, _schema, messages):
+            self.payload = json.loads(messages[-1]["content"])
+            return (
+                Diagnosis(
+                    incident_type="unknown",
+                    summary="Insufficient evidence",
+                    root_cause="Unknown",
+                    evidence_ids=[evidence.evidence_id],
+                    confidence=0.2,
+                    needs_more_evidence=True,
+                ),
+                {"input_tokens": 10, "output_tokens": 5},
+            )
+
+    llm = CapturingLLM()
+    IncidentAnalyzer(llm=llm, cache=MemoryCache()).run(state)
+
+    entry = llm.payload["evidence"][0]
+    assert entry["rule_id"] == normalized.rule_id
+    assert entry["rule_level"] == normalized.rule_level
+    assert entry["event_type"] == normalized.event_type
+    assert entry["source_ip"] == normalized.source_ip
 
 
 def test_gateway_passes_exact_bounds_and_authentication_filter():

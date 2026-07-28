@@ -29,6 +29,7 @@ from app.orchestration.investigation_service import (
     get_investigation_service,
 )
 from app.services.wazuh.gateway import WazuhGateway
+from app.utils.helpers import gather
 from app.soc_assistant.references import (
     InvestigationReferenceError,
     resolve_investigation_reference,
@@ -36,10 +37,11 @@ from app.soc_assistant.references import (
 
 MAX_TOOL_OUTPUT_CHARS = 6000
 # Each reasoning round is model-call + tool-call (~2.2 graph steps per the
-# previous 20-steps/~9-rounds ratio). 7 steps bounds this to ~3 rounds - the
-# LLM provider is rate-limited (5 req/min), so a vague question can no longer
-# burn most of that budget chasing an answer on its own.
-RECURSION_LIMIT = 7
+# previous 20-steps/~9-rounds ratio). 12 steps bounds this to ~5 rounds.
+# It was 7 (~3 rounds) purely because intent routing shared the reasoning
+# provider's per-minute budget; routing now runs on the cheap tier, so the
+# analyst-facing loop can afford to actually correlate before answering.
+RECURSION_LIMIT = 12
 
 SYSTEM_PROMPT = """You are the TSAGE SOC analyst assistant with read-only
 access to live Wazuh data through tools, a tool to save an analyst report on
@@ -48,9 +50,9 @@ response.
 
 How to work:
 - Use the minimum number of tools necessary. Prefer one broad query over
-  several narrow ones. You have a hard budget of about 3 reasoning rounds
-  (provider rate limits are tight) - after 2 rounds, produce the best answer
-  you can from the evidence already collected rather than reaching for more.
+  several narrow ones. You have a hard budget of about 5 reasoning rounds -
+  spend them on evidence that could change your conclusion, and once it
+  cannot, answer from what you already have rather than reaching for more.
 - For a vague question with a real time reference but no specific alert
   ("anything suspicious today?"), call alert_summary once and answer from
   that - do not chain into search_alerts/list_findings/get_agent_context
@@ -110,10 +112,45 @@ Saving reports:
 
 
 def _clip(value: Any) -> str:
+    """Serialize a tool result within budget, always as valid JSON.
+
+    Slicing the rendered JSON handed the model a blob cut mid-structure,
+    which it then had to guess at. Dropping whole records from the longest
+    list instead gives it fewer complete items and an explicit truncation
+    flag it can report to the analyst.
+    """
+
     text = json.dumps(value, default=str)
-    if len(text) > MAX_TOOL_OUTPUT_CHARS:
-        return text[:MAX_TOOL_OUTPUT_CHARS] + '... (truncated)"'
-    return text
+    if len(text) <= MAX_TOOL_OUTPUT_CHARS:
+        return text
+    if isinstance(value, dict):
+        shrunk = dict(value)
+        for _ in range(8):
+            longest = max(
+                (
+                    key
+                    for key, item in shrunk.items()
+                    if isinstance(item, list) and item
+                ),
+                key=lambda key: len(shrunk[key]),
+                default=None,
+            )
+            if longest is None:
+                break
+            shrunk[longest] = shrunk[longest][: max(1, len(shrunk[longest]) // 2)]
+            shrunk["truncated"] = True
+            text = json.dumps(shrunk, default=str)
+            if len(text) <= MAX_TOOL_OUTPUT_CHARS:
+                return text
+    return json.dumps(
+        {
+            "truncated": True,
+            "reason": "The result exceeded the tool output budget.",
+            "preview": json.dumps(value, default=str)[
+                : MAX_TOOL_OUTPUT_CHARS // 2
+            ],
+        }
+    )
 
 
 def build_tools(
@@ -300,50 +337,77 @@ def build_tools(
         suspicious process); use the individual tools afterward only if
         you need more depth in one area than this summary gives."""
         bounded_hours = max(1, min(int(hours), 168))
+
+        def inventory(component: str, item_limit: int):
+            return lambda: gateway.get_agent_inventory(
+                agent_id=agent_id,
+                component=component,  # type: ignore[arg-type]
+                limit=item_limit,
+            )
+
+        # These reads do not depend on each other, so the snapshot costs the
+        # slowest one rather than the sum of all seven.
+        raw = gather(
+            [
+                ("status", lambda: gateway.get_agent_summary(agent_id)),
+                ("hardware", inventory("hardware", 1)),
+                ("processes", inventory("processes", 15)),
+                ("ports", inventory("ports", 15)),
+                (
+                    "vulnerabilities",
+                    lambda: gateway.search_vulnerabilities(
+                        agent_id=agent_id,
+                        limit=10,
+                    ),
+                ),
+                (
+                    "detection_evidence",
+                    lambda: gateway.get_detection_evidence(
+                        agent_id=agent_id,
+                        limit=10,
+                    ),
+                ),
+                (
+                    "recent_alerts",
+                    lambda: gateway.search_alerts(
+                        agent_id=agent_id,
+                        hours=bounded_hours,
+                        limit=10,
+                    ),
+                ),
+            ]
+        )
+
+        def failed(label: str) -> dict[str, str] | None:
+            value = raw[label]
+            return (
+                {"error": type(value).__name__}
+                if isinstance(value, Exception)
+                else None
+            )
+
         context: dict[str, Any] = {"agent_id": agent_id}
-
-        status = gateway.get_agent_summary(agent_id)
-        context["status"] = status.model_dump(mode="json") if status else None
-
-        for label, component, item_limit in (
-            ("hardware", "hardware", 1),
-            ("processes", "processes", 15),
-            ("ports", "ports", 15),
-        ):
-            try:
-                inventory = gateway.get_agent_inventory(
-                    agent_id=agent_id,
-                    component=component,  # type: ignore[arg-type]
-                    limit=item_limit,
-                )
-                context[label] = {
-                    "total": inventory.total,
-                    "items": inventory.items,
-                }
-            except Exception as exc:
-                context[label] = {"error": type(exc).__name__}
-
-        try:
-            vuln_items, vuln_total = gateway.search_vulnerabilities(
-                agent_id=agent_id,
-                limit=10,
-            )
+        context["status"] = (
+            failed("status")
+            or (raw["status"].model_dump(mode="json") if raw["status"] else None)
+        )
+        for label in ("hardware", "processes", "ports"):
+            context[label] = failed(label) or {
+                "total": raw[label].total,
+                "items": raw[label].items,
+            }
+        if (error := failed("vulnerabilities")) is not None:
+            context["vulnerabilities"] = error
+        else:
+            vuln_items, vuln_total = raw["vulnerabilities"]
             context["vulnerabilities"] = {"total": vuln_total, "items": vuln_items}
-        except Exception as exc:
-            context["vulnerabilities"] = {"error": type(exc).__name__}
-
-        try:
-            evidence = gateway.get_detection_evidence(agent_id=agent_id, limit=10)
-            context["detection_evidence"] = evidence.model_dump(mode="json")
-        except Exception as exc:
-            context["detection_evidence"] = {"error": type(exc).__name__}
-
-        try:
-            recent = gateway.search_alerts(
-                agent_id=agent_id,
-                hours=bounded_hours,
-                limit=10,
-            )
+        context["detection_evidence"] = failed("detection_evidence") or raw[
+            "detection_evidence"
+        ].model_dump(mode="json")
+        if (error := failed("recent_alerts")) is not None:
+            context["recent_alerts"] = error
+        else:
+            recent = raw["recent_alerts"]
             context["recent_alerts"] = {
                 "total": recent.total,
                 "alerts": [
@@ -351,8 +415,6 @@ def build_tools(
                     for item in recent.alerts
                 ],
             }
-        except Exception as exc:
-            context["recent_alerts"] = {"error": type(exc).__name__}
 
         return _clip(context)
 

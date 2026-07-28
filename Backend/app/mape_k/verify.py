@@ -233,6 +233,55 @@ class ResponseVerifier:
             truncated=self._related_alerts_truncated,
         )
 
+    def _verify_no_new_auth_success_for_user(
+        self,
+        registration: VerificationCheckRegistration,
+        state: IncidentWorkflowState,
+        observation_start: datetime,
+    ) -> dict[str, Any]:
+        """No account disabled by this plan authenticated successfully after.
+
+        A disable that leaves the account usable is a failed containment, so
+        a single post-execution success is a hard failure rather than noise.
+        """
+
+        plan = state.remediation_plan
+        targets = {
+            action.target
+            for action in (plan.actions if plan else [])
+            if action.target
+        }
+        if not targets:
+            return self._check_result(
+                registration,
+                outcome=_CHECK_NOT_VERIFIED,
+                reason="no_account_target_in_plan",
+            )
+        successes = [
+            item
+            for item in self._load_post_execution_alerts(state, observation_start)
+            if item.target_user in targets
+            and item.event_outcome == "success"
+            and (not state.agent_id or item.agent_id == state.agent_id)
+        ]
+        return self._check_result(
+            registration,
+            outcome=(
+                _CHECK_FAILED
+                if successes
+                else (
+                    _CHECK_NOT_VERIFIED
+                    if self._related_alerts_truncated
+                    else _CHECK_PASSED
+                )
+            ),
+            observation_start=observation_start.isoformat(),
+            accounts=sorted(targets),
+            observed_successes=len(successes),
+            evidence_alert_ids=[item.alert_id for item in successes[:10]],
+            truncated=self._related_alerts_truncated,
+        )
+
     def _verify_wazuh_agent_connected(
         self,
         registration: VerificationCheckRegistration,
