@@ -95,6 +95,7 @@ def build_investigation_pdf(snapshot: dict[str, Any]) -> bytes:
     for title, key in (
         ("Diagnosis", "diagnosis"),
         ("Remediation plan", "remediation_plan"),
+        ("Analyst advisory", "advisory_plan"),
         ("Policy decision", "policy_decision"),
         ("Verification", "verification"),
         ("Rollback", "rollback"),

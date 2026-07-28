@@ -3,27 +3,36 @@
 Selection is catalogue-first: a diagnosed incident type that a registered
 playbook publishes picks that playbook with no model involved. The model is
 consulted only when the diagnosis names something the catalogue does not
-recognise, and then only to *choose* among already-published playbooks - it
-never authors actions, targets, TTLs or checks. Whatever it picks is
-canonicalised back onto that playbook's own incident type so the policy
-engine keeps validating deterministically, and the mapping it proposed is
-written to the audit trail.
+recognise. It may choose an already-published executable playbook, but it can
+never author executable actions, targets, TTLs, or checks. When no registered
+playbook fits, planning produces evidence-bound, non-executable analyst
+guidance instead of treating an unfamiliar attack as a workflow failure.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from app.config import settings
-from app.mape_k.llm import LLMProvider, LLMTier, get_llm_provider
+from app.mape_k.llm import (
+    LLMConfigurationError,
+    LLMInputLimitError,
+    LLMInvocationError,
+    LLMProvider,
+    LLMRateLimitedError,
+    LLMTier,
+    get_llm_provider,
+)
 from app.mape_k.registries import PLAYBOOK_REGISTRY, PlaybookRegistration
 from app.mape_k.schemas import (
     ActionType,
+    AdvisoryPlan,
+    AdvisoryStep,
     Diagnosis,
     IncidentWorkflowState,
     RemediationAction,
@@ -53,14 +62,102 @@ class PlaybookSelection(BaseModel):
         ),
     )
     rationale: str = Field(default="", max_length=600)
+    advisory_summary: str = Field(default="", max_length=2000)
+    investigation_steps: list[AdvisoryStep] = Field(default_factory=list, max_length=12)
+    containment_recommendations: list[AdvisoryStep] = Field(
+        default_factory=list,
+        max_length=12,
+    )
+    eradication_recommendations: list[AdvisoryStep] = Field(
+        default_factory=list,
+        max_length=12,
+    )
+    recovery_recommendations: list[AdvisoryStep] = Field(
+        default_factory=list,
+        max_length=12,
+    )
+    detection_improvements: list[AdvisoryStep] = Field(
+        default_factory=list,
+        max_length=12,
+    )
 
 
 @dataclass(frozen=True)
 class PlanSelection:
-    plan: RemediationPlan
+    plan: RemediationPlan | None
+    advisory_plan: AdvisoryPlan | None
     canonical_incident_type: str
-    selected_by: Literal["catalogue", "model"]
+    selected_by: Literal["catalogue", "model", "advisory"]
     rationale: str | None = None
+    usage: dict[str, Any] = field(default_factory=dict)
+
+
+def _default_advisory_steps() -> dict[str, list[str]]:
+    return {
+        "investigation_steps": [
+            "Validate scope and timeline across affected assets and "
+            "identities using the cited evidence.",
+            "Hunt for related activity and persistence in the "
+            "available Wazuh telemetry.",
+            "Identify the entry point and collect missing evidence "
+            "before authorizing containment.",
+        ],
+        "containment_recommendations": [
+            "Use an approved incident-specific containment runbook "
+            "after a human validates targets and business impact."
+        ],
+        "eradication_recommendations": [
+            "Preserve evidence, then remove confirmed persistence "
+            "and close the validated root cause."
+        ],
+        "recovery_recommendations": [
+            "Restore a known-good state, rotate exposed credentials, "
+            "and monitor for recurrence."
+        ],
+        "detection_improvements": [
+            "Convert confirmed indicators and techniques into reviewed "
+            "detections and regression tests."
+        ],
+    }
+
+
+def _advisory_plan(
+    state: IncidentWorkflowState,
+    diagnosis: Diagnosis,
+    *,
+    decision: PlaybookSelection | None = None,
+    rationale: str | None = None,
+) -> AdvisoryPlan:
+    defaults = _default_advisory_steps()
+
+    def recommendations(name: str) -> list[str]:
+        proposed = list(getattr(decision, name, []) or [])
+        return proposed or defaults[name]
+
+    return AdvisoryPlan(
+        plan_id=stable_id(
+            "ADV",
+            state.incident_id,
+            state.evidence_version,
+            diagnosis.incident_type,
+            length=32,
+        ),
+        incident_id=state.incident_id,
+        evidence_version=str(state.evidence_version or ""),
+        diagnosis_type=diagnosis.incident_type,
+        summary=(
+            (decision.advisory_summary if decision else "")
+            or diagnosis.summary
+            or f"Investigate {diagnosis.incident_type}."
+        ),
+        evidence_ids=list(dict.fromkeys(diagnosis.evidence_ids))[:20],
+        investigation_steps=recommendations("investigation_steps"),
+        containment_recommendations=recommendations("containment_recommendations"),
+        eradication_recommendations=recommendations("eradication_recommendations"),
+        recovery_recommendations=recommendations("recovery_recommendations"),
+        detection_improvements=recommendations("detection_improvements"),
+        rationale=(rationale or (decision.rationale if decision else "") or None),
+    )
 
 
 def _plan_envelope(
@@ -261,16 +358,20 @@ PLAN_BUILDERS = {
 
 
 SELECTION_SYSTEM_PROMPT = (
-    "You map a security diagnosis onto one already-approved response "
-    "playbook. You do not design a response: the actions, targets, expiry "
-    "and verification of each playbook are fixed in code and a human must "
-    "still approve them.\n"
+    "You plan the analyst response to an evidence-backed security diagnosis. "
+    "Executable actions are strictly limited to the supplied approved "
+    "playbooks: their actions, targets, expiry, and verification are fixed in "
+    "code and still require policy checks and human approval.\n"
     "Choose a playbook only when it genuinely addresses the diagnosed "
     "incident on the evidence given. Set applies=false whenever you are "
     "unsure, the diagnosis is a different kind of problem, or the required "
-    "entity (a source IP, an account) is missing - escalating to a human is "
-    "the correct answer, never a failure. Never choose a containment "
-    "playbook to 'do something' about an incident it does not fit."
+    "entity is missing. Never choose a containment playbook merely to do "
+    "something.\n"
+    "When applies=false, provide concise, evidence-bound, non-executable "
+    "analyst guidance for investigation, containment, eradication, recovery, "
+    "and detection improvement. Do not invent evidence, shell commands, tool "
+    "results, or facts not present in the diagnosis. Recommendations always "
+    "require human review."
 )
 
 
@@ -320,8 +421,8 @@ class PlaybookPlanner:
         self,
         state: IncidentWorkflowState,
         diagnosis: Diagnosis,
-    ) -> tuple[PlaybookRegistration, str, str]:
-        """Ask the model to map an unrecognised diagnosis onto a playbook."""
+    ) -> tuple[PlaybookSelection, dict[str, Any]]:
+        """Ask for a constrained playbook choice or analyst advisory."""
 
         catalogue = self._catalogue_summary()
         payload = {
@@ -337,7 +438,7 @@ class PlaybookPlanner:
             },
             "playbooks": catalogue,
         }
-        selection, _usage = self.llm.invoke_structured(
+        selection, usage = self.llm.invoke_structured(
             PlaybookSelection,
             [
                 {"role": "system", "content": SELECTION_SYSTEM_PROMPT},
@@ -353,34 +454,14 @@ class PlaybookPlanner:
             ],
         )
         selection = PlaybookSelection.model_validate(selection)
-        if not selection.applies:
-            raise LookupError(
-                "No approved playbook addresses this diagnosis "
-                f"({selection.rationale or 'model declined to map it'})."
-            )
-        registration = PLAYBOOK_REGISTRY.get(selection.playbook_id, "1.0")
-        if registration is None or registration.playbook_id not in PLAN_BUILDERS:
-            raise LookupError(
-                "The selected playbook is not a registered, buildable playbook."
-            )
-        canonical = selection.canonical_incident_type
-        if canonical not in registration.incident_types:
-            # The model must land on a type this playbook actually publishes;
-            # otherwise fall back to the playbook's own single type when it
-            # has exactly one, and refuse when it is genuinely ambiguous.
-            if len(registration.incident_types) != 1:
-                raise LookupError(
-                    "The selected playbook does not publish the proposed "
-                    "incident type."
-                )
-            canonical = next(iter(registration.incident_types))
-        return registration, canonical, selection.rationale
+        return selection, dict(usage or {})
 
     def plan(self, state: IncidentWorkflowState) -> PlanSelection:
         diagnosis = state.diagnosis
         if diagnosis is None:
             raise LookupError("A diagnosis is required before planning.")
 
+        usage: dict[str, Any] = {}
         matches = self._buildable(
             PLAYBOOK_REGISTRY.for_incident_type(diagnosis.incident_type)
         )
@@ -390,26 +471,125 @@ class PlaybookPlanner:
             selected_by: Literal["catalogue", "model"] = "catalogue"
             rationale = None
         else:
-            registration, canonical, rationale = self._model_selection(
-                state,
-                diagnosis,
-            )
+            try:
+                decision, usage = self._model_selection(state, diagnosis)
+            except (
+                LLMConfigurationError,
+                LLMInputLimitError,
+                LLMInvocationError,
+                LLMRateLimitedError,
+                ValidationError,
+            ) as exc:
+                rationale = (
+                    "Generated deterministic guidance because advisory model "
+                    f"planning was unavailable ({type(exc).__name__})."
+                )
+                return PlanSelection(
+                    plan=None,
+                    advisory_plan=_advisory_plan(
+                        state,
+                        diagnosis,
+                        rationale=rationale,
+                    ),
+                    canonical_incident_type=diagnosis.incident_type,
+                    selected_by="advisory",
+                    rationale=rationale,
+                    usage=usage,
+                )
+
+            if not decision.applies:
+                return PlanSelection(
+                    plan=None,
+                    advisory_plan=_advisory_plan(
+                        state,
+                        diagnosis,
+                        decision=decision,
+                    ),
+                    canonical_incident_type=diagnosis.incident_type,
+                    selected_by="advisory",
+                    rationale=decision.rationale or None,
+                    usage=usage,
+                )
+
+            registration = PLAYBOOK_REGISTRY.get(decision.playbook_id, "1.0")
+            if (
+                registration is None
+                or registration.playbook_id not in PLAN_BUILDERS
+            ):
+                rationale = (
+                    "The proposed executable playbook is not registered; "
+                    "returned analyst guidance instead."
+                )
+                return PlanSelection(
+                    plan=None,
+                    advisory_plan=_advisory_plan(
+                        state,
+                        diagnosis,
+                        decision=decision,
+                        rationale=rationale,
+                    ),
+                    canonical_incident_type=diagnosis.incident_type,
+                    selected_by="advisory",
+                    rationale=rationale,
+                    usage=usage,
+                )
+            canonical = decision.canonical_incident_type
+            if canonical not in registration.incident_types:
+                if len(registration.incident_types) != 1:
+                    rationale = (
+                        "The proposed incident mapping is not published by "
+                        "the selected playbook; returned guidance instead."
+                    )
+                    return PlanSelection(
+                        plan=None,
+                        advisory_plan=_advisory_plan(
+                            state,
+                            diagnosis,
+                            decision=decision,
+                            rationale=rationale,
+                        ),
+                        canonical_incident_type=diagnosis.incident_type,
+                        selected_by="advisory",
+                        rationale=rationale,
+                        usage=usage,
+                    )
+                canonical = next(iter(registration.incident_types))
+            rationale = decision.rationale or None
             selected_by = "model"
 
-        plan = PLAN_BUILDERS[registration.playbook_id](state, diagnosis)
-        # The same validation the policy engine will independently repeat.
-        # A model-selected plan is checked against the canonical type, so
-        # nothing reaches approval on the strength of the model's mapping
-        # alone.
-        PLAYBOOK_REGISTRY.validate_plan(plan, diagnosis_type=canonical)
+        try:
+            plan = PLAN_BUILDERS[registration.playbook_id](state, diagnosis)
+            PLAYBOOK_REGISTRY.validate_plan(plan, diagnosis_type=canonical)
+        except (LookupError, ValueError, ValidationError) as exc:
+            advisory_rationale = (
+                "The executable playbook could not safely bind to the "
+                f"diagnosed entities ({type(exc).__name__}); human review is required."
+            )
+            return PlanSelection(
+                plan=None,
+                advisory_plan=_advisory_plan(
+                    state,
+                    diagnosis,
+                    rationale=advisory_rationale,
+                ),
+                canonical_incident_type=diagnosis.incident_type,
+                selected_by="advisory",
+                rationale=advisory_rationale,
+                usage=usage,
+            )
         return PlanSelection(
             plan=plan,
+            advisory_plan=None,
             canonical_incident_type=canonical,
             selected_by=selected_by,
             rationale=rationale,
+            usage=usage,
         )
 
     def run(self, state: IncidentWorkflowState) -> RemediationPlan:
-        """Backwards-compatible entry point returning only the plan."""
+        """Backwards-compatible entry point for executable plans only."""
 
-        return self.plan(state).plan
+        selection = self.plan(state)
+        if selection.plan is None:
+            raise LookupError("No registered executable playbook fits the diagnosis.")
+        return selection.plan

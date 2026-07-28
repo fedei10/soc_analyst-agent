@@ -463,6 +463,7 @@ def build_tools(
                 "current_stage": snapshot["current_stage"],
                 "pending_nodes": snapshot.get("pending_nodes", []),
                 "diagnosis": snapshot.get("diagnosis"),
+                "advisory_plan": snapshot.get("advisory_plan"),
             }
         )
 
@@ -487,6 +488,7 @@ def build_tools(
                 "current_stage": snapshot["current_stage"],
                 "pending_nodes": snapshot.get("pending_nodes", []),
                 "diagnosis": snapshot.get("diagnosis"),
+                "advisory_plan": snapshot.get("advisory_plan"),
                 "approval_request": snapshot.get("approval_request"),
                 "verification": snapshot.get("verification"),
                 "final_report": snapshot.get("final_report"),

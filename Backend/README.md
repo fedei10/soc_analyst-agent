@@ -75,6 +75,13 @@ adapter, verifies security and health, and rolls back on failure. Keep
 `MAPEK_DRY_RUN=true`, `WAZUH_READ_ONLY=true`, and dangerous tools disabled until
 the response path has been validated in the lab.
 
+The workflow is not limited to SSH brute force analysis. Any sufficiently
+confident, evidence-backed attack diagnosis receives either a registered
+executable remediation plan or a typed analyst advisory covering investigation,
+containment, eradication, recovery, and detection improvement. Advisory plans
+are always non-executable and require human review; only code-owned, reversible
+playbooks can reach policy approval and execution.
+
 The SOC assistant accepts deterministic slash commands and natural-language
 requests. Its server-owned capability catalog is exposed to the frontend for
 autocomplete. Ambiguous requests may use Oxy only for typed intent

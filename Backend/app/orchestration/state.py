@@ -61,6 +61,8 @@ class InvestigationState(TypedDict, total=False):
     confidence: NotRequired[float]
 
     proposed_actions: NotRequired[list[dict[str, Any]]]
+    remediation_plan: NotRequired[dict[str, Any] | None]
+    advisory_plan: NotRequired[dict[str, Any] | None]
     approval_request: NotRequired[dict[str, Any] | None]
     approval_decision: NotRequired[dict[str, Any] | None]
     execution_authorization: NotRequired[dict[str, Any] | None]

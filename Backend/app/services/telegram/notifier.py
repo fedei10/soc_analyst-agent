@@ -115,12 +115,19 @@ def format_approval_alert(snapshot: dict[str, Any]) -> str:
 
 def format_escalation_alert(snapshot: dict[str, Any]) -> str:
     error = snapshot.get("error") or {}
+    advisory = snapshot.get("advisory_plan") or {}
+    reason = (
+        error.get("message")
+        or snapshot.get("failure_reason")
+        or advisory.get("rationale")
+        or advisory.get("summary")
+    )
     return (
         f"<b>Investigation {_escape(snapshot.get('status'))}</b>\n"
         f"Investigation: {_escape(snapshot.get('investigation_id'))}\n"
         f"Alert: {_escape(snapshot.get('alert_id'))}\n"
         f"Stage: {_escape(snapshot.get('current_stage'))}\n"
-        f"Reason: {_escape(error.get('message') or snapshot.get('failure_reason'))}"
+        f"Reason: {_escape(reason)}"
     )
 
 

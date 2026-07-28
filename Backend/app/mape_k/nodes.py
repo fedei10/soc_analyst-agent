@@ -248,6 +248,52 @@ def analyze_node(
     }
 
 
+def _planning_usage_update(
+    state: IncidentWorkflowState,
+    usage: dict[str, Any],
+) -> dict[str, Any]:
+    actual_input = usage.get("actual_input_tokens")
+    actual_output = usage.get("actual_output_tokens")
+    cached_input = usage.get("cached_input_tokens")
+    return {
+        "llm_input_tokens": (
+            state.llm_input_tokens + int(usage.get("input_tokens") or 0)
+        ),
+        "llm_output_tokens": (
+            state.llm_output_tokens + int(usage.get("output_tokens") or 0)
+        ),
+        "estimated_input_tokens": (
+            state.estimated_input_tokens
+            + int(usage.get("estimated_input_tokens") or 0)
+        ),
+        "estimated_output_tokens": (
+            state.estimated_output_tokens
+            + int(usage.get("estimated_output_tokens") or 0)
+        ),
+        "actual_input_tokens": (
+            (state.actual_input_tokens or 0) + int(actual_input)
+            if actual_input is not None
+            else state.actual_input_tokens
+        ),
+        "actual_output_tokens": (
+            (state.actual_output_tokens or 0) + int(actual_output)
+            if actual_output is not None
+            else state.actual_output_tokens
+        ),
+        "cached_input_tokens": (
+            (state.cached_input_tokens or 0) + int(cached_input)
+            if cached_input is not None
+            else state.cached_input_tokens
+        ),
+        "model_calls": state.model_calls
+        + int(usage.get("model_calls") or 0),
+        "model_retries": state.model_retries
+        + int(usage.get("retries") or 0),
+        "model_provider": usage.get("provider") or state.model_provider,
+        "model_name": usage.get("model") or state.model_name,
+    }
+
+
 def plan_node(
     planner: PlaybookPlanner,
     state: IncidentWorkflowState,
@@ -273,19 +319,49 @@ def plan_node(
             "status": WorkflowStatus.ESCALATED,
             "error": WorkflowError(
                 stage=WorkflowStage.PLAN,
-                code="NO_APPROVED_PLAYBOOK",
+                code="PLANNING_FAILED",
                 message=str(exc)[:1000],
             ),
             "audit_events": [
-                audit_event("planning_escalated", reason="no_approved_playbook")
+                audit_event("planning_escalated", reason="planning_failed")
             ],
         }
     plan = selection.plan
+    if plan is None:
+        advisory = selection.advisory_plan
+        if advisory is None:
+            return _failure(
+                WorkflowStage.PLAN,
+                ValueError(
+                    "Planner returned neither an executable nor advisory plan."
+                ),
+            )
+        return {
+            "remediation_plan": None,
+            "advisory_plan": advisory,
+            "planning_attempts": state.planning_attempts + 1,
+            "stage": WorkflowStage.UPDATE_KNOWLEDGE,
+            "current_stage": WorkflowStage.UPDATE_KNOWLEDGE,
+            "status": WorkflowStatus.ESCALATED,
+            **_planning_usage_update(state, selection.usage),
+            "audit_events": [
+                audit_event(
+                    "advisory_plan_created",
+                    diagnosis_type=advisory.diagnosis_type,
+                    evidence_ids=advisory.evidence_ids,
+                    executable=False,
+                    selected_by=selection.selected_by,
+                    rationale=(selection.rationale or "")[:600],
+                )
+            ],
+        }
     update: dict[str, Any] = {
         "remediation_plan": plan,
+        "advisory_plan": None,
         "planning_attempts": state.planning_attempts + 1,
         "stage": WorkflowStage.POLICY_GATE,
         "current_stage": WorkflowStage.POLICY_GATE,
+        **_planning_usage_update(state, selection.usage),
         "audit_events": [
             audit_event(
                 "plan_selected",

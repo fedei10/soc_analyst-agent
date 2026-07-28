@@ -17,7 +17,8 @@ flowchart LR
     M --> N[Analyze]
     N -->|sufficient evidence| P[Plan]
     N -->|low confidence or missing evidence| K[Knowledge and report]
-    P --> G[Policy gate]
+    P -->|registered executable playbook| G[Policy gate]
+    P -->|non-executable advisory| K
     G -->|denied| K
     G -->|mutating plan| H{{Human approval interrupt}}
     H -->|rejected or stale| K
@@ -51,12 +52,12 @@ authorization are LangGraph interrupt nodes, not additional stage enum values.
 | --- | --- |
 | `monitor` | Load the selected Wazuh alert, correlate a bounded time window, normalize and deduplicate events, and create evidence references. |
 | `analyze` | Produce an evidence-bound diagnosis. Deterministic SSH rules run before the bounded semantic fallback. |
-| `plan` | Select a published, versioned playbook and build a canonical remediation plan. |
+| `plan` | Build a registered executable remediation plan when one fits; otherwise produce a typed, non-executable advisory plan for human handling. |
 | `policy_gate` | Validate evidence references, plan integrity, registry versions, targets, protected resources, rollback coverage, risk, and required role. |
 | `execute` | Run only the registered restricted adapter after a durable action claim and execution authorization. |
 | `verify` | Observe post-action security and service health. An accepted provider request is not treated as a verified outcome. |
 | `rollback` | Run the exact rollback mapped to a forward action that may have changed state. |
-| `update_knowledge` | Build and persist the final deterministic report after verified success. |
+| `update_knowledge` | Build and persist the final deterministic report for verified outcomes, escalations, and advisory plans. |
 
 `WorkflowStatus` is orthogonal to the stage:
 
@@ -140,6 +141,28 @@ This is not yet a complete forensic chain of custody. The exact concrete source
 index and raw document hash are unavailable on the current normalized search
 result contract and remain explicit null or pattern-level metadata.
 
+## Attack-agnostic advisory planning
+
+Any sufficiently confident, evidence-bound diagnosis can reach Plan. Planning
+has two deliberately different outputs:
+
+- `RemediationPlan` is executable only when an exact code-owned playbook can be
+  built and independently validated by the policy engine.
+- `AdvisoryPlan` is available for every other diagnosis. It contains cited
+  evidence IDs and human-reviewed investigation, containment, eradication,
+  recovery, and detection recommendations. Its contract fixes
+  `executable=false` and `human_review_required=true`.
+
+The planning model may recommend analyst work, but it cannot place commands,
+targets, or actions into the executor. If the model is unavailable, the planner
+still returns deterministic incident-response guidance. If a model invents a
+playbook, or a registered playbook cannot safely bind to the diagnosed entities,
+the result is downgraded to an advisory rather than guessed or executed.
+
+This makes analysis and response guidance attack-agnostic without pretending
+that arbitrary attacks are safe to remediate automatically. New automation is
+added only by registering and testing a narrow reversible playbook.
+
 ## Immutable remediation plans
 
 `RemediationPlan` contains the plan ID and version, playbook ID and version,
@@ -173,6 +196,8 @@ The current registries publish only the following response surface.
 | --- | --- | --- | --- |
 | `block_ip` | Wazuh Active Response `firewall-drop` | `soc_l2` | `unblock_ip` |
 | `unblock_ip` | Wazuh Active Response `firewall-drop-delete` | `soc_l2` | None |
+| `disable_user` | Wazuh Active Response `disable-account` | `soc_l3` | `enable_user` |
+| `enable_user` | Wazuh Active Response `disable-account-delete` | `soc_l3` | None |
 
 Arbitrary `command`, `shell`, and `argv` parameters are prohibited.
 Playbook validation also enforces the published parameter allowlist.
@@ -183,23 +208,25 @@ Playbook validation also enforces the published parameter allowlist.
 | --- | --- | --- |
 | `ssh_attempts_stopped` | Security | Required |
 | `no_new_critical_alerts` | Security | Required |
+| `no_new_auth_success_for_user` | Security | Required for account containment |
 | `wazuh_agent_connected` | Health | Required |
 | `ssh_port_listening` | Health | Required |
 | `management_ssh_reachable` | Health | Optional unless required by configuration |
 
 ### Playbook registry
 
-The only currently published response playbook is
-`ssh-bruteforce-v1@1.0`. It accepts only the `ssh_brute_force` diagnosis and
-requires:
+The currently published executable playbooks are:
 
-- exactly one `block_ip` forward action;
-- exactly one `unblock_ip` rollback action;
-- an exact `reverts_action_id` mapping from rollback to forward action; and
-- the published SSH security and health checks.
+- `ssh-bruteforce-v1@1.0`: temporary source-IP containment for
+  `ssh_brute_force`;
+- `ssh-password-spray-v1@1.0`: temporary source-IP containment for
+  `ssh_password_spraying`; and
+- `credential-compromise-v1@1.0`: single-account disablement for
+  `ssh_success_after_failures`.
 
-Other action enum values are schema vocabulary only. They have no registered
-executor and cannot pass the current policy gate.
+Each requires one exact rollback mapped to its forward action and its published
+security and health checks. Other action enum values are schema vocabulary only;
+they have no registered executor and cannot pass the policy gate.
 
 ## Policy gate
 
@@ -610,8 +637,10 @@ The following work is intentionally not described as complete:
 7. **Rollback convergence:** ambiguous provider outcomes are durably recoverable
    and shared target locks survive to TTL expiry, but inline rollback is not
    yet a fully durable, independently verified outbox workflow.
-8. **Playbook breadth:** only SSH-brute-force temporary IP containment is
-   registered for runtime execution.
+8. **Execution breadth:** analysis and advisory planning accept any
+   evidence-backed attack diagnosis, but runtime execution is intentionally
+   limited to the three registered SSH/authentication playbooks. Other attack
+   types require human-reviewed response until a dedicated playbook is added.
 9. **Request execution model:** investigation stages still run synchronously
     in API request/resume paths rather than through a durable background job.
 

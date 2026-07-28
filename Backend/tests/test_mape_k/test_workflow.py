@@ -25,6 +25,7 @@ from app.mape_k.graph import (
 from app.mape_k.nodes import _validate_approval_binding
 from app.mape_k.llm import LLMInputLimitError, LLMProvider
 from app.mape_k.monitor import WazuhMonitor
+from app.mape_k.playbooks import PlaybookPlanner, PlaybookSelection
 from app.mape_k.policy import PolicyEngine, role_allows
 from app.mape_k.utils import response_resource_namespace
 from app.mape_k.schemas import (
@@ -258,6 +259,78 @@ def test_low_confidence_diagnosis_escalates_without_planning():
     # It escalates only after exhausting its re-collect attempts, not on the
     # first inconclusive pass.
     assert snapshot["analysis_attempts"] == settings.MAPEK_MAX_ANALYSIS_ATTEMPTS
+
+
+def test_unknown_attack_produces_advisory_without_execution_path():
+    class ExfiltrationAnalyzer:
+        def run(self, state):
+            return (
+                Diagnosis(
+                    incident_type="data_exfiltration",
+                    summary="Possible archive transfer to an external destination.",
+                    root_cause="A suspicious process initiated an outbound transfer.",
+                    attack_techniques=["T1041"],
+                    affected_assets=["linux-server-01"],
+                    affected_entities={"host": "linux-server-01"},
+                    evidence_ids=[state.evidence[0].evidence_id],
+                    confidence=0.94,
+                ),
+                {"input_tokens": 12, "output_tokens": 8, "model_calls": 1},
+            )
+
+    class AdvisoryLLM:
+        def invoke_structured(self, _schema, _messages):
+            return (
+                PlaybookSelection(
+                    applies=False,
+                    rationale="No registered response matches exfiltration.",
+                    advisory_summary="Investigate and contain possible exfiltration.",
+                    investigation_steps=[
+                        "Correlate transfer volume, destination, process, and user."
+                    ],
+                    containment_recommendations=[
+                        "After impact review, isolate the affected host "
+                        "using an approved runbook."
+                    ],
+                    eradication_recommendations=[
+                        "Remove the confirmed persistence and transfer mechanism."
+                    ],
+                    recovery_recommendations=[
+                        "Restore a known-good state and monitor outbound traffic."
+                    ],
+                    detection_improvements=[
+                        "Alert on unusual archive creation followed by "
+                        "outbound transfer."
+                    ],
+                ),
+                {"input_tokens": 20, "output_tokens": 15, "model_calls": 1},
+            )
+
+    graph = create_mape_k_graph(
+        monitor=WazuhMonitor(gateway=FakeWazuhGateway(), cache=MemoryCache()),
+        analyzer=ExfiltrationAnalyzer(),
+        planner=PlaybookPlanner(llm=AdvisoryLLM()),
+        executor=RestrictedExecutor(cache=MemoryCache()),
+    )
+    config = investigation_config("INV-EXFIL")
+
+    snapshot = graph.invoke(
+        initial_state("INV-EXFIL").model_dump(),
+        config=config,
+    )
+
+    assert snapshot["status"] == WorkflowStatus.ESCALATED
+    assert snapshot["remediation_plan"] is None
+    assert snapshot["advisory_plan"].diagnosis_type == "data_exfiltration"
+    assert snapshot["advisory_plan"].executable is False
+    assert snapshot["approval_request"] is None
+    assert snapshot["execution_results"] == []
+    assert snapshot["final_report"]["advisory_plan"]["executable"] is False
+    assert graph.get_state(config).next == ()
+    assert any(
+        event["event"] == "advisory_plan_created"
+        for event in snapshot["audit_events"]
+    )
 
 
 def test_inconclusive_analysis_recollects_over_a_wider_window():

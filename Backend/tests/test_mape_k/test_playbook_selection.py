@@ -85,16 +85,21 @@ def test_credential_compromise_disables_the_account_not_the_ip():
     assert plan.required_role == "soc_l3"
 
 
-def test_ambiguous_account_set_escalates_instead_of_guessing():
-    with pytest.raises(LookupError):
-        PlaybookPlanner(llm=StubLLM(None)).plan(
-            _state(
-                _diagnosis(
-                    "ssh_success_after_failures",
-                    users=["alice", "bob"],
-                )
+def test_ambiguous_account_set_returns_advisory_instead_of_guessing():
+    selection = PlaybookPlanner(llm=StubLLM(None)).plan(
+        _state(
+            _diagnosis(
+                "ssh_success_after_failures",
+                users=["alice", "bob"],
             )
         )
+    )
+
+    assert selection.plan is None
+    assert selection.selected_by == "advisory"
+    assert selection.advisory_plan is not None
+    assert selection.advisory_plan.executable is False
+    assert selection.advisory_plan.human_review_required is True
 
 
 def test_model_maps_an_unknown_incident_type_onto_a_published_playbook():
@@ -117,15 +122,34 @@ def test_model_maps_an_unknown_incident_type_onto_a_published_playbook():
     assert selection.plan.playbook_id == "ssh-bruteforce-v1"
 
 
-def test_model_declining_escalates():
+def test_model_declining_returns_attack_specific_advisory():
     llm = StubLLM(
-        PlaybookSelection(applies=False, rationale="Different problem entirely.")
+        PlaybookSelection(
+            applies=False,
+            rationale="Different problem entirely.",
+            advisory_summary="Investigate suspected outbound data theft.",
+            investigation_steps=[
+                "Correlate outbound transfers with process activity."
+            ],
+            containment_recommendations=["Validate and isolate the affected host."],
+        )
     )
 
-    with pytest.raises(LookupError):
-        PlaybookPlanner(llm=llm).plan(
-            _state(_diagnosis("data_exfiltration", source_ip="203.0.113.9"))
-        )
+    selection = PlaybookPlanner(llm=llm).plan(
+        _state(_diagnosis("data_exfiltration", source_ip="203.0.113.9"))
+    )
+
+    advisory = selection.advisory_plan
+    assert selection.plan is None
+    assert selection.selected_by == "advisory"
+    assert selection.usage["input_tokens"] == 1
+    assert advisory is not None
+    assert advisory.diagnosis_type == "data_exfiltration"
+    assert advisory.investigation_steps == [
+        "Correlate outbound transfers with process activity."
+    ]
+    assert advisory.executable is False
+    assert advisory.evidence_ids == [EVIDENCE_ID]
 
 
 def test_model_cannot_invent_an_unregistered_playbook():
@@ -137,10 +161,14 @@ def test_model_cannot_invent_an_unregistered_playbook():
         )
     )
 
-    with pytest.raises(LookupError):
-        PlaybookPlanner(llm=llm).plan(
-            _state(_diagnosis("something_novel", source_ip="203.0.113.9"))
-        )
+    selection = PlaybookPlanner(llm=llm).plan(
+        _state(_diagnosis("something_novel", source_ip="203.0.113.9"))
+    )
+
+    assert selection.plan is None
+    assert selection.advisory_plan is not None
+    assert selection.advisory_plan.executable is False
+    assert "not registered" in (selection.rationale or "")
 
 
 def test_model_selected_plan_still_satisfies_the_policy_engine():

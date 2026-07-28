@@ -4,6 +4,7 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from app.mape_k.schemas import (
     ActionType,
+    AdvisoryPlan,
     ApprovalDecision,
     ApprovalRequestRecord,
     ApprovalSubmission,
@@ -30,6 +31,7 @@ from app.services.wazuh.normalization.schemas import NormalizedAlert
 
 CHECKPOINT_TYPES = (
     ActionType,
+    AdvisoryPlan,
     ApprovalDecision,
     ApprovalRequestRecord,
     ApprovalSubmission,

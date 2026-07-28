@@ -214,6 +214,48 @@ class RemediationPlan(StrictModel):
         return self
 
 
+AdvisoryStep = Annotated[str, Field(min_length=1, max_length=1000)]
+
+
+class AdvisoryPlan(StrictModel):
+    """Evidence-bound analyst guidance that can never enter execution."""
+
+    plan_id: str = Field(pattern=r"^ADV-[A-F0-9]{12,64}$")
+    incident_id: str
+    evidence_version: str
+    diagnosis_type: str
+    summary: str = Field(min_length=1, max_length=2000)
+    evidence_ids: list[str] = Field(min_length=1, max_length=20)
+    investigation_steps: list[AdvisoryStep] = Field(min_length=1, max_length=12)
+    containment_recommendations: list[AdvisoryStep] = Field(
+        default_factory=list,
+        max_length=12,
+    )
+    eradication_recommendations: list[AdvisoryStep] = Field(
+        default_factory=list,
+        max_length=12,
+    )
+    recovery_recommendations: list[AdvisoryStep] = Field(
+        default_factory=list,
+        max_length=12,
+    )
+    detection_improvements: list[AdvisoryStep] = Field(
+        default_factory=list,
+        max_length=12,
+    )
+    rationale: str | None = Field(default=None, max_length=1000)
+    human_review_required: Literal[True] = True
+    executable: Literal[False] = False
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @field_validator("evidence_ids")
+    @classmethod
+    def evidence_ids_are_unique(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("Advisory evidence IDs must be unique.")
+        return value
+
+
 class PolicyDecision(StrictModel):
     allowed: bool
     approval_required: bool
@@ -378,6 +420,7 @@ class IncidentWorkflowState(BaseModel):
     evidence_version: str | None = None
     diagnosis: Diagnosis | None = None
     remediation_plan: RemediationPlan | None = None
+    advisory_plan: AdvisoryPlan | None = None
     policy_decision: PolicyDecision | None = None
     approval_request: ApprovalRequestRecord | None = None
     approval_decision: ApprovalDecision | None = None

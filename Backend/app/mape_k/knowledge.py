@@ -17,6 +17,11 @@ def build_final_report(state: IncidentWorkflowState) -> dict[str, Any]:
         if state.remediation_plan
         else None
     )
+    advisory_plan = (
+        state.advisory_plan.model_dump(mode="json")
+        if state.advisory_plan
+        else None
+    )
     return {
         "report_type": "mapek_incident_report",
         "incident_id": state.incident_id,
@@ -26,6 +31,7 @@ def build_final_report(state: IncidentWorkflowState) -> dict[str, Any]:
         "stage": state.stage,
         "diagnosis": diagnosis,
         "remediation_plan": plan,
+        "advisory_plan": advisory_plan,
         "policy_decision": (
             state.policy_decision.model_dump(mode="json")
             if state.policy_decision
