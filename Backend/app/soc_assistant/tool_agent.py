@@ -219,6 +219,64 @@ Saving reports:
 """
 
 
+def _is_empty_alert_value(value: Any) -> bool:
+    """True for values that cost tokens in every row and say nothing.
+
+    These are resent in full on each following ReAct round, so the waste
+    compounds across the turn.
+    """
+
+    if value is None or value == []:
+        return True
+    return isinstance(value, str) and value.strip().lower() in {"", "unknown"}
+
+
+def _compact_alert(
+    alert: Any,
+    *,
+    drop_rule_metadata: bool = False,
+) -> dict[str, Any]:
+    """One alert with its empty fields dropped.
+
+    A normalised alert has ~30 optional fields; a dpkg or syslog row fills a
+    handful. Serialising `source_ip: null, target_user: null,
+    event_outcome: "unknown"` for every row is pure overhead, and the whole
+    payload is replayed into the prompt on each following round.
+    """
+
+    payload = alert.model_dump(mode="json", exclude={"full_log"})
+    payload.pop("schema_version", None)
+    if drop_rule_metadata:
+        # Carried once per rule in rule_summary; the model joins on rule_id.
+        payload.pop("rule_description", None)
+        payload.pop("rule_groups", None)
+    return {
+        key: value
+        for key, value in payload.items()
+        if not _is_empty_alert_value(value)
+    }
+
+
+def _rule_rollup(alerts: list[Any]) -> list[dict[str, Any]]:
+    """Counts per rule, so repetition is visible without reading every row."""
+
+    counts: dict[str, dict[str, Any]] = {}
+    for alert in alerts:
+        rule_id = str(getattr(alert, "rule_id", "") or "unknown")
+        entry = counts.setdefault(
+            rule_id,
+            {
+                "rule_id": rule_id,
+                "count": 0,
+                "level": getattr(alert, "rule_level", None),
+                "description": getattr(alert, "rule_description", None),
+                "groups": list(getattr(alert, "rule_groups", []) or []),
+            },
+        )
+        entry["count"] += 1
+    return sorted(counts.values(), key=lambda item: -item["count"])
+
+
 def _clip(value: Any) -> str:
     """Serialize a tool result within budget, always as valid JSON.
 
@@ -318,8 +376,11 @@ def build_tools(
             {
                 "total": result.total,
                 "returned": result.returned,
+                # Repetition is the signal in a dpkg burst; showing it as a
+                # count stops the model re-deriving it by reading every row.
+                "rule_summary": _rule_rollup(result.alerts),
                 "alerts": [
-                    item.model_dump(mode="json", exclude={"full_log"})
+                    _compact_alert(item, drop_rule_metadata=True)
                     for item in result.alerts
                 ],
             }

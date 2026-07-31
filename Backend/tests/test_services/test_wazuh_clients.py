@@ -549,3 +549,106 @@ def test_agent_connectivity_summary_handles_flat_shape():
 
     assert summary.by_status == {"active": 3, "disconnected": 1}
     assert summary.total == 4
+
+
+# --- rule_mitre_context must not come back empty --------------------------
+
+
+class _RuleWithoutMitreServer:
+    """Wazuh /rules returning a rule whose definition carries no MITRE map."""
+
+    def __init__(self):
+        self.paths = []
+
+    def get(self, path, params=None):
+        self.paths.append(path)
+        if path == "/rules":
+            return {
+                "data": {
+                    "affected_items": [
+                        {
+                            "id": 5902,
+                            "description": "New user added to the system.",
+                            "level": 8,
+                            "groups": ["syslog", "adduser"],
+                        }
+                    ]
+                }
+            }
+        if path == "/mitre/techniques":
+            return {
+                "data": {
+                    "affected_items": [
+                        {"id": "T1136", "name": "Create Account"}
+                    ]
+                }
+            }
+        return {"data": {"affected_items": []}}
+
+
+def test_rule_mitre_context_falls_back_to_alert_documents(monkeypatch):
+    """Rule 5902 has no mapping in its definition; its alerts carry T1136."""
+    from types import SimpleNamespace
+
+    from app.services.wazuh.gateway import WazuhGateway
+
+    gateway = WazuhGateway.__new__(WazuhGateway)
+    gateway.server = _RuleWithoutMitreServer()
+    monkeypatch.setattr(
+        gateway,
+        "search_alerts",
+        lambda **_kwargs: SimpleNamespace(
+            alerts=[
+                SimpleNamespace(mitre_techniques=["T1136"]),
+                SimpleNamespace(mitre_techniques=["T1136"]),
+            ],
+            total=2,
+            returned=2,
+        ),
+        raising=False,
+    )
+
+    context = gateway._load_rule_and_mitre_context("5902")
+
+    assert context.mitre_ids == ["T1136"]
+    assert context.mitre_source == "alert_documents"
+    assert context.techniques
+
+
+def test_rule_mitre_context_prefers_the_rule_definition(monkeypatch):
+    """The fallback must not mask a mapping the rule already provides."""
+    from app.services.wazuh.gateway import WazuhGateway
+
+    class _Server(_RuleWithoutMitreServer):
+        def get(self, path, params=None):
+            if path == "/rules":
+                return {
+                    "data": {
+                        "affected_items": [
+                            {
+                                "id": 5902,
+                                "description": "New user added.",
+                                "level": 8,
+                                "groups": ["adduser"],
+                                "mitre": {"id": ["T1136"]},
+                            }
+                        ]
+                    }
+                }
+            return super().get(path, params)
+
+    gateway = WazuhGateway.__new__(WazuhGateway)
+    gateway.server = _Server()
+    called = []
+    monkeypatch.setattr(
+        gateway,
+        "_mitre_ids_from_alerts",
+        lambda rule_id: called.append(rule_id) or [],
+        raising=False,
+    )
+
+    context = gateway._load_rule_and_mitre_context("5902")
+
+    assert context.mitre_ids == ["T1136"]
+    assert context.mitre_source == "rule_definition"
+    assert called == []

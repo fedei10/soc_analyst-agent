@@ -180,6 +180,9 @@ class RuleMitreContext(BaseModel):
     groups: list[str] = Field(default_factory=list)
     mitre_ids: list[str] = Field(default_factory=list)
     techniques: list[dict] = Field(default_factory=list)
+    # Where mitre_ids came from: the rule definition, or aggregated from
+    # alert documents when the rule metadata carries no mapping.
+    mitre_source: Literal["rule_definition", "alert_documents", "none"] = "none"
 
 
 class EndpointInventory(BaseModel):

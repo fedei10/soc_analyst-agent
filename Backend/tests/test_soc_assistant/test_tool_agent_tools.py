@@ -283,3 +283,85 @@ def test_save_report_truncates_oversized_fields():
     assert len(stored["title"]) == 256
     assert len(stored["summary"]) == 2000
     assert len(stored["body_markdown"]) == 20000
+
+
+# --- Wazuh tool payload compaction ----------------------------------------
+
+
+def _dpkg_alert(index: int):
+    from datetime import UTC, datetime
+
+    from app.services.wazuh.normalization.schemas import NormalizedAlert
+
+    return NormalizedAlert(
+        alert_id=f"alert-{index}",
+        timestamp=datetime.now(UTC),
+        agent_id="001",
+        agent_name="srv",
+        hostname="srv",
+        rule_id="2501",
+        rule_level=7,
+        rule_description="dpkg (Debian Package) installed.",
+        rule_groups=["syslog", "dpkg"],
+        category="system",
+        attack_family="none",
+        event_type="package_install",
+        summary="dpkg installed a package.",
+        evidence_ref=f"wazuh:alert:alert-{index}",
+        normalization_quality="complete",
+    )
+
+
+def test_compact_alert_drops_empty_fields_but_keeps_citation_data():
+    from app.soc_assistant.tool_agent import _compact_alert
+
+    compacted = _compact_alert(_dpkg_alert(1))
+
+    # Null/unknown noise is gone.
+    assert "source_ip" not in compacted
+    assert "target_user" not in compacted
+    assert "cve_id" not in compacted
+    assert compacted.get("outcome") is None
+    # Everything needed to cite the alert survives.
+    assert compacted["alert_id"] == "alert-1"
+    assert compacted["evidence_ref"] == "wazuh:alert:alert-1"
+    assert compacted["rule_id"] == "2501"
+
+
+def test_rule_rollup_counts_repeated_rules():
+    from app.soc_assistant.tool_agent import _rule_rollup
+
+    rollup = _rule_rollup([_dpkg_alert(index) for index in range(10)])
+
+    assert rollup == [
+        {
+            "rule_id": "2501",
+            "count": 10,
+            "level": 7,
+            "description": "dpkg (Debian Package) installed.",
+            "groups": ["syslog", "dpkg"],
+        }
+    ]
+
+
+def test_compaction_materially_shrinks_a_repetitive_burst():
+    """The payload is replayed every ReAct round, so size is a real cost."""
+    import json
+
+    from app.soc_assistant.tool_agent import _compact_alert, _rule_rollup
+
+    alerts = [_dpkg_alert(index) for index in range(10)]
+    before = json.dumps(
+        [item.model_dump(mode="json", exclude={"full_log"}) for item in alerts],
+        default=str,
+    )
+    after = json.dumps(
+        {
+            "rule_summary": _rule_rollup(alerts),
+            "alerts": [
+                _compact_alert(item, drop_rule_metadata=True) for item in alerts
+            ],
+        },
+        default=str,
+    )
+    assert len(after) < len(before) * 0.6

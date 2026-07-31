@@ -460,6 +460,25 @@ class WazuhGateway:
         groups = rule.get("groups") or []
         if not isinstance(groups, list):
             groups = [groups]
+        mitre_source = "rule_definition" if mitre_ids else "none"
+        if not mitre_ids:
+            # The rule definition carries no mapping, but the alerts it fires
+            # usually do. Aggregating them beats the tool whose whole job is
+            # MITRE context returning nothing - and the source is labelled so
+            # a caller can tell the two apart.
+            derived = self._mitre_ids_from_alerts(rule_id)
+            if derived:
+                mitre_ids = derived
+                mitre_source = "alert_documents"
+                techniques = _items(
+                    self.server.get(
+                        "/mitre/techniques",
+                        params={
+                            "search": ",".join(mitre_ids),
+                            "limit": 50,
+                        },
+                    )
+                )
         return RuleMitreContext(
             rule_id=str(rule.get("id") or rule_id),
             description=rule.get("description"),
@@ -467,7 +486,28 @@ class WazuhGateway:
             groups=[str(item) for item in groups],
             mitre_ids=[str(item) for item in mitre_ids],
             techniques=techniques,
+            mitre_source=mitre_source,
         )
+
+    def _mitre_ids_from_alerts(self, rule_id: str) -> list[str]:
+        """MITRE IDs observed on recent alerts for this rule. Never raises."""
+
+        try:
+            result = self.search_alerts(
+                hours=168,
+                min_level=0,
+                limit=50,
+                rule_id=str(rule_id),
+            )
+        except Exception:
+            return []
+        seen: list[str] = []
+        for alert in result.alerts:
+            for technique in getattr(alert, "mitre_techniques", []) or []:
+                value = str(technique).strip()
+                if value and value not in seen:
+                    seen.append(value)
+        return seen
 
     def get_detection_evidence(self, *, agent_id: str, limit: int = 100) -> DetectionEvidence:
         fim = self.server.get("/syscheck/{agent_id}".format(agent_id=agent_id), params={"limit": limit})
