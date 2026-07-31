@@ -85,6 +85,45 @@ COMMANDS = (
         examples=["/status INV-ABC123"],
     ),
     AssistantCommand(
+        name=AssistantCommandName.PLAN,
+        slash="/plan",
+        aliases=["/investigation-plan"],
+        title="Review the investigation plan",
+        description=(
+            "Show the evidence-bound plan already produced by the controlled "
+            "workflow; this command never invents or executes a plan."
+        ),
+        usage="/plan <investigation-id>",
+        category="Investigate",
+        examples=["/plan INV-ABC123"],
+    ),
+    AssistantCommand(
+        name=AssistantCommandName.COLLECT,
+        slash="/collect",
+        aliases=["/collect-evidence"],
+        title="Collect more evidence",
+        description=(
+            "Resume an inconclusive escalated investigation at Monitor, then "
+            "run Analyze again in the same durable workflow."
+        ),
+        usage="/collect <investigation-id>",
+        category="Investigate",
+        examples=["/collect INV-ABC123"],
+    ),
+    AssistantCommand(
+        name=AssistantCommandName.CONTINUE,
+        slash="/continue",
+        aliases=["/resume"],
+        title="Continue the controlled workflow",
+        description=(
+            "Continue the same durable investigation without skipping Analyze, "
+            "policy, approval, execution authorization, or verification."
+        ),
+        usage="/continue <investigation-id>",
+        category="Respond",
+        examples=["/continue INV-ABC123"],
+    ),
+    AssistantCommand(
         name=AssistantCommandName.HEALTH,
         slash="/health",
         aliases=["/connections"],

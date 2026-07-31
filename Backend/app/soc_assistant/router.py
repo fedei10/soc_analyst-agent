@@ -54,6 +54,9 @@ COMMAND_ARGUMENTS = {
     AssistantCommandName.TRIAGE: {"hours", "min_level", "limit"},
     AssistantCommandName.INVESTIGATE: {"alert_id", "agent_id"},
     AssistantCommandName.STATUS: {"investigation_id"},
+    AssistantCommandName.PLAN: {"investigation_id"},
+    AssistantCommandName.COLLECT: {"investigation_id"},
+    AssistantCommandName.CONTINUE: {"investigation_id"},
     AssistantCommandName.HEALTH: set(),
     AssistantCommandName.EXPLAIN: {"command"},
 }
@@ -151,9 +154,16 @@ class AssistantIntentRouter:
             if not positional:
                 raise ValueError("/investigate requires a Wazuh alert ID.")
             options["alert_id"] = positional[0]
-        elif command.name == AssistantCommandName.STATUS:
+        elif command.name in {
+            AssistantCommandName.STATUS,
+            AssistantCommandName.PLAN,
+            AssistantCommandName.COLLECT,
+            AssistantCommandName.CONTINUE,
+        }:
             if not positional:
-                raise ValueError("/status requires an investigation ID.")
+                raise ValueError(
+                    f"{command.slash} requires an investigation ID."
+                )
             options["investigation_id"] = positional[0]
         elif command.name == AssistantCommandName.CHAT:
             if not positional:
@@ -274,6 +284,24 @@ class AssistantIntentRouter:
             "good evening",
         }:
             return AssistantIntent(command=AssistantCommandName.CHAT)
+        if investigation and re.search(
+            r"\b(collect|gather|fetch)\b.*\b(evidence|telemetry|data)\b",
+            lower,
+        ):
+            return AssistantIntent(
+                command=AssistantCommandName.COLLECT,
+                arguments={"investigation_id": investigation.group(0).upper()},
+            )
+        if investigation and re.search(r"\b(continue|resume)\b", lower):
+            return AssistantIntent(
+                command=AssistantCommandName.CONTINUE,
+                arguments={"investigation_id": investigation.group(0).upper()},
+            )
+        if investigation and re.search(r"\b(plan|remediation)\b", lower):
+            return AssistantIntent(
+                command=AssistantCommandName.PLAN,
+                arguments={"investigation_id": investigation.group(0).upper()},
+            )
         if investigation and any(word in lower for word in ("status", "check", "show")):
             return AssistantIntent(
                 command=AssistantCommandName.STATUS,

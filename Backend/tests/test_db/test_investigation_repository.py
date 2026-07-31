@@ -185,6 +185,22 @@ def test_repository_persists_runs_report_actions_and_audit_history():
     assert approvals[0]["decided_by_user_id"] == "analyst"
 
 
+def test_escalated_investigation_remains_reusable_for_the_same_alert():
+    store = repository()
+    value = snapshot()
+    value["status"] = "escalated"
+    value["current_stage"] = "analyze"
+
+    store.save_snapshot(value)
+
+    active = store.get_active_for_alert(
+        value["alert_id"],
+        organization_id=value["organization_id"],
+    )
+    assert active is not None
+    assert active["investigation_id"] == value["investigation_id"]
+
+
 def test_audit_events_are_append_only_and_idempotent():
     store = repository()
     value = snapshot()

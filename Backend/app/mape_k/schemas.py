@@ -87,6 +87,33 @@ class EvidenceReference(StrictModel):
     content_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
 
 
+class EvidenceCollectionStatus(StrEnum):
+    COLLECTED = "collected"
+    NOT_FOUND = "not_found"
+    # Scheduled for a later collection pass. The data source exists and the
+    # question is still open, unlike NOT_CONFIGURED which means it can never
+    # be asked - so this drives another Monitor pass rather than reading as a
+    # permanent telemetry gap.
+    DEFERRED = "deferred"
+    COLLECTOR_UNAVAILABLE = "collector_unavailable"
+    NOT_CONFIGURED = "not_configured"
+    TRUNCATED = "truncated"
+    STALE = "stale"
+    UNSUPPORTED = "unsupported"
+
+
+class EvidenceCollectionResult(StrictModel):
+    evidence_type: str
+    collector: str
+    required: bool = True
+    purpose: str = ""
+    status: EvidenceCollectionStatus
+    records: int = Field(default=0, ge=0)
+    source: str
+    evidence_ids: list[str] = Field(default_factory=list)
+    limitation: str | None = None
+
+
 class SSHDetectionPolicy(StrictModel):
     brute_force_min_failures: int = Field(default=5, ge=2, le=10_000)
     brute_force_min_events: int = Field(default=3, ge=2, le=10_000)
@@ -124,6 +151,44 @@ class AuthenticationEvidenceSummary(StrictModel):
     missing_evidence: list[str] = Field(default_factory=list)
 
 
+class DiagnosisVerdict(StrEnum):
+    """Conclusion, including the two ways of declining to conclude.
+
+    Abstention is a first-class outcome: a boolean cannot tell "we looked and
+    found nothing" apart from "we could not look", and only the second is a
+    reason to distrust an otherwise confident diagnosis. Always derived in
+    code from collection results - never taken from the model.
+    """
+
+    CONFIRMED_MALICIOUS = "confirmed_malicious"
+    LIKELY_MALICIOUS = "likely_malicious"
+    SUSPICIOUS = "suspicious"
+    LIKELY_BENIGN = "likely_benign"
+    CONFIRMED_BENIGN = "confirmed_benign"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+    TELEMETRY_UNAVAILABLE = "telemetry_unavailable"
+
+
+# Statuses meaning the collector ran and answered. "not_found" is a real
+# answer - useful contradicting evidence - so it counts as complete.
+ANSWERED_COLLECTION_STATUSES = frozenset(
+    {
+        EvidenceCollectionStatus.COLLECTED,
+        EvidenceCollectionStatus.NOT_FOUND,
+    }
+)
+
+# Statuses meaning the question could not be asked at all. These are not
+# evidence of absence and must never read as "nothing suspicious found".
+TELEMETRY_GAP_STATUSES = frozenset(
+    {
+        EvidenceCollectionStatus.COLLECTOR_UNAVAILABLE,
+        EvidenceCollectionStatus.NOT_CONFIGURED,
+        EvidenceCollectionStatus.UNSUPPORTED,
+    }
+)
+
+
 class Diagnosis(StrictModel):
     incident_type: str
     summary: str
@@ -135,6 +200,15 @@ class Diagnosis(StrictModel):
     confidence: float = Field(ge=0, le=1)
     needs_more_evidence: bool = False
     deterministic: bool = False
+    supporting_evidence_ids: list[str] = Field(default_factory=list)
+    contradicting_evidence_ids: list[str] = Field(default_factory=list)
+    missing_evidence: list[str] = Field(default_factory=list)
+    evidence_completeness: float = Field(default=0.0, ge=0, le=1)
+    verdict: DiagnosisVerdict = DiagnosisVerdict.SUSPICIOUS
+    # Requirements whose collector never answered, so their absence proves
+    # nothing. Kept separate from missing_evidence, which also covers
+    # truncated and stale results.
+    telemetry_gaps: list[str] = Field(default_factory=list)
 
 
 class RemediationAction(StrictModel):
@@ -414,6 +488,9 @@ class IncidentWorkflowState(BaseModel):
     normalized_alerts: list[NormalizedAlert] = Field(default_factory=list)
     evidence: list[EvidenceReference] = Field(default_factory=list)
     evidence_records: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_collection_results: list[EvidenceCollectionResult] = Field(
+        default_factory=list
+    )
     authentication_evidence: AuthenticationEvidenceSummary | None = None
     findings: list[dict[str, Any]] = Field(default_factory=list)
     incident_fingerprint: str | None = None
@@ -463,6 +540,103 @@ class IncidentWorkflowState(BaseModel):
         if not value.startswith("INC-"):
             raise ValueError("incident_id must start with INC-.")
         return value
+
+
+def assess_evidence(
+    diagnosis: Diagnosis,
+    collection_results: list[EvidenceCollectionResult],
+    *,
+    completeness_threshold: float,
+    truncated: bool = False,
+) -> Diagnosis:
+    """Stamp completeness and verdict onto a diagnosis, deterministically.
+
+    Reporting only - this never changes routing on its own. Both diagnosis
+    paths run through here; the model path used to leave
+    evidence_completeness at its 0.0 default, so any gate reading it would
+    have blocked every model-derived diagnosis regardless of the telemetry
+    actually collected. Enforcement lives in remediation_allowed.
+    """
+
+    required = [item for item in collection_results if item.required]
+    answered = [
+        item for item in required if item.status in ANSWERED_COLLECTION_STATUSES
+    ]
+    completeness = len(answered) / len(required) if required else 1.0
+    gaps = [
+        item.evidence_type
+        for item in required
+        if item.status in TELEMETRY_GAP_STATUSES
+    ]
+    deferred = [
+        item.evidence_type
+        for item in required
+        if item.status == EvidenceCollectionStatus.DEFERRED
+    ]
+    missing = [
+        item.evidence_type
+        for item in required
+        if item.status not in ANSWERED_COLLECTION_STATUSES
+    ]
+
+    if gaps:
+        # Cannot distinguish "clean" from "unobserved" - say so rather than
+        # letting the confidence score speak for evidence that never arrived.
+        verdict = DiagnosisVerdict.TELEMETRY_UNAVAILABLE
+    elif (
+        truncated
+        or diagnosis.needs_more_evidence
+        or completeness < completeness_threshold
+    ):
+        verdict = DiagnosisVerdict.INSUFFICIENT_EVIDENCE
+    elif diagnosis.confidence >= 0.9:
+        verdict = DiagnosisVerdict.CONFIRMED_MALICIOUS
+    elif diagnosis.confidence >= 0.75:
+        verdict = DiagnosisVerdict.LIKELY_MALICIOUS
+    else:
+        verdict = DiagnosisVerdict.SUSPICIOUS
+
+    return diagnosis.model_copy(
+        update={
+            "verdict": verdict,
+            "evidence_completeness": round(completeness, 3),
+            "telemetry_gaps": gaps,
+            "missing_evidence": list(
+                dict.fromkeys([*diagnosis.missing_evidence, *missing])
+            ),
+            # Deferred evidence is obtainable - another Monitor pass is what
+            # collects it, so ask for one. A permanent gap deliberately does
+            # not set this: re-running collection cannot conjure telemetry
+            # that is not configured, it would just burn another pass.
+            "needs_more_evidence": (
+                diagnosis.needs_more_evidence or bool(deferred)
+            ),
+        }
+    )
+
+
+def remediation_allowed(
+    diagnosis: Diagnosis,
+    *,
+    confidence_threshold: float,
+    completeness_threshold: float,
+) -> bool:
+    """Whether evidence supports proposing executable actions.
+
+    Blocking here yields an advisory plan instead - the analyst still gets
+    guidance, it just cannot reach the executor.
+    """
+
+    return (
+        diagnosis.verdict
+        in {
+            DiagnosisVerdict.CONFIRMED_MALICIOUS,
+            DiagnosisVerdict.LIKELY_MALICIOUS,
+        }
+        and diagnosis.confidence >= confidence_threshold
+        and diagnosis.evidence_completeness >= completeness_threshold
+        and not diagnosis.telemetry_gaps
+    )
 
 
 def canonical_plan_payload(plan: RemediationPlan) -> dict[str, Any]:

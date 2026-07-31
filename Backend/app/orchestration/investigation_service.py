@@ -22,7 +22,10 @@ from app.mape_k.schemas import (
     IncidentWorkflowState,
     TrustedApprovalSubmission,
     VerificationResumeAuthorization,
+    WorkflowStage,
+    WorkflowStatus,
 )
+from app.mape_k.utils import audit_event
 from app.mape_k.executor import RestrictedExecutor
 from app.mape_k.utils import response_resource_namespace
 from app.mape_k.wazuh_response import WazuhBeforeStateProvider
@@ -172,6 +175,7 @@ class InvestigationService:
             "normalized_alerts": [],
             "evidence": [],
             "evidence_records": [],
+            "evidence_collection_results": [],
             "findings": [],
             "remediation_plan": None,
             "advisory_plan": None,
@@ -393,6 +397,10 @@ class InvestigationService:
             "normalized_alerts": state.get("normalized_alerts", []),
             "evidence": state.get("evidence", []),
             "evidence_records": state.get("evidence_records", []),
+            "evidence_collection_results": state.get(
+                "evidence_collection_results",
+                [],
+            ),
             "findings": state.get("findings", []),
             "incident_fingerprint": state.get("incident_fingerprint"),
             "evidence_version": state.get("evidence_version"),
@@ -430,6 +438,7 @@ class InvestigationService:
             "estimated_cost_usd": state.get("estimated_cost_usd", 0),
             "actual_cost_usd": state.get("actual_cost_usd"),
             "errors": state.get("errors", []),
+            "analysis_attempts": state.get("analysis_attempts", 0),
             "failure_code": (
                 (state.get("errors") or [{}])[-1].get("code")
                 if state.get("errors")
@@ -534,6 +543,130 @@ class InvestigationService:
         return self.repository.get_active_for_alert(
             alert_id,
             organization_id=organization_id,
+        )
+
+    def collect_more_evidence(
+        self,
+        investigation_id: str,
+        *,
+        organization_id: str,
+    ) -> dict[str, Any]:
+        """Re-enter an inconclusive escalated workflow at Monitor.
+
+        The existing LangGraph thread is updated as if Analyze selected its
+        Monitor edge. This preserves the investigation/evidence history and
+        cannot jump directly to Plan, policy, or execution.
+        """
+
+        with self._investigation_lock(investigation_id):
+            stored = self.repository.get_snapshot(
+                investigation_id,
+                organization_id=organization_id,
+            )
+            if stored is None:
+                raise InvestigationNotFoundError(investigation_id)
+            lock_namespace = response_resource_namespace(settings)
+            try:
+                lease = self.repository.acquire_resource_lease(
+                    organization_id=lock_namespace,
+                    resource_type="incident",
+                    resource_id=str(stored["incident_id"]),
+                    owner_id=f"collect-{uuid.uuid4().hex}",
+                    lease_seconds=int(
+                        settings.MAPEK_EXECUTION_LOCK_TTL_SECONDS
+                    ),
+                )
+            except ResourceLeaseConflictError as exc:
+                raise ResponseExecutionConflictError(
+                    "Another worker is updating this investigation."
+                ) from exc
+            try:
+                snapshot = self.snapshot(
+                    investigation_id,
+                    organization_id=organization_id,
+                )
+                if not (
+                    snapshot.get("status") == WorkflowStatus.ESCALATED
+                    and snapshot.get("current_stage") == WorkflowStage.ANALYZE
+                ):
+                    raise ResponseExecutionConflictError(
+                        "More evidence can only be collected for an "
+                        "investigation escalated from Analyze."
+                    )
+                if not hasattr(self.graph, "update_state"):
+                    raise ResponseExecutionConflictError(
+                        "The investigation checkpoint is unavailable for continuation."
+                    )
+                attempt = max(
+                    int(settings.MAPEK_MAX_ANALYSIS_ATTEMPTS) - 1,
+                    0,
+                )
+                config = investigation_config(investigation_id)
+                self.graph.update_state(
+                    config,
+                    {
+                        "status": WorkflowStatus.RUNNING,
+                        "stage": WorkflowStage.MONITOR,
+                        "current_stage": WorkflowStage.MONITOR,
+                        "analysis_attempts": attempt,
+                        "audit_events": [
+                            audit_event(
+                                "additional_evidence_requested",
+                                source="analyst",
+                                previous_status="escalated",
+                            )
+                        ],
+                    },
+                    as_node="analyze",
+                )
+                self.graph.invoke(None, config=config)
+                return self._sync_snapshot(
+                    investigation_id,
+                    organization_id=organization_id,
+                )
+            finally:
+                try:
+                    self.repository.release_resource_lease(
+                        organization_id=lock_namespace,
+                        resource_type="incident",
+                        resource_id=str(stored["incident_id"]),
+                        lease_token=str(lease["lease_token"]),
+                    )
+                except ResourceLeaseConflictError:
+                    pass
+
+    def continue_investigation(
+        self,
+        investigation_id: str,
+        *,
+        organization_id: str,
+    ) -> dict[str, Any]:
+        """Continue only when a safe graph transition is available."""
+
+        snapshot = self.snapshot(
+            investigation_id,
+            organization_id=organization_id,
+        )
+        if (
+            snapshot.get("status") == WorkflowStatus.ESCALATED
+            and snapshot.get("current_stage") == WorkflowStage.ANALYZE
+        ):
+            return self.collect_more_evidence(
+                investigation_id,
+                organization_id=organization_id,
+            )
+        if snapshot.get("status") in {
+            WorkflowStatus.QUEUED,
+            WorkflowStatus.RUNNING,
+            WorkflowStatus.WAITING_APPROVAL,
+            WorkflowStatus.APPROVED,
+            WorkflowStatus.WAITING_VERIFICATION,
+        }:
+            # A worker, approval, execution authorization, or verification
+            # event owns the next transition. Never bypass it from chat.
+            return snapshot
+        raise ResponseExecutionConflictError(
+            "This investigation has no safe continuation from its current stage."
         )
 
     def run_queued(

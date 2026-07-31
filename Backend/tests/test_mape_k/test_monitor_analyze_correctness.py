@@ -10,7 +10,14 @@ from app.mape_k.schemas import (
     IncidentWorkflowState,
 )
 from app.services.wazuh.gateway import WazuhGateway
-from app.services.wazuh.models import AlertEvidence, AlertSearchResult
+from app.services.wazuh.models import (
+    AlertEvidence,
+    AlertSearchResult,
+    ArchivedLogSearchResult,
+    DetectionEvidence,
+    EndpointInventory,
+    RawAlertDocument,
+)
 from app.services.wazuh.normalization import normalize_alerts
 
 
@@ -115,8 +122,10 @@ def monitored_state(
     *,
     total: int | None = None,
     truncated: bool = False,
+    analysis_attempts: int = 0,
+    gateway=None,
 ):
-    gateway = AuthenticationGateway(
+    gateway = gateway or AuthenticationGateway(
         alerts,
         total=total,
         truncated=truncated,
@@ -126,6 +135,7 @@ def monitored_state(
         investigation_id="INV-AUTH",
         alert_id=alerts[0].alert_id,
         agent_id="001",
+        analysis_attempts=analysis_attempts,
     )
     update = WazuhMonitor(gateway=gateway, cache=MemoryCache()).run(initial)
     return initial.model_copy(update=update), gateway
@@ -165,6 +175,96 @@ def test_ssh_monitor_uses_exact_window_and_authentication_profile():
     assert "authentication_search_truncated" in (
         state.authentication_evidence.missing_evidence
     )
+
+
+def test_second_ssh_collection_adds_bounded_session_and_endpoint_evidence():
+    alerts = [ssh_alert(0, outcome="success")]
+
+    class EnrichmentGateway(AuthenticationGateway):
+        def search_alerts_by_agent_and_time(self, **_kwargs):
+            process = AlertEvidence(
+                alert_id="process-1",
+                timestamp=BASE_TIME + timedelta(minutes=2),
+                agent_id="001",
+                agent_name="server-01",
+                rule_id="530",
+                rule_level=7,
+                description="New process started after SSH login",
+                full_log="sshd child process /usr/bin/bash",
+                rule_groups=["process_monitor"],
+            )
+            return AlertSearchResult(
+                total=1,
+                returned=1,
+                truncated=False,
+                alerts=[process],
+            )
+
+        def search_archived_logs(self, **_kwargs):
+            event = AlertEvidence(
+                alert_id="archive-1",
+                timestamp=BASE_TIME + timedelta(minutes=1),
+                agent_id="001",
+                agent_name="server-01",
+                rule_id="1002",
+                rule_level=5,
+                description="SSH session command telemetry",
+                full_log="session opened for user admin",
+            )
+            return ArchivedLogSearchResult(
+                index_pattern="wazuh-archives-*",
+                archive_status="available",
+                total=1,
+                returned=1,
+                truncated=False,
+                events=[
+                    RawAlertDocument(
+                        alert_id=event.alert_id,
+                        normalized=event,
+                        raw_document={},
+                    )
+                ],
+            )
+
+        def get_agent_inventory(self, *, agent_id, component, limit):
+            self.inventory_called = True
+            return EndpointInventory(
+                agent_id=agent_id,
+                component=component,
+                total=1,
+                returned=1,
+                truncated=False,
+                items=[{"name": "bash", "pid": 42}],
+            )
+
+        def get_detection_evidence(self, *, agent_id, limit):
+            return DetectionEvidence(
+                agent_id=agent_id,
+                fim_findings=[],
+                sca_findings=[],
+                rootcheck_findings=[],
+                fim_total=0,
+                sca_total=0,
+                rootcheck_total=0,
+                truncated=False,
+            )
+
+    state, gateway = monitored_state(
+        alerts,
+        analysis_attempts=1,
+        gateway=EnrichmentGateway(alerts),
+    )
+
+    enrichment = state.monitor_context["ssh_session_enrichment"]
+    assert enrichment["performed"] is True
+    assert enrichment["session_alert_ids"] == ["process-1"]
+    assert enrichment["archive_event_ids"] == ["archive-1"]
+    assert state.monitor_context["inventory"]["processes"]["returned"] == 1
+    assert {item.alert_id for item in state.normalized_alerts} >= {
+        "process-1",
+        "archive-1",
+    }
+    assert gateway.inventory_called is True
 
 
 def test_single_ssh_failure_is_not_brute_force():

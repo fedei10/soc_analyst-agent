@@ -565,6 +565,18 @@ def _sse(event: str, payload: dict[str, Any]) -> str:
     )
 
 
+def _assistant_stream_error(_error: Exception) -> dict[str, str]:
+    """Stable public SSE error; exception details stay in server logs."""
+
+    return {
+        "code": "SOC_ASSISTANT_UNAVAILABLE",
+        "message": (
+            "The SOC assistant could not complete the request. "
+            "Retry or use /health to check live data services."
+        ),
+    }
+
+
 @read.post(
     "/soc/orchestrator/chat/stream",
     tags=["assistant"],
@@ -614,12 +626,13 @@ def stream_with_soc_orchestrator(
                 routed=routed,
             )
         except Exception as exc:
+            logger.exception(
+                "soc_assistant_stream_failed",
+                error_type=type(exc).__name__,
+            )
             yield _sse(
                 "error",
-                {
-                    "code": type(exc).__name__,
-                    "message": str(exc)[:500],
-                },
+                _assistant_stream_error(exc),
             )
             return
         for activity in result.activities:

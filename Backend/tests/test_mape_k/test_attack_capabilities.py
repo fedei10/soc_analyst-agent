@@ -4,8 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from app.mape_k.capabilities import diagnose_with_capabilities
+from app.mape_k.capabilities import (
+    capability_for_alert,
+    diagnose_with_capabilities,
+)
 from app.mape_k.schemas import (
+    EvidenceCollectionResult,
     EvidenceReference,
     IncidentWorkflowState,
 )
@@ -50,6 +54,22 @@ def _state(case, *, rule_level=12):
         summary=alert.summary,
         content_hash="a" * 64,
     )
+    capability = capability_for_alert(alert)
+    collection_results = [
+        EvidenceCollectionResult(
+            evidence_type=requirement.evidence_type,
+            collector=requirement.collector,
+            required=requirement.required,
+            purpose=requirement.purpose,
+            status="collected",
+            records=1,
+            source="test",
+            evidence_ids=[evidence.evidence_id],
+        )
+        for requirement in (
+            capability.evidence_requirements if capability is not None else ()
+        )
+    ]
     return IncidentWorkflowState(
         incident_id="INC-CAPABILITY",
         investigation_id="INV-CAPABILITY",
@@ -57,6 +77,7 @@ def _state(case, *, rule_level=12):
         agent_id="001",
         normalized_alerts=[alert],
         evidence=[evidence],
+        evidence_collection_results=collection_results,
         monitor_context={"related_alerts_truncated": False},
     )
 
@@ -70,6 +91,8 @@ def test_attack_capability_matrix(case):
     assert diagnosis.deterministic is True
     assert diagnosis.evidence_ids == ["EV-AAAAAAAAAAAA"]
     assert diagnosis.needs_more_evidence is False
+    assert diagnosis.evidence_completeness == 1.0
+    assert diagnosis.supporting_evidence_ids == ["EV-AAAAAAAAAAAA"]
 
 
 def test_low_severity_process_event_does_not_become_an_attack():
@@ -86,3 +109,20 @@ def test_missing_capability_entity_requests_more_evidence():
 
     assert diagnosis is not None
     assert diagnosis.needs_more_evidence is True
+
+
+def test_unavailable_required_collector_caps_evidence_completeness():
+    case = next(item for item in CASES if item["name"] == "suspicious process")
+    state = _state(case)
+    results = list(state.evidence_collection_results)
+    results[1] = results[1].model_copy(
+        update={"status": "collector_unavailable", "evidence_ids": []}
+    )
+
+    diagnosis = diagnose_with_capabilities(
+        state.model_copy(update={"evidence_collection_results": results})
+    )
+
+    assert diagnosis.needs_more_evidence is True
+    assert diagnosis.evidence_completeness < 0.8
+    assert results[1].evidence_type in diagnosis.missing_evidence

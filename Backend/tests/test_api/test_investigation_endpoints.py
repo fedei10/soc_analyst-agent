@@ -254,6 +254,17 @@ def test_orchestrator_stream_returns_event_stream(monkeypatch):
     assert response.headers["cache-control"] == "no-cache"
 
 
+def test_orchestrator_stream_sanitizes_internal_errors():
+    payload = investigations._assistant_stream_error(
+        RuntimeError("postgresql://secret-user:secret-password@database")
+    )
+
+    body = investigations._sse("error", payload)
+    assert "SOC_ASSISTANT_UNAVAILABLE" in body
+    assert "secret-password" not in body
+    assert "RuntimeError" not in body
+
+
 def test_soc_overview_is_scoped_and_survives_wazuh_outage(monkeypatch):
     class FakeService:
         def list_history(self, *, limit, organization_id):

@@ -180,7 +180,12 @@ def test_monitor_normalizes_deduplicates_and_correlates_alerts():
     assert len(state.normalized_alerts) == 5
     assert len(state.findings) == 1
     assert state.findings[0]["alert_count"] == 5
-    assert len(state.evidence) == 5
+    assert len(
+        [item for item in state.evidence if item.source_type == "wazuh_alert"]
+    ) == 5
+    assert any(
+        item.source_type == "wazuh_context" for item in state.evidence
+    )
     assert state.incident_fingerprint.startswith("FP-")
     assert "payload" not in state.evidence_records[0]
     assert (
@@ -895,7 +900,14 @@ def test_redis_failure_does_not_lose_monitor_evidence():
 
     state = monitored_state(EphemeralRedis(BrokenRedis()))
 
-    assert len(state.evidence_records) == 5
+    assert len(
+        [
+            item
+            for item in state.evidence_records
+            if item["source_type"] == "wazuh_alert"
+        ]
+    ) == 5
+    assert state.evidence_collection_results
     assert state.incident_fingerprint
 
 
@@ -960,7 +972,8 @@ def test_service_persists_the_controlled_snapshot():
     assert snapshot["pending_nodes"] == ["human_approval"]
     assert repeated["investigation_id"] == snapshot["investigation_id"]
     assert stored["diagnosis"]["incident_type"] == "ssh_brute_force"
-    assert len(stored["evidence_records"]) == 5
+    assert len(stored["evidence_records"]) >= 5
+    assert stored["evidence_collection_results"]
     assert snapshot["proposed_actions"]
 
     approval_id = snapshot["approval_request"]["approval_id"]
@@ -1013,6 +1026,117 @@ def test_enqueue_persists_without_running_the_graph():
     assert snapshot["status"] == "queued"
     assert snapshot["current_stage"] == "monitor"
     assert graph.invoked is False
+
+
+def test_collect_more_evidence_reenters_the_same_graph_at_monitor():
+    repository = InMemoryInvestigationRepository()
+    state = InvestigationService.initial_state(
+        "INV-ESCALATED",
+        alert_id="alert-1",
+        agent_id="001",
+        organization_id="org-1",
+    )
+    state.update(
+        {
+            "status": "escalated",
+            "stage": "analyze",
+            "current_stage": "analyze",
+            "analysis_attempts": settings.MAPEK_MAX_ANALYSIS_ATTEMPTS,
+            "pending_nodes": [],
+            "specialist_runs": [],
+            "final_report": None,
+        }
+    )
+    repository.save_snapshot(state)
+
+    class ContinuationGraph:
+        def __init__(self):
+            self.values = dict(state)
+            self.updated = None
+            self.invoked_with = "not-called"
+
+        def get_state(self, _config):
+            return SimpleNamespace(values=self.values, next=[])
+
+        def update_state(self, _config, values, *, as_node):
+            self.updated = (dict(values), as_node)
+            self.values.update(values)
+
+        def invoke(self, input_data, config):
+            self.invoked_with = input_data
+            assert config["configurable"]["thread_id"] == "INV-ESCALATED"
+            self.values.update(
+                {
+                    "status": "escalated",
+                    "stage": "analyze",
+                    "current_stage": "analyze",
+                }
+            )
+
+    graph = ContinuationGraph()
+    service = InvestigationService(graph=graph, repository=repository)
+
+    result = service.collect_more_evidence(
+        "INV-ESCALATED",
+        organization_id="org-1",
+    )
+
+    update, as_node = graph.updated
+    assert result["investigation_id"] == "INV-ESCALATED"
+    assert update["stage"] == "monitor"
+    assert update["analysis_attempts"] == (
+        settings.MAPEK_MAX_ANALYSIS_ATTEMPTS - 1
+    )
+    assert as_node == "analyze"
+    assert graph.invoked_with is None
+
+
+def test_collect_more_evidence_resumes_a_real_langgraph_checkpoint():
+    class InconclusiveLLM:
+        def invoke_structured(self, _schema, messages):
+            payload = json.loads(messages[-1]["content"])
+            return (
+                Diagnosis(
+                    incident_type="ssh_login_failure",
+                    summary="The enriched evidence is still inconclusive.",
+                    root_cause="Authorization could not be established.",
+                    evidence_ids=[payload["evidence"][0]["evidence_id"]],
+                    confidence=0.4,
+                    needs_more_evidence=True,
+                ),
+                {"input_tokens": 10, "output_tokens": 5},
+            )
+
+    gateway = FakeWazuhGateway()
+    gateway.alerts = gateway.alerts[:1]
+    repository = InMemoryInvestigationRepository()
+    graph = create_mape_k_graph(
+        monitor=WazuhMonitor(gateway=gateway, cache=MemoryCache()),
+        analyzer=IncidentAnalyzer(
+            llm=InconclusiveLLM(),
+            cache=MemoryCache(),
+        ),
+        executor=RestrictedExecutor(cache=MemoryCache()),
+    )
+    service = InvestigationService(graph=graph, repository=repository)
+    original = service.start(
+        alert_id="alert-0",
+        agent_id="001",
+        organization_id="org-1",
+    )
+
+    resumed = service.collect_more_evidence(
+        original["investigation_id"],
+        organization_id="org-1",
+    )
+
+    assert original["status"] == "escalated"
+    assert resumed["investigation_id"] == original["investigation_id"]
+    assert resumed["status"] == "escalated"
+    assert any(
+        event.get("event") == "additional_evidence_requested"
+        for event in resumed["audit_events"]
+    )
 
 
 def test_worker_candidates_put_verifications_and_criticals_first():
@@ -1235,3 +1359,32 @@ def test_worst_severity_picks_the_highest_not_the_first_finding():
 def test_worst_severity_handles_empty_or_missing_findings():
     assert _worst_severity([]) is None
     assert _worst_severity([{"finding_id": "no-severity-key"}]) is None
+
+
+def test_evidence_gate_withholds_execution_and_returns_advisory(monkeypatch):
+    """With the gate on, missing telemetry yields advice, not an executable plan."""
+
+    monkeypatch.setattr(
+        settings, "MAPEK_REQUIRE_EVIDENCE_FOR_REMEDIATION", True
+    )
+    repository = InMemoryInvestigationRepository()
+    graph = create_mape_k_graph(
+        monitor=WazuhMonitor(gateway=FakeWazuhGateway(), cache=MemoryCache()),
+        analyzer=IncidentAnalyzer(llm=NoLLM(), cache=MemoryCache()),
+        executor=RestrictedExecutor(cache=MemoryCache()),
+    )
+    service = InvestigationService(graph=graph, repository=repository)
+    snapshot = service.start(
+        alert_id="alert-0",
+        agent_id="001",
+        organization_id="user-1",
+        owner_user_id="user-1",
+    )
+
+    # The fixture cannot read session archives, so nothing reaches the executor.
+    assert snapshot["status"] != "waiting_approval"
+    assert not snapshot.get("execution_results")
+    assert snapshot.get("remediation_plan") is None
+    diagnosis = snapshot.get("diagnosis") or {}
+    assert diagnosis.get("verdict") == "telemetry_unavailable"
+    assert "session_archives" in (diagnosis.get("telemetry_gaps") or [])

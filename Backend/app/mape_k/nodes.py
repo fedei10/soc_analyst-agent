@@ -17,7 +17,7 @@ from app.mape_k.analyze import IncidentAnalyzer
 from app.mape_k.executor import RestrictedExecutor
 from app.mape_k.knowledge import build_final_report
 from app.mape_k.monitor import WazuhMonitor
-from app.mape_k.playbooks import PlaybookPlanner
+from app.mape_k.playbooks import PlaybookPlanner, build_advisory_plan
 from app.mape_k.policy import PolicyEngine, role_allows
 from app.mape_k.schemas import (
     ApprovalDecision,
@@ -31,7 +31,9 @@ from app.mape_k.schemas import (
     WorkflowError,
     WorkflowStage,
     WorkflowStatus,
+    assess_evidence,
     compute_plan_hash,
+    remediation_allowed,
 )
 from app.mape_k.utils import audit_event, stable_id
 from app.mape_k.verify import (
@@ -157,6 +159,20 @@ def analyze_node(
         diagnosis, usage = analyzer.run(state)
     except Exception as exc:
         return _failure(WorkflowStage.ANALYZE, exc)
+    # Completeness and verdict are stamped here, after both the deterministic
+    # and model paths, so neither can report on evidence it never received.
+    diagnosis = assess_evidence(
+        diagnosis,
+        state.evidence_collection_results,
+        completeness_threshold=(
+            settings.MAPEK_EVIDENCE_COMPLETENESS_THRESHOLD
+        ),
+        truncated=bool(
+            (getattr(state, "monitor_context", {}) or {}).get(
+                "related_alerts_truncated"
+            )
+        ),
+    )
     inconclusive = (
         diagnosis.confidence < settings.MAPEK_ANALYSIS_CONFIDENCE_THRESHOLD
         or diagnosis.needs_more_evidence
@@ -327,6 +343,54 @@ def plan_node(
                 audit_event(
                     "planning_escalated",
                     reason="planning_retry_limit_reached",
+                )
+            ],
+        }
+    diagnosis = state.diagnosis
+    if (
+        settings.MAPEK_REQUIRE_EVIDENCE_FOR_REMEDIATION
+        and diagnosis is not None
+        and not remediation_allowed(
+            diagnosis,
+            confidence_threshold=(
+                settings.MAPEK_REMEDIATION_CONFIDENCE_THRESHOLD
+            ),
+            completeness_threshold=(
+                settings.MAPEK_EVIDENCE_COMPLETENESS_THRESHOLD
+            ),
+        )
+    ):
+        # Evidence does not support touching the estate. The analyst still
+        # gets guidance; it just cannot reach the executor.
+        return {
+            "stage": WorkflowStage.PLAN,
+            "current_stage": WorkflowStage.PLAN,
+            "status": WorkflowStatus.ESCALATED,
+            "advisory_plan": build_advisory_plan(
+                state,
+                diagnosis,
+                rationale=(
+                    "Proposed analyst guidance only: "
+                    f"verdict {diagnosis.verdict} with "
+                    f"{diagnosis.evidence_completeness:.0%} of required "
+                    "evidence answered"
+                    + (
+                        f"; unavailable telemetry: "
+                        f"{', '.join(diagnosis.telemetry_gaps)}"
+                        if diagnosis.telemetry_gaps
+                        else ""
+                    )
+                    + ". Executable remediation is withheld until the "
+                    "missing evidence is collected."
+                ),
+            ),
+            "audit_events": [
+                audit_event(
+                    "planning_escalated",
+                    reason="evidence_insufficient_for_remediation",
+                    verdict=str(diagnosis.verdict),
+                    evidence_completeness=diagnosis.evidence_completeness,
+                    telemetry_gaps=diagnosis.telemetry_gaps,
                 )
             ],
         }

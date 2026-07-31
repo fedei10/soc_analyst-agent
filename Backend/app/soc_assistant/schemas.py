@@ -21,6 +21,9 @@ class AssistantCommandName(StrEnum):
     TRIAGE = "triage"
     INVESTIGATE = "investigate"
     STATUS = "status"
+    PLAN = "plan"
+    COLLECT = "collect"
+    CONTINUE = "continue"
     HEALTH = "health"
     EXPLAIN = "explain"
 

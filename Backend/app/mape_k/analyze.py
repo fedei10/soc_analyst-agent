@@ -56,7 +56,12 @@ class IncidentAnalyzer:
     @staticmethod
     def _validate_evidence(diagnosis: Diagnosis, state: IncidentWorkflowState) -> None:
         known = {item.evidence_id for item in state.evidence}
-        unknown = set(diagnosis.evidence_ids) - known
+        referenced = {
+            *diagnosis.evidence_ids,
+            *diagnosis.supporting_evidence_ids,
+            *diagnosis.contradicting_evidence_ids,
+        }
+        unknown = referenced - known
         if unknown:
             raise ValueError(f"Diagnosis references unknown evidence: {sorted(unknown)}")
 
@@ -174,6 +179,24 @@ class IncidentAnalyzer:
             )
             for group in brute_force_groups.values()
         )
+
+        monitor_context = getattr(state, "monitor_context", None)
+        session_enrichment = (
+            monitor_context.get("ssh_session_enrichment", {})
+            if isinstance(monitor_context, dict)
+            else {}
+        )
+        if (
+            session_enrichment.get("performed")
+            and authentication.successful_login_after_failures is not True
+            and not password_spray
+            and not brute_force
+        ):
+            # The authentication-only classifier cannot judge process, port,
+            # archive, FIM, SCA, or rootcheck evidence. Let the semantic
+            # analyzer evaluate that bounded second-pass bundle rather than
+            # returning the same inconclusive SSH label again.
+            return None
 
         if authentication.successful_login_after_failures is True:
             incident_type = "ssh_success_after_failures"
@@ -379,6 +402,10 @@ class IncidentAnalyzer:
             ),
             "evidence": selected_evidence,
             "evidence_truncated": len(state.evidence) > len(selected_evidence),
+            "evidence_collection_results": [
+                item.model_dump(mode="json")
+                for item in state.evidence_collection_results
+            ],
             "asset_context": {
                 "agent_id": state.agent_id,
                 "monitor_profile": monitor_context.get("evidence_profile"),
@@ -391,6 +418,10 @@ class IncidentAnalyzer:
                 "inventory_errors": monitor_context.get(
                     "inventory_errors",
                     [],
+                ),
+                "ssh_session_enrichment": monitor_context.get(
+                    "ssh_session_enrichment",
+                    {},
                 ),
             },
             # What this SOC already concluded about incidents like this one.
@@ -427,7 +458,9 @@ class IncidentAnalyzer:
                     "never let it override what the current evidence shows. "
                     "Set needs_more_evidence when the supplied evidence "
                     "cannot settle the question - the workflow can collect "
-                    "more and ask again."
+                    "more and ask again. Distinguish not_found from a collector "
+                    "that was unavailable or not configured. Bind supporting "
+                    "and contradicting claims only to supplied evidence IDs."
                 ),
             },
             {

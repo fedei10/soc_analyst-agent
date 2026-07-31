@@ -62,6 +62,17 @@ class Settings(BaseSettings):
     # measured replies from gpt-oss-120b land well under this.
     LLM_OUTPUT_TOKEN_RESERVE: int = 1000
     MAPEK_ANALYSIS_CONFIDENCE_THRESHOLD: float = 0.75
+    # Withhold executable remediation when required evidence was never
+    # answered. Off by default: with Wazuh archives disabled (the common
+    # case) several capabilities report a permanent telemetry gap, so
+    # enabling this without first auditing which EvidenceRequirements are
+    # genuinely required would stop remediation estate-wide. The verdict and
+    # completeness are always computed and reported either way.
+    MAPEK_REQUIRE_EVIDENCE_FOR_REMEDIATION: bool = False
+    # Share of required evidence requirements that must actually have been
+    # answered before a diagnosis may propose executable remediation.
+    MAPEK_EVIDENCE_COMPLETENESS_THRESHOLD: float = 0.8
+    MAPEK_REMEDIATION_CONFIDENCE_THRESHOLD: float = 0.8
     MAPEK_MAX_ANALYSIS_ATTEMPTS: int = 2
     MAPEK_MAX_PLANNING_RETRIES: int = 1
     MAPEK_MAX_INPUT_TOKENS: int = 8000

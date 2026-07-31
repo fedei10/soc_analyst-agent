@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -22,6 +23,7 @@ from app.services.wazuh.tool_results import failure as wazuh_tool_failure
 from app.db.session import database_url
 from app.db.repositories.alert_memory import get_alert_memory_repository
 from app.db.repositories.findings import get_finding_repository
+from app.db.repositories.investigations import ResponseExecutionConflictError
 from app.services.wazuh.exceptions import (
     WazuhAPIError,
     WazuhAuthError,
@@ -81,6 +83,18 @@ RUNNING_ACTIVITY = {
         "get_investigation",
         "Loading the durable investigation state",
     ),
+    AssistantCommandName.PLAN: (
+        "get_investigation",
+        "Loading the evidence-bound investigation plan",
+    ),
+    AssistantCommandName.COLLECT: (
+        "collect_more_evidence",
+        "Collecting more evidence in the existing workflow",
+    ),
+    AssistantCommandName.CONTINUE: (
+        "continue_investigation",
+        "Continuing the existing controlled workflow",
+    ),
     AssistantCommandName.HEALTH: (
         "wazuh_health",
         "Checking Wazuh manager and indexer connectivity",
@@ -101,8 +115,25 @@ WAZUH_BACKED_COMMANDS = {
     AssistantCommandName.HUNT,
     AssistantCommandName.TRIAGE,
     AssistantCommandName.INVESTIGATE,
+    AssistantCommandName.COLLECT,
+    AssistantCommandName.CONTINUE,
     AssistantCommandName.HEALTH,
 }
+
+INVESTIGATION_FOLLOW_UP_PATTERN = re.compile(
+    r"(?:what happened(?: now)?|what(?:'s| is) happening(?: now)?|"
+    r"where are we(?: now)?|what(?:'s| is) the status(?: now)?|"
+    r"status(?: now)?|any updates?|what did (?:it|the investigation) find)"
+)
+COLLECT_FOLLOW_UP_PATTERN = re.compile(
+    r"(?:collect|gather|fetch)(?: some)? (?:more )?(?:evidence|telemetry|data)"
+)
+CONTINUE_FOLLOW_UP_PATTERN = re.compile(
+    r"(?:continue|resume)(?: it| the investigation| the workflow)?"
+)
+PLAN_FOLLOW_UP_PATTERN = re.compile(
+    r"(?:show|review|open)(?: me)? (?:the )?(?:plan|remediation plan)"
+)
 WAZUH_RETRY_HINTS = {
     "WAZUH_UNAVAILABLE": (
         "Wazuh is unreachable right now. Check that the Wazuh indexer/API tunnel "
@@ -359,6 +390,39 @@ class SOCAssistant:
     ) -> tuple[AssistantIntent, dict[str, int]]:
         return self.router.route(message)
 
+    @staticmethod
+    def _apply_recent_context(
+        intent: AssistantIntent,
+        *,
+        message: str,
+        recent_context: dict[str, str],
+    ) -> AssistantIntent:
+        """Resolve only tightly bounded conversational follow-ups.
+
+        This deliberately does not treat every vague question as a status
+        request. A recent investigation must exist and the whole message must
+        match a small follow-up vocabulary.
+        """
+
+        investigation_id = recent_context.get("investigation")
+        normalized = re.sub(r"[^a-z0-9'\s]", "", message.lower()).strip()
+        if investigation_id and intent.command == AssistantCommandName.CHAT:
+            contextual_commands = (
+                (INVESTIGATION_FOLLOW_UP_PATTERN, AssistantCommandName.STATUS),
+                (COLLECT_FOLLOW_UP_PATTERN, AssistantCommandName.COLLECT),
+                (CONTINUE_FOLLOW_UP_PATTERN, AssistantCommandName.CONTINUE),
+                (PLAN_FOLLOW_UP_PATTERN, AssistantCommandName.PLAN),
+            )
+            for pattern, command in contextual_commands:
+                if pattern.fullmatch(normalized):
+                    return AssistantIntent(
+                        command=command,
+                        arguments={"investigation_id": investigation_id},
+                        confidence=1.0,
+                        source="conversation_context",
+                    )
+        return intent
+
     @traceable(
         run_type="chain",
         name="soc_assistant.route",
@@ -531,18 +595,35 @@ class SOCAssistant:
                     {},
                 )
             try:
-                agent_answer, tool_calls, active_alert_id = self.tool_agent.answer(
+                agent_result = self.tool_agent.answer(
                     question=question,
                     history=conversation_history or [],
                     organization_id=organization_id,
                     created_by=user_id,
                     conversation_id=conversation_id,
                 )
+                agent_answer, tool_calls, active_alert_id = agent_result
+                failed_tools = list(
+                    getattr(agent_result, "failed_tools", []) or []
+                )
+                evidence_references = list(
+                    getattr(agent_result, "evidence_references", []) or []
+                )
                 return (
                     agent_answer,
                     {
                         "display_mode": "conversation",
-                        "answer_type": "soc_tool_agent",
+                        "answer_type": (
+                            "soc_tool_agent_partial"
+                            if failed_tools
+                            else "soc_tool_agent"
+                        ),
+                        "grounded": not failed_tools,
+                        "grounding_status": (
+                            "partial" if failed_tools else "grounded"
+                        ),
+                        "failed_tools": failed_tools,
+                        "evidence_references": evidence_references,
                         "tools_called": tool_calls,
                     },
                     ["soc_tool_agent", *tool_calls],
@@ -1182,6 +1263,124 @@ class SOCAssistant:
                 },
             )
 
+        if command == AssistantCommandName.PLAN:
+            investigation_id = str(
+                arguments.get("investigation_id") or ""
+            ).strip()
+            if not investigation_id:
+                return (
+                    "Provide an investigation ID, for example `/plan INV-ABC123`.",
+                    {"required": ["investigation_id"]},
+                    [],
+                    {},
+                )
+            snapshot = self.investigations.snapshot(
+                investigation_id,
+                organization_id=organization_id,
+            )
+            plan = snapshot.get("remediation_plan") or snapshot.get(
+                "advisory_plan"
+            )
+            if plan is None:
+                message = (
+                    f"Investigation {investigation_id} has no evidence-bound "
+                    "plan yet. Analyze must reach a conclusive diagnosis before "
+                    "Plan can run; use `/collect "
+                    f"{investigation_id}` if more evidence is needed."
+                )
+            else:
+                message = (
+                    f"Loaded the existing evidence-bound plan for "
+                    f"investigation {investigation_id}."
+                )
+            return (
+                message,
+                {
+                    "investigation_id": investigation_id,
+                    "status": snapshot["status"],
+                    "current_stage": snapshot["current_stage"],
+                    "plan_available": plan is not None,
+                    "plan": plan,
+                    "grounded": True,
+                },
+                ["get_investigation"],
+                {
+                    "active_investigation_id": investigation_id,
+                    "active_alert_id": snapshot.get("alert_id"),
+                    "active_agent_id": snapshot.get("agent_id"),
+                    "investigation": snapshot,
+                },
+            )
+
+        if command in {
+            AssistantCommandName.COLLECT,
+            AssistantCommandName.CONTINUE,
+        }:
+            investigation_id = str(
+                arguments.get("investigation_id") or ""
+            ).strip()
+            if not investigation_id:
+                return (
+                    (
+                        f"Provide an investigation ID, for example "
+                        f"`/{command.value} INV-ABC123`."
+                    ),
+                    {"required": ["investigation_id"]},
+                    [],
+                    {},
+                )
+            operation_name = (
+                "collect_more_evidence"
+                if command == AssistantCommandName.COLLECT
+                else "continue_investigation"
+            )
+            operation = getattr(self.investigations, operation_name)
+            try:
+                snapshot = self._run_tool(
+                    tool_name=operation_name,
+                    inputs={
+                        "investigation_id": investigation_id,
+                        "organization_id": organization_id,
+                    },
+                    fn=lambda: operation(
+                        investigation_id,
+                        organization_id=organization_id,
+                    ),
+                )
+            except ResponseExecutionConflictError as exc:
+                return (
+                    str(exc),
+                    {
+                        "investigation_id": investigation_id,
+                        "status": "conflict",
+                        "grounded": True,
+                    },
+                    [operation_name],
+                    {"active_investigation_id": investigation_id},
+                )
+            return (
+                (
+                    f"Investigation {investigation_id} is now "
+                    f"{_stage_phrase(snapshot['status'], snapshot['current_stage'])}."
+                ),
+                {
+                    "investigation_id": investigation_id,
+                    "status": snapshot["status"],
+                    "current_stage": snapshot["current_stage"],
+                    "pending_nodes": snapshot.get("pending_nodes", []),
+                    "diagnosis": snapshot.get("diagnosis"),
+                    "advisory_plan": snapshot.get("advisory_plan"),
+                    "grounded": True,
+                },
+                [operation_name],
+                {
+                    "active_investigation_id": investigation_id,
+                    "active_alert_id": snapshot.get("alert_id"),
+                    "active_agent_id": snapshot.get("agent_id"),
+                    "investigation": snapshot,
+                },
+            )
+
         if command == AssistantCommandName.HEALTH:
             checks: dict[str, dict[str, Any]] = {}
             for name, tool_name, operation in (
@@ -1316,6 +1515,11 @@ class SOCAssistant:
             except Exception:
                 conversation_history = []
         intent, usage = routed or self._trace_route(message=message)
+        intent = self._apply_recent_context(
+            intent,
+            message=message,
+            recent_context=recent_context,
+        )
         if intent.command == AssistantCommandName.CHAT:
             intent.arguments["question"] = (
                 intent.arguments.get("question") or message

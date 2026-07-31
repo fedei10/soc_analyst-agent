@@ -804,6 +804,7 @@ class InMemoryInvestigationRepository:
             "waiting_approval",
             "waiting_verification",
             "approved",
+            "escalated",
         }
         with self._lock:
             matches = [
@@ -1633,6 +1634,10 @@ class SQLAlchemyInvestigationRepository:
                 record.updated_at = now
             if data["status"] in TERMINAL_STATUSES:
                 record.completed_at = record.completed_at or now
+            else:
+                # Controlled continuation can reopen an Analyze escalation in
+                # the same durable row. Its lifecycle is active again.
+                record.completed_at = None
 
             # SQLAlchemy cannot infer the insert dependency without ORM
             # relationships, so make the parent visible before child rows.
@@ -1663,6 +1668,7 @@ class SQLAlchemyInvestigationRepository:
             "waiting_approval",
             "waiting_verification",
             "approved",
+            "escalated",
         )
         statement = (
             select(InvestigationRecord)

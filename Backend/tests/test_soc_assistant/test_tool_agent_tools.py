@@ -132,12 +132,14 @@ def test_answer_stops_cleanly_on_graph_recursion_limit(monkeypatch):
         investigations=None,
     )
 
-    answer, tool_calls, active_alert_id = agent.answer(
+    result = agent.answer(
         question="analyze everything", history=[]
     )
+    answer, tool_calls, active_alert_id = result
 
     assert tool_calls == []
     assert active_alert_id is None
+    assert result.failed_tools == []
     assert "reasoning-step limit" in answer
 
 
@@ -171,11 +173,58 @@ def test_answer_flags_a_failed_tool_the_model_narrated_as_success(monkeypatch):
         investigations=None,
     )
 
-    answer, tool_calls, _ = agent.answer(question="save a report", history=[])
+    result = agent.answer(question="save a report", history=[])
+    answer, tool_calls, _ = result
 
     assert tool_calls == ["save_report"]
+    assert result.failed_tools == ["save_report"]
+    assert result.grounded is False
     assert "Tool failure" in answer
     assert "`save_report`" in answer
+
+
+def test_answer_does_not_attach_every_tool_reference_as_a_footer(monkeypatch):
+    class FakeLLM:
+        def get_client(self):
+            return object()
+
+    class FakeAgent:
+        def invoke(self, *args, **kwargs):
+            return {
+                "messages": [
+                    ToolMessage(
+                        content=json.dumps(
+                            {
+                                "alerts": [
+                                    {"alert_id": "alert-relevant"},
+                                    {"alert_id": "alert-unrelated"},
+                                ]
+                            }
+                        ),
+                        name="search_alerts",
+                        tool_call_id="call-1",
+                    ),
+                    AIMessage(
+                        content="The relevant evidence is alert-relevant."
+                    ),
+                ]
+            }
+
+    monkeypatch.setattr(
+        "app.soc_assistant.tool_agent.create_react_agent",
+        lambda *args, **kwargs: FakeAgent(),
+    )
+    agent = SOCToolAgent(
+        gateway=None,
+        llm=FakeLLM(),
+        report_repository=InMemoryReportRepository(),
+        investigations=None,
+    )
+
+    result = agent.answer(question="which alert matters?", history=[])
+
+    assert result.evidence_references == ["alert-relevant"]
+    assert "alert-unrelated" not in result.answer
 
 
 def test_tool_node_converts_runtime_errors_to_safe_error_messages():

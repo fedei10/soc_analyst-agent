@@ -14,6 +14,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from dataclasses import dataclass, field
+from collections.abc import Iterator
 from typing import Any, Literal
 
 import structlog
@@ -46,6 +48,28 @@ _REPORT_INTENT = re.compile(r"\b(report|write[- ]?up|document|save)\b")
 _RESPONSE_INTENT = re.compile(
     r"\b(contain|block|isolate|investigat|remediat|respond|escalat|do something)\w*"
 )
+
+
+@dataclass(frozen=True)
+class SOCToolAgentAnswer:
+    """Backward-compatible answer tuple plus machine-visible grounding."""
+
+    answer: str
+    tool_calls: list[str] = field(default_factory=list)
+    active_alert_id: str | None = None
+    failed_tools: list[str] = field(default_factory=list)
+    evidence_references: list[str] = field(default_factory=list)
+
+    @property
+    def grounded(self) -> bool:
+        return not self.failed_tools
+
+    def __iter__(self) -> Iterator[Any]:
+        # Existing integrations unpack three values. Keep that contract while
+        # exposing grounding metadata as named attributes.
+        yield self.answer
+        yield self.tool_calls
+        yield self.active_alert_id
 
 
 def _recursion_limit() -> int:
@@ -705,9 +729,8 @@ class SOCToolAgent:
         organization_id: str = "local",
         created_by: str = "unknown",
         conversation_id: str | None = None,
-    ) -> tuple[str, list[str], str | None]:
-        """Returns (answer, tool_names_called, active_alert_id). Raises on
-        model failure."""
+    ) -> SOCToolAgentAnswer:
+        """Return an answer with explicit tool-failure and citation metadata."""
         messages: list[dict[str, str]] = [
             {
                 "role": str(item.get("role") or "user"),
@@ -746,12 +769,12 @@ class SOCToolAgent:
         except GraphRecursionError:
             # A bounded stop, not a failure - do not fall through to another
             # LLM call (question_agent) on top of the rounds already spent.
-            return (
-                "I reached my reasoning-step limit before finishing. Ask "
-                "about a more specific alert, agent, IP, or time range and "
-                "I can go straight to the relevant evidence.",
-                [],
-                None,
+            return SOCToolAgentAnswer(
+                answer=(
+                    "I reached my reasoning-step limit before finishing. Ask "
+                    "about a more specific alert, agent, IP, or time range and "
+                    "I can go straight to the relevant evidence."
+                ),
             )
         tool_calls: list[str] = []
         failed_tools: list[str] = []
@@ -790,14 +813,9 @@ class SOCToolAgent:
                 )
         if not answer:
             raise RuntimeError("The tool agent returned no answer.")
-        uncited = [
-            reference
-            for reference in evidence_refs
-            if reference not in answer
+        cited_evidence_refs = [
+            reference for reference in evidence_refs if reference in answer
         ]
-        if uncited:
-            rendered = ", ".join(f"`{item}`" for item in uncited[:8])
-            answer = f"{answer}\n\nEvidence references: {rendered}"
         if failed_tools:
             rendered = ", ".join(
                 f"`{name}`" for name in dict.fromkeys(failed_tools)
@@ -816,4 +834,10 @@ class SOCToolAgent:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
         )
-        return answer, tool_calls, active_alert_id
+        return SOCToolAgentAnswer(
+            answer=answer,
+            tool_calls=tool_calls,
+            active_alert_id=active_alert_id,
+            failed_tools=sorted(set(failed_tools)),
+            evidence_references=cited_evidence_refs,
+        )

@@ -137,7 +137,7 @@ def _default_advisory_steps(
     return defaults
 
 
-def _advisory_plan(
+def build_advisory_plan(
     state: IncidentWorkflowState,
     diagnosis: Diagnosis,
     *,
@@ -507,7 +507,7 @@ class PlaybookPlanner:
                 )
                 return PlanSelection(
                     plan=None,
-                    advisory_plan=_advisory_plan(
+                    advisory_plan=build_advisory_plan(
                         state,
                         diagnosis,
                         rationale=rationale,
@@ -521,7 +521,7 @@ class PlaybookPlanner:
             if not decision.applies:
                 return PlanSelection(
                     plan=None,
-                    advisory_plan=_advisory_plan(
+                    advisory_plan=build_advisory_plan(
                         state,
                         diagnosis,
                         decision=decision,
@@ -543,7 +543,7 @@ class PlaybookPlanner:
                 )
                 return PlanSelection(
                     plan=None,
-                    advisory_plan=_advisory_plan(
+                    advisory_plan=build_advisory_plan(
                         state,
                         diagnosis,
                         decision=decision,
@@ -563,7 +563,7 @@ class PlaybookPlanner:
                     )
                     return PlanSelection(
                         plan=None,
-                        advisory_plan=_advisory_plan(
+                        advisory_plan=build_advisory_plan(
                             state,
                             diagnosis,
                             decision=decision,
@@ -588,7 +588,7 @@ class PlaybookPlanner:
             )
             return PlanSelection(
                 plan=None,
-                advisory_plan=_advisory_plan(
+                advisory_plan=build_advisory_plan(
                     state,
                     diagnosis,
                     rationale=advisory_rationale,

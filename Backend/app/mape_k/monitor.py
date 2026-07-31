@@ -7,9 +7,15 @@ from datetime import timedelta
 from typing import Any
 
 from app.config import settings
-from app.mape_k.capabilities import capability_for_alert
+from app.mape_k.capabilities import (
+    GENERIC_EVIDENCE_REQUIREMENTS,
+    SSH_EVIDENCE_REQUIREMENTS,
+    capability_for_alert,
+)
 from app.mape_k.schemas import (
     AuthenticationEvidenceSummary,
+    EvidenceCollectionResult,
+    EvidenceCollectionStatus,
     EvidenceReference,
     IncidentWorkflowState,
     WorkflowStage,
@@ -117,6 +123,81 @@ class WazuhMonitor:
         alerts_by_id = {primary.alert_id: primary}
         for alert in related.alerts:
             alerts_by_id.setdefault(alert.alert_id, alert)
+
+        agent_id = state.agent_id or primary.agent_id
+        ssh_session_enrichment: dict[str, Any] = {
+            "performed": False,
+            "session_alert_ids": [],
+            "archive_event_ids": [],
+            "source_errors": [],
+            "limitations": [],
+        }
+        # The first SSH pass stays authentication-only. If Analyze cannot
+        # decide, the next pass deliberately widens to bounded post-login and
+        # endpoint telemetry instead of repeating the same authentication
+        # query with a larger clock window.
+        if primary_is_ssh and state.analysis_attempts > 0 and agent_id:
+            ssh_session_enrichment["performed"] = True
+            window_minutes = max(
+                1,
+                min(1440, (window_seconds + 59) // 60),
+            )
+            try:
+                session_alerts = self.gateway.search_alerts_by_agent_and_time(
+                    agent_id=agent_id,
+                    center_time=primary.timestamp,
+                    window_minutes=window_minutes,
+                    limit=50,
+                    authentication_only=False,
+                )
+                for alert in session_alerts.alerts:
+                    alerts_by_id.setdefault(alert.alert_id, alert)
+                ssh_session_enrichment["session_alert_ids"] = [
+                    alert.alert_id for alert in session_alerts.alerts
+                ]
+                ssh_session_enrichment["session_search_truncated"] = (
+                    session_alerts.truncated
+                )
+            except Exception as exc:
+                ssh_session_enrichment["source_errors"].append(
+                    {
+                        "source": "agent_alert_timeline",
+                        "error": type(exc).__name__,
+                    }
+                )
+
+            archive_term = (
+                primary.target_user or primary.source_ip or "sshd"
+            )
+            try:
+                archived = self.gateway.search_archived_logs(
+                    text=archive_term,
+                    agent_id=agent_id,
+                    center_time=primary.timestamp,
+                    window_minutes=window_minutes,
+                    limit=25,
+                )
+                for event in archived.events:
+                    alerts_by_id.setdefault(
+                        event.normalized.alert_id,
+                        event.normalized,
+                    )
+                ssh_session_enrichment["archive_status"] = (
+                    archived.archive_status
+                )
+                ssh_session_enrichment["archive_event_ids"] = [
+                    event.normalized.alert_id for event in archived.events
+                ]
+                ssh_session_enrichment["archive_search_truncated"] = (
+                    archived.truncated
+                )
+            except Exception as exc:
+                ssh_session_enrichment["source_errors"].append(
+                    {
+                        "source": "archived_logs",
+                        "error": type(exc).__name__,
+                    }
+                )
 
         raw_alerts = [
             alert.model_dump(mode="json", exclude_none=True)
@@ -296,27 +377,60 @@ class WazuhMonitor:
 
         inventory: dict[str, Any] = {}
         inventory_errors: list[dict[str, str]] = []
-        agent_id = state.agent_id or primary.agent_id
-        if agent_id and not primary_is_ssh:
-            profiles = {
-                "identity_and_process": ("processes", "os"),
-                "persistence_and_file_integrity": ("processes", "os"),
-                "network_and_process": ("ports", "network", "processes"),
-                "network_and_data_access": ("ports", "network", "processes"),
-                "process_and_parent": ("processes", "os"),
-                "file_integrity_and_process": ("processes", "os"),
-                "vulnerability_and_asset": ("packages", "os"),
-                "package_and_process": ("packages", "processes"),
-            }
-            profile = (
-                primary_capability.evidence_profile
-                if primary_capability is not None
-                else "generic_inventory"
+        if agent_id and primary_is_ssh and state.analysis_attempts > 0:
+            for component in ("processes", "ports"):
+                try:
+                    result = self.gateway.get_agent_inventory(
+                        agent_id=agent_id,
+                        component=component,
+                        limit=10,
+                    )
+                    compact = result.model_dump(mode="json")
+                    compact["items"] = compact.get("items", [])[:5]
+                    inventory[component] = compact
+                except Exception as exc:
+                    inventory_errors.append(
+                        {"component": component, "error": type(exc).__name__}
+                    )
+            try:
+                detection = self.gateway.get_detection_evidence(
+                    agent_id=agent_id,
+                    limit=10,
+                )
+                ssh_session_enrichment["detection_evidence"] = {
+                    "fim_findings": detection.fim_findings[:5],
+                    "sca_findings": detection.sca_findings[:5],
+                    "rootcheck_findings": detection.rootcheck_findings[:5],
+                    "fim_total": detection.fim_total,
+                    "sca_total": detection.sca_total,
+                    "rootcheck_total": detection.rootcheck_total,
+                    "truncated": detection.truncated,
+                }
+                ssh_session_enrichment["limitations"].append(
+                    "Endpoint inventory and detection evidence are current-state "
+                    "snapshots, not guaranteed historical state at login time."
+                )
+            except Exception as exc:
+                ssh_session_enrichment["source_errors"].append(
+                    {
+                        "source": "endpoint_detection_evidence",
+                        "error": type(exc).__name__,
+                    }
+                )
+        elif agent_id and not primary_is_ssh:
+            components = tuple(
+                dict.fromkeys(
+                    requirement.component
+                    for requirement in (
+                        primary_capability.evidence_requirements
+                        if primary_capability is not None
+                        else GENERIC_EVIDENCE_REQUIREMENTS
+                    )
+                    if requirement.collector == "agent_inventory"
+                    and requirement.component
+                )
             )
-            components = profiles.get(
-                profile,
-                ("ports", "processes"),
-            )[: settings.MAPEK_MAX_TOOL_CALLS_PER_STAGE]
+            components = components[: settings.MAPEK_MAX_TOOL_CALLS_PER_STAGE]
 
             def fetch(component: str):
                 return lambda: self.gateway.get_agent_inventory(
@@ -337,6 +451,360 @@ class WazuhMonitor:
                     compact = result.model_dump(mode="json")
                     compact["items"] = compact.get("items", [])[:5]
                     inventory[component] = compact
+
+        requirements = (
+            SSH_EVIDENCE_REQUIREMENTS
+            if primary_is_ssh
+            else (
+                primary_capability.evidence_requirements
+                if primary_capability is not None
+                else GENERIC_EVIDENCE_REQUIREMENTS
+            )
+        )
+        collection_results: list[EvidenceCollectionResult] = []
+        capability_evidence: dict[str, Any] = {}
+        collector_calls = len(inventory) + len(inventory_errors)
+        max_collector_calls = max(
+            1,
+            int(settings.MAPEK_MAX_TOOL_CALLS_PER_STAGE),
+        )
+        collection_pass = state.analysis_attempts + 1
+
+        for requirement in requirements:
+            status = EvidenceCollectionStatus.UNSUPPORTED
+            records = 0
+            source = requirement.collector
+            limitation: str | None = None
+            payload: Any = None
+
+            if collection_pass < requirement.minimum_pass:
+                status = EvidenceCollectionStatus.DEFERRED
+                limitation = (
+                    f"Scheduled for collection pass {requirement.minimum_pass}."
+                )
+            elif requirement.collector == "primary_alert_field":
+                value = getattr(
+                    primary_envelope.normalized,
+                    str(requirement.alert_field or ""),
+                    None,
+                )
+                records = int(value not in (None, "", []))
+                status = (
+                    EvidenceCollectionStatus.COLLECTED
+                    if records
+                    else EvidenceCollectionStatus.NOT_FOUND
+                )
+                payload = {"field": requirement.alert_field, "value": value}
+                source = "wazuh_alert"
+            elif requirement.collector == "related_alerts":
+                records = len(related.alerts) + 1
+                status = (
+                    EvidenceCollectionStatus.TRUNCATED
+                    if related.truncated
+                    else EvidenceCollectionStatus.COLLECTED
+                )
+                payload = {
+                    "alert_ids": list(alerts_by_id),
+                    "total": max(records, related.total + 1),
+                }
+                source = "wazuh_indexer"
+            elif requirement.collector == "agent_inventory":
+                component = str(requirement.component or "")
+                payload = inventory.get(component)
+                if payload is not None:
+                    records = int(payload.get("returned") or 0)
+                    status = (
+                        EvidenceCollectionStatus.TRUNCATED
+                        if payload.get("truncated")
+                        else EvidenceCollectionStatus.COLLECTED
+                        if records >= requirement.minimum_records
+                        else EvidenceCollectionStatus.NOT_FOUND
+                    )
+                else:
+                    status = EvidenceCollectionStatus.COLLECTOR_UNAVAILABLE
+                    limitation = "The requested inventory component was unavailable."
+                source = f"wazuh_syscollector:{component}"
+            elif primary_is_ssh and requirement.collector == "agent_timeline":
+                records = len(
+                    ssh_session_enrichment.get("session_alert_ids") or []
+                )
+                status = (
+                    EvidenceCollectionStatus.TRUNCATED
+                    if ssh_session_enrichment.get("session_search_truncated")
+                    else EvidenceCollectionStatus.COLLECTED
+                    if records >= requirement.minimum_records
+                    else EvidenceCollectionStatus.NOT_FOUND
+                )
+                payload = {
+                    "alert_ids": ssh_session_enrichment.get(
+                        "session_alert_ids", []
+                    )
+                }
+                source = "wazuh_agent_timeline"
+            elif primary_is_ssh and requirement.collector == "archived_logs":
+                records = len(
+                    ssh_session_enrichment.get("archive_event_ids") or []
+                )
+                archive_status = ssh_session_enrichment.get("archive_status")
+                status = (
+                    EvidenceCollectionStatus.NOT_CONFIGURED
+                    if archive_status in {None, "unavailable", "unknown"}
+                    else EvidenceCollectionStatus.TRUNCATED
+                    if ssh_session_enrichment.get("archive_search_truncated")
+                    else EvidenceCollectionStatus.COLLECTED
+                    if records >= requirement.minimum_records
+                    else EvidenceCollectionStatus.NOT_FOUND
+                )
+                payload = {
+                    "archive_status": archive_status,
+                    "event_ids": ssh_session_enrichment.get(
+                        "archive_event_ids", []
+                    ),
+                }
+                source = "wazuh_archives"
+            elif primary_is_ssh and requirement.collector == "detection_evidence":
+                payload = ssh_session_enrichment.get("detection_evidence")
+                if payload is not None:
+                    records = sum(
+                        int(payload.get(key) or 0)
+                        for key in ("fim_total", "sca_total", "rootcheck_total")
+                    )
+                    status = (
+                        EvidenceCollectionStatus.TRUNCATED
+                        if payload.get("truncated")
+                        else EvidenceCollectionStatus.COLLECTED
+                        if records >= requirement.minimum_records
+                        else EvidenceCollectionStatus.NOT_FOUND
+                    )
+                else:
+                    status = EvidenceCollectionStatus.COLLECTOR_UNAVAILABLE
+                source = "wazuh_endpoint_detection"
+            elif requirement.collector == "source_identity":
+                status = EvidenceCollectionStatus.NOT_CONFIGURED
+                limitation = (
+                    "No source asset, VPN, or administrator identity mapping "
+                    "provider is configured."
+                )
+            elif not agent_id:
+                status = EvidenceCollectionStatus.NOT_FOUND
+                limitation = "The alert does not identify a Wazuh agent."
+            elif collector_calls >= max_collector_calls:
+                status = EvidenceCollectionStatus.COLLECTOR_UNAVAILABLE
+                limitation = "The bounded Monitor collector budget was exhausted."
+            else:
+                collector_calls += 1
+                try:
+                    if requirement.collector == "agent_timeline":
+                        timeline = self.gateway.search_alerts_by_agent_and_time(
+                            agent_id=agent_id,
+                            center_time=primary.timestamp,
+                            window_minutes=max(
+                                1,
+                                min(1440, (window_seconds + 59) // 60),
+                            ),
+                            limit=25,
+                            authentication_only=False,
+                        )
+                        records = timeline.returned
+                        payload = {
+                            "alerts": [
+                                alert.model_dump(mode="json")
+                                for alert in timeline.alerts[:10]
+                            ],
+                            "total": timeline.total,
+                        }
+                        status = (
+                            EvidenceCollectionStatus.TRUNCATED
+                            if timeline.truncated
+                            else EvidenceCollectionStatus.COLLECTED
+                            if records >= requirement.minimum_records
+                            else EvidenceCollectionStatus.NOT_FOUND
+                        )
+                        source = "wazuh_agent_timeline"
+                    elif requirement.collector == "archived_logs":
+                        search_term = next(
+                            (
+                                str(value)
+                                for value in (
+                                    primary_envelope.normalized.process_name,
+                                    primary_envelope.normalized.file_path,
+                                    primary_envelope.normalized.package_name,
+                                    primary_envelope.normalized.destination_ip,
+                                    primary_envelope.normalized.source_ip,
+                                )
+                                if value
+                            ),
+                            primary.description,
+                        )
+                        archived = self.gateway.search_archived_logs(
+                            text=search_term,
+                            agent_id=agent_id,
+                            center_time=primary.timestamp,
+                            window_minutes=max(
+                                1,
+                                min(1440, (window_seconds + 59) // 60),
+                            ),
+                            limit=25,
+                        )
+                        records = archived.returned
+                        payload = {
+                            "archive_status": archived.archive_status,
+                            "events": [
+                                event.normalized.model_dump(mode="json")
+                                for event in archived.events[:10]
+                            ],
+                            "total": archived.total,
+                        }
+                        status = (
+                            EvidenceCollectionStatus.NOT_CONFIGURED
+                            if archived.archive_status
+                            in {"unavailable", "unknown"}
+                            else EvidenceCollectionStatus.TRUNCATED
+                            if archived.truncated
+                            else EvidenceCollectionStatus.COLLECTED
+                            if records >= requirement.minimum_records
+                            else EvidenceCollectionStatus.NOT_FOUND
+                        )
+                        source = "wazuh_archives"
+                    elif requirement.collector == "detection_evidence":
+                        detection = self.gateway.get_detection_evidence(
+                            agent_id=agent_id,
+                            limit=10,
+                        )
+                        payload = detection.model_dump(mode="json")
+                        records = (
+                            detection.fim_total
+                            + detection.sca_total
+                            + detection.rootcheck_total
+                        )
+                        status = (
+                            EvidenceCollectionStatus.TRUNCATED
+                            if detection.truncated
+                            else EvidenceCollectionStatus.COLLECTED
+                            if records >= requirement.minimum_records
+                            else EvidenceCollectionStatus.NOT_FOUND
+                        )
+                        source = "wazuh_endpoint_detection"
+                    elif requirement.collector == "agent_summary":
+                        summary = self.gateway.get_agent_summary(agent_id)
+                        records = int(summary is not None)
+                        payload = (
+                            summary.model_dump(mode="json") if summary else None
+                        )
+                        status = (
+                            EvidenceCollectionStatus.COLLECTED
+                            if summary
+                            else EvidenceCollectionStatus.NOT_FOUND
+                        )
+                        source = "wazuh_manager"
+                    elif requirement.collector == "vulnerability_inventory":
+                        vulnerabilities, total = self.gateway.search_vulnerabilities(
+                            agent_id=agent_id,
+                            limit=20,
+                        )
+                        records = len(vulnerabilities)
+                        payload = {
+                            "items": vulnerabilities[:10],
+                            "total": total,
+                        }
+                        status = (
+                            EvidenceCollectionStatus.TRUNCATED
+                            if total > records
+                            else EvidenceCollectionStatus.COLLECTED
+                            if records >= requirement.minimum_records
+                            else EvidenceCollectionStatus.NOT_FOUND
+                        )
+                        source = "wazuh_vulnerability_detector"
+                except Exception as exc:
+                    status = EvidenceCollectionStatus.COLLECTOR_UNAVAILABLE
+                    limitation = type(exc).__name__
+
+            capability_evidence[requirement.evidence_type] = payload
+            result = EvidenceCollectionResult(
+                evidence_type=requirement.evidence_type,
+                collector=requirement.collector,
+                required=requirement.required,
+                purpose=requirement.purpose,
+                status=status,
+                records=records,
+                source=source,
+                limitation=limitation,
+            )
+            if payload is not None and status in {
+                EvidenceCollectionStatus.COLLECTED,
+                EvidenceCollectionStatus.NOT_FOUND,
+                EvidenceCollectionStatus.TRUNCATED,
+            }:
+                safe_payload = {
+                    "collection": result.model_dump(mode="json"),
+                    "payload": payload,
+                }
+                digest = content_hash(safe_payload)
+                evidence_id = stable_id(
+                    "EV",
+                    "collection",
+                    state.investigation_id,
+                    requirement.evidence_type,
+                    digest,
+                    length=16,
+                )
+                evidence.append(
+                    EvidenceReference(
+                        evidence_id=evidence_id,
+                        source_type="wazuh_context",
+                        source_ref=(
+                            f"wazuh:context:{agent_id or 'unknown'}:"
+                            f"{requirement.evidence_type}:{digest[:12]}"
+                        ),
+                        observed_at=primary.timestamp,
+                        summary=(
+                            f"{requirement.evidence_type}: {status.value}; "
+                            f"{records} record(s) in the bounded collection."
+                        ),
+                        content_hash=digest,
+                    )
+                )
+                evidence_records.append(
+                    {
+                        "evidence_id": evidence_id,
+                        "source_type": "wazuh_context",
+                        "source_ref": evidence[-1].source_ref,
+                        "raw_source_type": source,
+                        "raw_source_index": None,
+                        "raw_source_document_id": None,
+                        "raw_document_hash": None,
+                        "normalized_document_hash": digest,
+                        "normalizer_name": "evidence_contract",
+                        "normalizer_version": "1.0",
+                        "ingested_at": primary.timestamp.isoformat(),
+                        "observed_at": primary.timestamp.isoformat(),
+                        "organization_id": state.organization_id,
+                        "summary": evidence[-1].summary,
+                        "content_hash": digest,
+                        "event_count": max(records, 1),
+                        "attack_details": safe_payload,
+                    }
+                )
+                result = result.model_copy(
+                    update={"evidence_ids": [evidence_id]}
+                )
+            collection_results.append(result)
+
+        required_results = [item for item in collection_results if item.required]
+        completed_results = [
+            item
+            for item in required_results
+            if item.status
+            in {
+                EvidenceCollectionStatus.COLLECTED,
+                EvidenceCollectionStatus.NOT_FOUND,
+            }
+        ]
+        evidence_completeness = (
+            len(completed_results) / len(required_results)
+            if required_results
+            else 1.0
+        )
 
         fingerprint_material = [
             group.group_key for group in groups
@@ -369,6 +837,7 @@ class WazuhMonitor:
             "normalized_alerts": normalized,
             "evidence": evidence,
             "evidence_records": evidence_records,
+            "evidence_collection_results": collection_results,
             "authentication_evidence": authentication_evidence,
             "findings": [
                 finding.model_dump(mode="json") for finding in findings
@@ -382,7 +851,7 @@ class WazuhMonitor:
                     else (
                         primary_capability.evidence_profile
                         if primary_capability is not None
-                        else "generic_inventory"
+                        else "generic_evidence"
                     )
                 ),
                 "capability_id": (
@@ -405,6 +874,24 @@ class WazuhMonitor:
                     "collection_pass": state.analysis_attempts + 1,
                 },
                 "related_alerts_truncated": related.truncated,
+                "ssh_session_enrichment": ssh_session_enrichment,
+                "evidence_contract": {
+                    "requirements": [
+                        {
+                            "evidence_type": item.evidence_type,
+                            "collector": item.collector,
+                            "required": item.required,
+                            "purpose": item.purpose,
+                        }
+                        for item in requirements
+                    ],
+                    "results": [
+                        item.model_dump(mode="json")
+                        for item in collection_results
+                    ],
+                    "completeness": evidence_completeness,
+                },
+                "capability_evidence": capability_evidence,
             },
             "audit_events": [
                 audit_event(

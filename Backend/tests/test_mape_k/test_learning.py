@@ -190,3 +190,141 @@ def test_outcome_priors_skip_the_current_investigation_and_thin_history():
         ),
     )
     assert "past_outcomes" not in priors
+
+
+def _diag(**kw):
+    from app.mape_k.schemas import Diagnosis
+
+    payload = {
+        "incident_type": "ssh_brute_force",
+        "summary": "s",
+        "root_cause": "r",
+        "evidence_ids": ["EV-1"],
+        "confidence": 0.96,
+    }
+    payload.update(kw)
+    return Diagnosis(**payload)
+
+
+def _result(evidence_type, status, required=True):
+    from app.mape_k.schemas import EvidenceCollectionResult
+
+    return EvidenceCollectionResult(
+        evidence_type=evidence_type,
+        collector="c",
+        required=required,
+        status=status,
+        source="s",
+    )
+
+
+def test_unavailable_collector_yields_telemetry_unavailable_not_confidence():
+    """A collector that never ran must not read as 'nothing found'."""
+    from app.mape_k.schemas import DiagnosisVerdict, assess_evidence
+
+    assessed = assess_evidence(
+        _diag(),
+        [
+            _result("auth_timeline", "collected"),
+            _result("session_archives", "not_configured"),
+        ],
+        completeness_threshold=0.8,
+    )
+    assert assessed.verdict == DiagnosisVerdict.TELEMETRY_UNAVAILABLE
+    assert assessed.telemetry_gaps == ["session_archives"]
+    assert assessed.evidence_completeness == 0.5
+
+
+def test_not_found_counts_as_answered_evidence():
+    """'Searched and found nothing' is a real answer, not a gap."""
+    from app.mape_k.schemas import DiagnosisVerdict, assess_evidence
+
+    assessed = assess_evidence(
+        _diag(),
+        [
+            _result("auth_timeline", "collected"),
+            _result("post_login_activity", "not_found"),
+        ],
+        completeness_threshold=0.8,
+    )
+    assert assessed.evidence_completeness == 1.0
+    assert assessed.telemetry_gaps == []
+    assert assessed.verdict == DiagnosisVerdict.CONFIRMED_MALICIOUS
+
+
+def test_remediation_blocked_by_gaps_and_low_completeness():
+    from app.mape_k.schemas import assess_evidence, remediation_allowed
+
+    complete = assess_evidence(
+        _diag(),
+        [_result("auth_timeline", "collected")],
+        completeness_threshold=0.8,
+    )
+    gapped = assess_evidence(
+        _diag(),
+        [
+            _result("auth_timeline", "collected"),
+            _result("session_archives", "collector_unavailable"),
+        ],
+        completeness_threshold=0.8,
+    )
+    kwargs = {
+        "confidence_threshold": 0.8,
+        "completeness_threshold": 0.8,
+    }
+    assert remediation_allowed(complete, **kwargs) is True
+    assert remediation_allowed(gapped, **kwargs) is False
+    # High confidence must not rescue missing telemetry.
+    assert gapped.confidence == 0.96
+
+
+def test_low_confidence_stays_suspicious_and_cannot_remediate():
+    from app.mape_k.schemas import DiagnosisVerdict, assess_evidence, remediation_allowed
+
+    assessed = assess_evidence(
+        _diag(confidence=0.6),
+        [_result("auth_timeline", "collected")],
+        completeness_threshold=0.8,
+    )
+    assert assessed.verdict == DiagnosisVerdict.SUSPICIOUS
+    assert (
+        remediation_allowed(
+            assessed,
+            confidence_threshold=0.8,
+            completeness_threshold=0.8,
+        )
+        is False
+    )
+
+
+def test_deferred_evidence_requests_another_pass_but_is_not_a_gap():
+    """minimum_pass requirements must trigger recollection, not escalation."""
+    from app.mape_k.schemas import DiagnosisVerdict, assess_evidence
+
+    assessed = assess_evidence(
+        _diag(),
+        [
+            _result("auth_timeline", "collected"),
+            _result("session_archives", "deferred"),
+        ],
+        completeness_threshold=0.8,
+    )
+    assert assessed.verdict == DiagnosisVerdict.INSUFFICIENT_EVIDENCE
+    assert assessed.telemetry_gaps == []
+    assert assessed.needs_more_evidence is True
+
+
+def test_permanent_gap_does_not_request_another_pass():
+    """Re-collecting cannot conjure telemetry that is not configured."""
+    from app.mape_k.schemas import DiagnosisVerdict, assess_evidence
+
+    assessed = assess_evidence(
+        _diag(),
+        [
+            _result("auth_timeline", "collected"),
+            _result("session_archives", "not_configured"),
+        ],
+        completeness_threshold=0.8,
+    )
+    assert assessed.verdict == DiagnosisVerdict.TELEMETRY_UNAVAILABLE
+    assert assessed.needs_more_evidence is False
