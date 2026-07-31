@@ -90,6 +90,16 @@ class Settings(BaseSettings):
     MAPEK_TEMPORARY_BLOCK_TTL_SECONDS: int = 900
     MAPEK_WORKER_INTERVAL_SECONDS: int = 5
     MAPEK_WORKER_BATCH_SIZE: int = 25
+    MAPEK_WORKER_MAX_ATTEMPTS: int = 5
+    MAPEK_WORKER_CONCURRENCY: int = 4
+    # Autonomous incident creation. Off by default: turning it on lets the
+    # pipeline open investigations without a human. Every action they propose
+    # still stops at the approval gate, so the exposure is spend, not blast
+    # radius.
+    MAPEK_AUTO_INVESTIGATE_ENABLED: bool = False
+    MAPEK_AUTO_INVESTIGATE_MIN_CONFIDENCE: float = 0.7
+    MAPEK_AUTO_INVESTIGATE_MAX_PER_CYCLE: int = 5
+    MAPEK_CHECKPOINTER_POOL_SIZE: int = 10
     MAPEK_PROTECTED_IPS: str = ""
     MAPEK_APPROVED_ADMIN_IPS: str = ""
     MAPEK_PROTECTED_ACCOUNTS: str = "root,wazuh"
@@ -160,6 +170,7 @@ class Settings(BaseSettings):
     WAZUH_MAX_LIMIT: int = 500
     # Safety rails: reads only by default; active-response needs BOTH flags flipped.
     WAZUH_READ_ONLY: bool = True
+    WAZUH_REQUEST_MAX_ATTEMPTS: int = 3
     WAZUH_ALLOW_DANGEROUS_TOOLS: bool = False
     WAZUH_AGENT_RESPONSE_MODE: str = "compact"
     WAZUH_NORMALIZATION_ENABLED: bool = True

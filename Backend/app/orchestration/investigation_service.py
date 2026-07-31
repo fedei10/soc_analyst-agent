@@ -1,12 +1,14 @@
 """Reusable application service around the formal investigation graph."""
 
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from enum import Enum
 from functools import lru_cache
 from threading import RLock
 from typing import Any
 
+import structlog
 from langgraph.types import Command
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
@@ -41,6 +43,9 @@ from app.services.telegram.notifier import (
 )
 
 
+logger = structlog.get_logger("tsage.orchestration.investigations")
+
+
 class InvestigationNotFoundError(LookupError):
     pass
 
@@ -62,7 +67,12 @@ def _notify_investigation_transition(snapshot: dict[str, Any]) -> None:
         )
         notifier.send(message)
     except Exception:
-        pass
+        logger.warning(
+            "telegram_notification_failed",
+            investigation_id=snapshot.get("investigation_id"),
+            status=status,
+            exc_info=True,
+        )
 
 
 def _json_safe(value: Any) -> Any:
@@ -115,7 +125,24 @@ class InvestigationService:
                 ),
             )
         self.graph = graph
+        # Guards the snapshot version check-and-write only.
         self._lock = RLock()
+        self._investigation_locks: dict[str, RLock] = {}
+        self._investigation_locks_guard = RLock()
+
+    def _investigation_lock(self, investigation_id: str) -> RLock:
+        """Per-investigation lock, so one slow workflow blocks only itself.
+
+        Correctness across processes comes from the DB incident lease; this
+        just keeps same-process callers off each other's check-then-act.
+        ponytail: unbounded dict of small locks, one per investigation seen.
+        Add eviction if a deployment ever accumulates enough IDs to care.
+        """
+        with self._investigation_locks_guard:
+            return self._investigation_locks.setdefault(
+                investigation_id,
+                RLock(),
+            )
 
     @staticmethod
     def initial_state(
@@ -297,15 +324,11 @@ class InvestigationService:
         )
         if not created:
             return snapshot
-        investigation_id = str(snapshot["investigation_id"])
-        state = IncidentWorkflowState.model_validate(snapshot)
-
-        self.graph.invoke(
-            state.model_dump(mode="json"),
-            config=investigation_config(investigation_id),
-        )
-        return self._sync_snapshot(
-            investigation_id,
+        # Delegate rather than invoke directly: run_queued takes the incident
+        # lease and re-checks the status under it, so a worker cycle landing
+        # in this window cannot run the same thread_id concurrently.
+        return self.run_queued(
+            str(snapshot["investigation_id"]),
             organization_id=organization_id,
         )
 
@@ -586,66 +609,142 @@ class InvestigationService:
             statuses=("queued", "waiting_verification"),
             limit=batch_size,
         )
-        results: list[dict[str, Any]] = []
         now = datetime.now(UTC)
-        for candidate in candidates:
-            investigation_id = str(candidate["investigation_id"])
-            organization_id = str(candidate["organization_id"])
-            status = str(candidate.get("status") or "")
-            try:
-                if status == "queued":
-                    snapshot = self.run_queued(
-                        investigation_id,
-                        organization_id=organization_id,
+        # Candidates are independent - each holds its own incident lease - so
+        # one slow LLM-bound investigation no longer delays the ready
+        # verifications queued behind it.
+        workers = max(
+            1,
+            min(int(settings.MAPEK_WORKER_CONCURRENCY), len(candidates) or 1),
+        )
+        if workers == 1:
+            rows = [self._process_candidate(item, now) for item in candidates]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                rows = list(
+                    pool.map(
+                        lambda item: self._process_candidate(item, now),
+                        candidates,
                     )
-                    operation = "investigation"
-                else:
-                    ready_value = candidate.get("verification_not_before")
-                    ready_at = (
-                        datetime.fromisoformat(
-                            str(ready_value).replace("Z", "+00:00")
-                        )
-                        if ready_value
-                        else None
-                    )
-                    if ready_at is not None and ready_at.tzinfo is None:
-                        ready_at = ready_at.replace(tzinfo=UTC)
-                    if ready_at is None or ready_at > now:
-                        continue
-                    snapshot = self.resume_verification(
-                        investigation_id,
-                        resumed_by="tsage-orchestration-worker",
-                        executor_roles=[],
-                        organization_id=organization_id,
-                    )
-                    operation = "verification"
-                results.append(
-                    {
-                        "investigation_id": investigation_id,
-                        "operation": operation,
-                        "status": snapshot.get("status"),
-                    }
                 )
-            except ResourceLeaseConflictError:
-                continue
-            except Exception as exc:
-                results.append(
-                    {
-                        "investigation_id": investigation_id,
-                        "operation": (
-                            "investigation"
-                            if status == "queued"
-                            else "verification"
-                        ),
-                        "status": "failed",
-                        "error": type(exc).__name__,
-                    }
-                )
+        results = [row for row in rows if row is not None]
         return {
             "candidates": len(candidates),
             "processed": len(results),
             "results": results,
         }
+
+    def _process_candidate(
+        self,
+        candidate: dict[str, Any],
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        """Run one worker candidate. None means skipped, not failed."""
+
+        investigation_id = str(candidate["investigation_id"])
+        organization_id = str(candidate["organization_id"])
+        status = str(candidate.get("status") or "")
+        try:
+            if status == "queued":
+                snapshot = self.run_queued(
+                    investigation_id,
+                    organization_id=organization_id,
+                )
+                operation = "investigation"
+            else:
+                ready_value = candidate.get("verification_not_before")
+                ready_at = (
+                    datetime.fromisoformat(
+                        str(ready_value).replace("Z", "+00:00")
+                    )
+                    if ready_value
+                    else None
+                )
+                if ready_at is not None and ready_at.tzinfo is None:
+                    ready_at = ready_at.replace(tzinfo=UTC)
+                if ready_at is None or ready_at > now:
+                    return None
+                snapshot = self.resume_verification(
+                    investigation_id,
+                    resumed_by="tsage-orchestration-worker",
+                    executor_roles=[],
+                    organization_id=organization_id,
+                )
+                operation = "verification"
+            return {
+                "investigation_id": investigation_id,
+                "operation": operation,
+                "status": snapshot.get("status"),
+            }
+        except ResourceLeaseConflictError:
+            return None
+        except Exception as exc:
+            logger.error(
+                "worker_candidate_failed",
+                investigation_id=investigation_id,
+                organization_id=organization_id,
+                candidate_status=status,
+                exc_info=True,
+            )
+            self._record_worker_failure(
+                investigation_id,
+                organization_id=organization_id,
+            )
+            return {
+                "investigation_id": investigation_id,
+                "operation": (
+                    "investigation" if status == "queued" else "verification"
+                ),
+                "status": "failed",
+                "error": type(exc).__name__,
+            }
+
+    def _record_worker_failure(
+        self,
+        investigation_id: str,
+        *,
+        organization_id: str,
+    ) -> None:
+        """Count a worker failure; mark the investigation failed at the limit.
+
+        Without this, a snapshot whose graph invocation raises outside a node
+        stays queued and is retried every cycle forever. Attempts live in the
+        snapshot JSON; a successful run rebuilds the snapshot from the
+        checkpoint view, which drops the counter, so it resets for free.
+        """
+        try:
+            snapshot = self.repository.get_snapshot(
+                investigation_id,
+                organization_id=organization_id,
+            )
+            if snapshot is None:
+                return
+            attempts = int(snapshot.get("worker_attempts") or 0) + 1
+            snapshot["worker_attempts"] = attempts
+            if attempts >= max(1, int(settings.MAPEK_WORKER_MAX_ATTEMPTS)):
+                snapshot["status"] = "failed"
+                snapshot["errors"] = [
+                    *(snapshot.get("errors") or []),
+                    {
+                        "code": "WORKER_RETRY_LIMIT",
+                        "message": (
+                            "The background worker gave up after "
+                            f"{attempts} failed attempts."
+                        ),
+                    },
+                ]
+            self.repository.save_snapshot(
+                snapshot,
+                expected_version=int(snapshot.get("state_version") or 0),
+            )
+        except Exception:
+            # Another worker may have advanced the snapshot; the next failed
+            # cycle will count the attempt instead.
+            logger.warning(
+                "worker_failure_bookkeeping_failed",
+                investigation_id=investigation_id,
+                exc_info=True,
+            )
 
     def _resume_trusted(
         self,
@@ -679,15 +778,19 @@ class InvestigationService:
                     "Another worker is updating this investigation."
                 ) from exc
         try:
-            with self._lock:
-                self.graph.invoke(
-                    Command(resume=command_payload),
-                    config=investigation_config(investigation_id),
-                )
-                return self._sync_snapshot(
-                    investigation_id,
-                    organization_id=organization_id,
-                )
+            # No process-wide lock around invoke: the incident lease above
+            # already gives this investigation exclusive ownership across
+            # workers and threads, and _sync_snapshot locks its own
+            # check-and-write. Holding a global lock here stalled every other
+            # approval and verification for the duration of the LLM calls.
+            self.graph.invoke(
+                Command(resume=command_payload),
+                config=investigation_config(investigation_id),
+            )
+            return self._sync_snapshot(
+                investigation_id,
+                organization_id=organization_id,
+            )
         finally:
             if lease is not None:
                 try:
@@ -735,7 +838,7 @@ class InvestigationService:
         executor_roles: list[str] | tuple[str, ...],
         organization_id: str,
     ) -> dict[str, Any]:
-        with self._lock:
+        with self._investigation_lock(investigation_id):
             before = self.snapshot(
                 investigation_id,
                 organization_id=organization_id,
@@ -921,7 +1024,7 @@ class InvestigationService:
     ) -> dict[str, Any]:
         """Resume post-action verification using server-derived identity/time."""
 
-        with self._lock:
+        with self._investigation_lock(investigation_id):
             before = self.snapshot(
                 investigation_id,
                 organization_id=organization_id,

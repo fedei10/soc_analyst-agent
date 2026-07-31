@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from app.config import settings
 from app.mape_k.capabilities import capability_for_incident
+from app.mape_k.learning import incident_priors
 from app.mape_k.llm import (
     LLMConfigurationError,
     LLMInputLimitError,
@@ -453,6 +454,11 @@ class PlaybookPlanner:
             },
             "playbooks": catalogue,
         }
+        # What happened last time this kind of incident was planned. A plan
+        # shape analysts keep rejecting should not keep being selected.
+        outcomes = (incident_priors(state) or {}).get("past_outcomes")
+        if outcomes:
+            payload["past_outcomes"] = outcomes
         selection, usage = self.llm.invoke_structured(
             PlaybookSelection,
             [

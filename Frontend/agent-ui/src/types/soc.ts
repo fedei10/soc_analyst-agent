@@ -314,6 +314,7 @@ export interface InvestigationStartInput {
 export interface ApprovalInput {
   decision: ApprovalDecision
   approval_id: string
+  comment?: string
   modified_actions?: Record<string, unknown>[]
 }
 

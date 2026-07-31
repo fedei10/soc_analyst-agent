@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import structlog
 
@@ -271,6 +272,7 @@ class AlertIngestionService:
         )
         findings = build_findings(groups)
         correlated: set[int] = set()
+        auto_candidates: list[Any] = []
         new_findings = 0
         updated_findings = 0
         finding_scope = settings.WAZUH_INGESTION_ORGANIZATION_ID
@@ -310,14 +312,84 @@ class AlertIngestionService:
                 alert_ids=alert_ids,
             )
             correlated.update(alert_ids)
+            if self._should_auto_investigate(finding, verdict):
+                auto_candidates.append(finding)
         return {
             "correlated_alerts": len(correlated),
             "new_finding_count": new_findings,
             "updated_finding_count": updated_findings,
-            # Ingestion does not automatically create investigations. This
-            # stays zero until an explicit incident-creation policy exists.
-            "new_incident_count": 0,
+            "new_incident_count": self._open_auto_investigations(
+                auto_candidates,
+                organization_id=finding_scope,
+            ),
         }
+
+    @staticmethod
+    def _should_auto_investigate(finding: Any, verdict: Any) -> bool:
+        """Incident-creation policy: only clear, severe, confident findings."""
+
+        if not settings.MAPEK_AUTO_INVESTIGATE_ENABLED:
+            return False
+        return bool(
+            getattr(finding, "investigation_recommended", False)
+            and getattr(verdict, "verdict", "") in {"malicious", "suspicious"}
+            and float(getattr(verdict, "confidence", 0))
+            >= float(settings.MAPEK_AUTO_INVESTIGATE_MIN_CONFIDENCE)
+        )
+
+    def _open_auto_investigations(
+        self,
+        findings: list[Any],
+        *,
+        organization_id: str,
+    ) -> int:
+        """Queue investigations for policy-selected findings.
+
+        enqueue() already returns the existing investigation when one is
+        active for the alert, so repeated ingestion cycles converge instead
+        of piling up duplicates.
+        """
+
+        if not findings:
+            return 0
+        from app.orchestration.investigation_service import (
+            get_investigation_service,
+        )
+
+        limit = max(0, int(settings.MAPEK_AUTO_INVESTIGATE_MAX_PER_CYCLE))
+        service = get_investigation_service()
+        opened = 0
+        for finding in sorted(
+            findings,
+            key=lambda item: -int(getattr(item, "severity_score", 0)),
+        )[:limit]:
+            try:
+                snapshot = service.enqueue(
+                    alert_id=finding.representative_alert_id,
+                    finding_id=finding.finding_id,
+                    initiated_by="auto-triage",
+                    initiation_reason=(
+                        f"Auto-opened for {finding.severity} "
+                        f"{finding.event_type} finding {finding.finding_id}."
+                    ),
+                    organization_id=organization_id,
+                )
+            except Exception:
+                logger.warning(
+                    "auto_investigation_failed",
+                    finding_id=getattr(finding, "finding_id", None),
+                    exc_info=True,
+                )
+                continue
+            if str(snapshot.get("status") or "") == "queued":
+                opened += 1
+                logger.info(
+                    "auto_investigation_opened",
+                    finding_id=finding.finding_id,
+                    investigation_id=snapshot.get("investigation_id"),
+                    severity=finding.severity,
+                )
+        return opened
 
 
 def check_for_new_wazuh_alerts() -> NewAlertCheckResult:

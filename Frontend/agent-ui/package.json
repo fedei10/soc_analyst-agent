@@ -11,6 +11,7 @@
     "format": "prettier --check \"**/*.{ts,tsx,mdx}\" --cache",
     "format:fix": "prettier --write \"**/*.{ts,tsx,mdx}\" --cache",
     "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test \"src/**/*.test.ts\"",
     "validate": "eslint . --max-warnings=0 && prettier --check \"**/*.{ts,tsx,mdx}\" --cache && tsc --noEmit"
   },
   "dependencies": {

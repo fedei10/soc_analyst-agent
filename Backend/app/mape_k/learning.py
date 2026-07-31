@@ -182,11 +182,82 @@ def _prevalence_priors(
     }
 
 
+def _outcome_priors(
+    state: Any,
+    repository: Any,
+    *,
+    organization_id: str,
+    since: datetime,
+    minimum_outcomes: int = 2,
+) -> dict[str, Any] | None:
+    """How past investigations of lookalike incidents actually turned out.
+
+    Closes the K loop: without this the workflow learns nothing from its own
+    history - a plan shape analysts keep rejecting gets proposed again with
+    the same confidence, and a verification that keeps failing never lowers
+    it.
+    """
+
+    event_types = _event_types(state)
+    families = _attack_families(state)
+    if not event_types and not families:
+        return None
+
+    snapshots = repository.list_snapshots(
+        organization_id=organization_id,
+        limit=MAX_FINDINGS_SCANNED,
+    )
+    current_id = str(getattr(state, "investigation_id", "") or "")
+    similar: list[dict[str, Any]] = []
+    for snapshot in snapshots:
+        if str(snapshot.get("investigation_id") or "") == current_id:
+            continue
+        if not _at_or_after(snapshot.get("updated_at"), since):
+            continue
+        matched = any(
+            isinstance(item, dict)
+            and (
+                str(item.get("event_type") or "") in event_types
+                or str(item.get("attack_family") or "") in families
+            )
+            for item in snapshot.get("findings") or []
+        )
+        if matched:
+            similar.append(snapshot)
+        if len(similar) >= MAX_FINDINGS_JOINED:
+            break
+    if len(similar) < minimum_outcomes:
+        return None
+
+    decisions: Counter[str] = Counter()
+    verifications: Counter[str] = Counter()
+    rollbacks = 0
+    for snapshot in similar:
+        decision = snapshot.get("approval_decision")
+        if isinstance(decision, dict) and decision.get("decision"):
+            decisions[str(decision["decision"])] += 1
+        verification = snapshot.get("verification")
+        if isinstance(verification, dict) and verification.get("outcome"):
+            verifications[str(verification["outcome"])] += 1
+        if snapshot.get("rollback"):
+            rollbacks += 1
+
+    if not decisions and not verifications and not rollbacks:
+        return None
+    return {
+        "similar_investigations": len(similar),
+        "approval_decisions": dict(decisions),
+        "verification_outcomes": dict(verifications),
+        "rollbacks": rollbacks,
+    }
+
+
 def incident_priors(
     state: Any,
     *,
     finding_repository: Any | None = None,
     memory_repository: Any | None = None,
+    investigation_repository: Any | None = None,
     settings_obj: Any = settings,
 ) -> dict[str, Any]:
     """Compact prior knowledge for this incident. Never raises."""
@@ -239,6 +310,24 @@ def incident_priors(
         prevalence = _prevalence_priors(state, memory_repository, since=since)
         if prevalence:
             priors["asset_prevalence"] = prevalence
+    except Exception:
+        pass
+
+    try:
+        if investigation_repository is None:
+            from app.db.repositories.investigations import (
+                get_investigation_repository,
+            )
+
+            investigation_repository = get_investigation_repository()
+        outcomes = _outcome_priors(
+            state,
+            investigation_repository,
+            organization_id=organization_id,
+            since=since,
+        )
+        if outcomes:
+            priors["past_outcomes"] = outcomes
     except Exception:
         pass
 

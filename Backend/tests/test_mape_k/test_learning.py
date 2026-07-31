@@ -132,3 +132,61 @@ def test_repository_failure_degrades_to_no_priors():
         finding_repository=Broken(),
         memory_repository=Broken(),
     ) == {}
+
+
+class FakeInvestigations:
+    def __init__(self, snapshots):
+        self.snapshots = snapshots
+
+    def list_snapshots(self, *, organization_id, limit, **_kwargs):
+        return self.snapshots[:limit]
+
+
+def _past(investigation_id, *, decision=None, verification=None, rollback=None):
+    return {
+        "investigation_id": investigation_id,
+        "updated_at": datetime.now(UTC).isoformat(),
+        "findings": [
+            {"event_type": "ssh_login_failure", "attack_family": "credential_access"}
+        ],
+        "approval_decision": {"decision": decision} if decision else None,
+        "verification": {"outcome": verification} if verification else None,
+        "rollback": rollback,
+    }
+
+
+def test_outcome_priors_summarize_past_decisions():
+    priors = incident_priors(
+        _state(),
+        finding_repository=FakeFindings(records=[], feedback={}),
+        memory_repository=FakeMemory({}),
+        investigation_repository=FakeInvestigations(
+            [
+                _past("INV-A", decision="reject"),
+                _past("INV-B", decision="reject"),
+                _past("INV-C", decision="approve", verification="failed"),
+                _past("INV-D", rollback={"status": "done"}),
+            ]
+        ),
+    )
+
+    outcomes = priors["past_outcomes"]
+    assert outcomes["similar_investigations"] == 4
+    assert outcomes["approval_decisions"] == {"reject": 2, "approve": 1}
+    assert outcomes["verification_outcomes"] == {"failed": 1}
+    assert outcomes["rollbacks"] == 1
+
+
+def test_outcome_priors_skip_the_current_investigation_and_thin_history():
+    priors = incident_priors(
+        _state(),
+        finding_repository=FakeFindings(records=[], feedback={}),
+        memory_repository=FakeMemory({}),
+        investigation_repository=FakeInvestigations(
+            [
+                _past("INV-LEARN", decision="approve"),
+                _past("INV-A", decision="approve"),
+            ]
+        ),
+    )
+    assert "past_outcomes" not in priors

@@ -9,7 +9,7 @@ from functools import lru_cache
 from threading import RLock
 from typing import Any, Protocol
 
-from sqlalchemy import Select, and_, func, or_, select
+from sqlalchemy import Select, and_, case, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -40,6 +40,27 @@ from app.db.session import (
 
 
 TERMINAL_STATUSES = {"completed", "failed", "rejected", "escalated"}
+
+# Worker pickup order. Ready verifications come first because their observation
+# window has already elapsed and every further delay widens it; within a class,
+# a critical incident should not wait behind a batch of low-severity ones.
+_WORKER_SEVERITY_RANK = {
+    "critical": 0,
+    "high": 1,
+    "medium": 2,
+    "low": 3,
+    "informational": 4,
+}
+
+
+def worker_candidate_priority(snapshot: dict[str, Any]) -> tuple[int, int, str]:
+    status = str(snapshot.get("status") or "")
+    severity = str(snapshot.get("severity") or "").lower()
+    return (
+        0 if status == "waiting_verification" else 1,
+        _WORKER_SEVERITY_RANK.get(severity, 3),
+        str(snapshot.get("updated_at") or ""),
+    )
 ROLLBACK_ELIGIBLE_STATUSES = {
     "accepted",
     "applied",
@@ -766,6 +787,7 @@ class InMemoryInvestigationRepository:
                 if item.get("status") in wanted
             ]
         values.reverse()
+        values.sort(key=worker_candidate_priority)
         return deepcopy(values[:limit])
 
     def get_active_for_alert(
@@ -3045,10 +3067,23 @@ class SQLAlchemyInvestigationRepository:
     ) -> list[dict[str, Any]]:
         if not statuses:
             return []
+        # Ordering has to happen in SQL: sorting after LIMIT would drop a
+        # critical incident that sits past the batch boundary.
         statement = (
             select(InvestigationRecord)
             .where(InvestigationRecord.status.in_(statuses))
-            .order_by(InvestigationRecord.updated_at.asc())
+            .order_by(
+                case(
+                    (InvestigationRecord.status == "waiting_verification", 0),
+                    else_=1,
+                ),
+                case(
+                    _WORKER_SEVERITY_RANK,
+                    value=func.lower(InvestigationRecord.severity),
+                    else_=3,
+                ),
+                InvestigationRecord.updated_at.asc(),
+            )
             .limit(max(1, min(limit, 1000)))
         )
         with self._session_factory() as session:

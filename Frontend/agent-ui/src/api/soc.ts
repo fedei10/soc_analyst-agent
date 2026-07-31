@@ -20,6 +20,7 @@ import type {
   WazuhCollection,
   WazuhHealth
 } from '@/types/soc'
+import { parseSSEBlock, splitSSEBlocks } from '@/lib/sse'
 
 const BACKEND_ROOT = '/api/tsage'
 
@@ -40,6 +41,15 @@ function headers(hasBody = false): HeadersInit {
   return value
 }
 
+/** Send an expired session back to Clerk instead of surfacing a stray toast. */
+function handleUnauthenticated() {
+  if (typeof window === 'undefined') return
+  const returnTo = `${window.location.pathname}${window.location.search}`
+  window.location.assign(
+    `/sign-in?redirect_url=${encodeURIComponent(returnTo)}`
+  )
+}
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`${BACKEND_ROOT}${path}`, {
     ...options,
@@ -52,6 +62,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const body = await response.json().catch(() => ({}))
 
   if (!response.ok) {
+    if (response.status === 401) handleUnauthenticated()
     const error = body?.error
     throw new APIError(
       error?.message || body?.detail || `Request failed (${response.status})`,
@@ -178,18 +189,10 @@ export async function streamAgentMessage(
   let finalResult: AgentChatResponse | null = null
 
   function processEvent(block: string) {
-    const lines = block.split('\n')
-    const event = lines
-      .find((line) => line.startsWith('event:'))
-      ?.slice(6)
-      .trim()
-    const data = lines
-      .filter((line) => line.startsWith('data:'))
-      .map((line) => line.slice(5).trim())
-      .join('\n')
-    if (!event || !data) return
-
-    const payload = JSON.parse(data)
+    const parsed = parseSSEBlock(block)
+    if (!parsed) return
+    const { event } = parsed
+    const payload = JSON.parse(parsed.data)
     if (event === 'activity') {
       handlers.onActivity?.(payload as ChatActivity)
     } else if (event === 'token') {
@@ -207,14 +210,10 @@ export async function streamAgentMessage(
 
   while (true) {
     const { value, done } = await reader.read()
-    buffer += decoder.decode(value, { stream: !done }).replaceAll('\r\n', '\n')
-    let boundary = buffer.indexOf('\n\n')
-    while (boundary !== -1) {
-      const block = buffer.slice(0, boundary)
-      buffer = buffer.slice(boundary + 2)
-      if (block.trim()) processEvent(block)
-      boundary = buffer.indexOf('\n\n')
-    }
+    buffer += decoder.decode(value, { stream: !done })
+    const { blocks, rest } = splitSSEBlocks(buffer)
+    buffer = rest
+    blocks.forEach(processEvent)
     if (done) break
   }
 
@@ -245,6 +244,28 @@ export function queueInvestigation(
     method: 'POST',
     body: JSON.stringify(input)
   })
+}
+
+export function getInvestigation(
+  investigationId: string
+): Promise<Investigation> {
+  return request(
+    `/api/v1/investigations/${encodeURIComponent(investigationId)}`
+  )
+}
+
+/** Resume the approved plan at the execution-authorization gate. */
+export function executeApproved(
+  investigationId: string,
+  approvalId: string
+): Promise<Investigation> {
+  return request(
+    `/api/v1/investigations/${encodeURIComponent(investigationId)}/execute`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ approval_id: approvalId })
+    }
+  )
 }
 
 export function submitApproval(

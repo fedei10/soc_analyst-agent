@@ -1015,6 +1015,92 @@ def test_enqueue_persists_without_running_the_graph():
     assert graph.invoked is False
 
 
+def test_worker_candidates_put_verifications_and_criticals_first():
+    from app.db.repositories.investigations import worker_candidate_priority
+
+    rows = [
+        {"status": "queued", "severity": "low", "updated_at": "1"},
+        {"status": "queued", "severity": "critical", "updated_at": "9"},
+        {"status": "waiting_verification", "severity": "low", "updated_at": "5"},
+        {"status": "queued", "severity": "high", "updated_at": "2"},
+    ]
+    ordered = [
+        (row["status"], row["severity"])
+        for row in sorted(rows, key=worker_candidate_priority)
+    ]
+    assert ordered == [
+        ("waiting_verification", "low"),
+        ("queued", "critical"),
+        ("queued", "high"),
+        ("queued", "low"),
+    ]
+
+
+def test_start_runs_through_the_leased_queued_path():
+    """start() must not invoke the graph outside run_queued's incident lease."""
+
+    repository = InMemoryInvestigationRepository()
+    graph = create_mape_k_graph(
+        monitor=WazuhMonitor(gateway=FakeWazuhGateway(), cache=MemoryCache()),
+        analyzer=IncidentAnalyzer(llm=NoLLM(), cache=MemoryCache()),
+        executor=RestrictedExecutor(cache=MemoryCache()),
+    )
+    service = InvestigationService(graph=graph, repository=repository)
+    seen: list[str] = []
+    original = service.run_queued
+
+    def spy(investigation_id, *, organization_id):
+        seen.append(investigation_id)
+        return original(investigation_id, organization_id=organization_id)
+
+    service.run_queued = spy
+    snapshot = service.start(
+        alert_id="alert-0",
+        agent_id="001",
+        organization_id="user-1",
+        owner_user_id="user-1",
+    )
+    assert seen == [snapshot["investigation_id"]]
+    assert snapshot["status"] != "queued"
+
+
+def test_worker_marks_poison_pill_failed_after_retry_limit():
+    class ExplodingGraph:
+        def get_state(self, _config):
+            return SimpleNamespace(values={}, next=[])
+
+        def invoke(self, *_args, **_kwargs):
+            raise RuntimeError("boom")
+
+    repository = InMemoryInvestigationRepository()
+    service = InvestigationService(
+        graph=ExplodingGraph(),
+        repository=repository,
+    )
+    snapshot = service.enqueue(
+        alert_id="alert-poison",
+        organization_id="user-1",
+    )
+
+    for _ in range(settings.MAPEK_WORKER_MAX_ATTEMPTS):
+        service.process_background_once()
+
+    stored = repository.get_snapshot(
+        snapshot["investigation_id"],
+        organization_id="user-1",
+    )
+    assert stored["status"] == "failed"
+    assert stored["worker_attempts"] == settings.MAPEK_WORKER_MAX_ATTEMPTS
+    assert stored["errors"][-1]["code"] == "WORKER_RETRY_LIMIT"
+    assert (
+        repository.list_worker_candidates(
+            statuses=("queued",),
+            limit=10,
+        )
+        == []
+    )
+
+
 def test_service_rejects_execution_when_target_resource_is_locked():
     repository = InMemoryInvestigationRepository()
     graph = create_mape_k_graph(

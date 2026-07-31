@@ -10,6 +10,7 @@ from app.services.wazuh.exceptions import (
     WazuhAPIError,
     WazuhAuthError,
     WazuhPermissionError,
+    WazuhTimeoutError,
     WazuhValidationError,
 )
 from app.services.wazuh.models import ToolError
@@ -26,7 +27,14 @@ def failure(error: Exception) -> dict[str, Any]:
         result = ToolError(code="WAZUH_FORBIDDEN", message=str(error), retryable=False)
     elif isinstance(error, WazuhValidationError | ValueError):
         result = ToolError(code="INVALID_TOOL_INPUT", message=str(error), retryable=False)
-    elif isinstance(error, (httpx.TimeoutException, opensearch_exc.ConnectionTimeout)):
+    elif isinstance(
+        error,
+        (
+            WazuhTimeoutError,
+            httpx.TimeoutException,
+            opensearch_exc.ConnectionTimeout,
+        ),
+    ):
         result = ToolError(
             code="WAZUH_TIMEOUT",
             message="Wazuh did not respond within the allowed time.",

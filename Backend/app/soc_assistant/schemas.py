@@ -22,6 +22,7 @@ class AssistantCommandName(StrEnum):
     INVESTIGATE = "investigate"
     STATUS = "status"
     HEALTH = "health"
+    EXPLAIN = "explain"
 
 
 class AssistantIntent(StrictModel):

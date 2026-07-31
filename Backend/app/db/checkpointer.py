@@ -65,10 +65,27 @@ def create_investigation_checkpointer() -> CheckpointerHandle:
         )
 
     from langgraph.checkpoint.postgres import PostgresSaver
+    from psycopg.rows import dict_row
+    from psycopg_pool import ConnectionPool
 
-    context = PostgresSaver.from_conn_string(_postgres_uri(url))
-    saver = context.__enter__()
+    # A pool, not from_conn_string's single Connection: a psycopg connection
+    # is not safe for concurrent use, so one connection forces every graph
+    # invocation in the process to serialize behind a lock. PostgresSaver
+    # accepts either (its Conn type is Connection | ConnectionPool), and the
+    # pool is what lets investigations actually run in parallel.
+    pool = ConnectionPool(
+        conninfo=_postgres_uri(url),
+        min_size=1,
+        max_size=max(2, int(settings.MAPEK_CHECKPOINTER_POOL_SIZE)),
+        open=True,
+        kwargs={
+            "autocommit": True,
+            "prepare_threshold": 0,
+            "row_factory": dict_row,
+        },
+    )
+    saver = PostgresSaver(pool)
     saver.serde = create_checkpoint_serializer()
     if settings.DATABASE_AUTO_CREATE:
         saver.setup()
-    return CheckpointerHandle(saver=saver, context=context)
+    return CheckpointerHandle(saver=saver, context=pool)

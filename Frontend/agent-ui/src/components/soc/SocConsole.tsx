@@ -35,6 +35,7 @@ import {
   ReactNode,
   useEffect,
   useMemo,
+  useRef,
   useState
 } from 'react'
 import { toast } from 'sonner'
@@ -43,6 +44,7 @@ import {
   explainCommand,
   getAlertSummary,
   getAssistantCommands,
+  getInvestigation,
   getLiveness,
   getReports,
   getShiftHandoff,
@@ -81,8 +83,12 @@ const SUGGESTED_PROMPTS = [
   '/investigate ALERT-ID --agent 001'
 ]
 
-const INVESTIGATION_POLL_ATTEMPTS = 6
+// A real investigation runs monitor + two LLM stages behind a worker that
+// wakes every few seconds, so the old 6 x 2s budget almost always gave up
+// while the work was still in flight. Back off instead, up to ~5 minutes.
+const INVESTIGATION_POLL_ATTEMPTS = 40
 const INVESTIGATION_POLL_INTERVAL_MS = 2000
+const INVESTIGATION_POLL_MAX_INTERVAL_MS = 15000
 const TERMINAL_INVESTIGATION_STATUSES = new Set([
   'awaiting_approval',
   'completed',
@@ -378,6 +384,10 @@ export default function SocConsole() {
   const { user, isLoaded: userLoaded } = useUser()
   const [view, setView] = useState<WorkspaceView>('overview')
   const [overview, setOverview] = useState<SOCOverview | null>(null)
+  // Generation gate for in-flight investigation polls. Unmount and chat reset
+  // bump it, so loops started before the bump retire themselves without also
+  // disabling loops started after it.
+  const pollGenerationRef = useRef(0)
   const [overviewBusy, setOverviewBusy] = useState(false)
   const [platform, setPlatform] = useState<SOCPlatform | null>(null)
   const [platformBusy, setPlatformBusy] = useState(false)
@@ -535,17 +545,18 @@ export default function SocConsole() {
   }
 
   async function trackInvestigation(investigation: Investigation) {
+    const generation = pollGenerationRef.current
+    // The user navigated away, signed out, or reset the chat - stop polling
+    // rather than keep writing into state nobody is showing any more.
+    const live = () => pollGenerationRef.current === generation
+    let delay = INVESTIGATION_POLL_INTERVAL_MS
     for (let attempt = 0; attempt < INVESTIGATION_POLL_ATTEMPTS; attempt += 1) {
-      await new Promise((resolve) =>
-        setTimeout(resolve, INVESTIGATION_POLL_INTERVAL_MS)
-      )
+      await new Promise((resolve) => setTimeout(resolve, delay))
+      if (!live()) return
+      delay = Math.min(delay * 1.5, INVESTIGATION_POLL_MAX_INTERVAL_MS)
       try {
-        const nextOverview = await getSOCOverview()
-        setOverview(nextOverview)
-        const latest = nextOverview.recent_investigations.find(
-          (item) => item.investigation_id === investigation.investigation_id
-        )
-        if (!latest) continue
+        const latest = await getInvestigation(investigation.investigation_id)
+        if (!live()) return
         updateInvestigationProgress(
           latest.investigation_id,
           latest.status,
@@ -556,6 +567,8 @@ export default function SocConsole() {
         break
       }
     }
+    if (!live()) return
+    await refreshOverview()
     await refreshPlatform()
   }
 
@@ -571,6 +584,13 @@ export default function SocConsole() {
     setView('chat')
     void trackInvestigation(investigation)
   }
+
+  useEffect(
+    () => () => {
+      pollGenerationRef.current += 1
+    },
+    []
+  )
 
   useEffect(() => {
     if (!userLoaded || !userId) return
@@ -593,6 +613,8 @@ export default function SocConsole() {
   }
 
   function resetChat() {
+    // Abandon polls for investigations whose chat cards are about to vanish.
+    pollGenerationRef.current += 1
     const nextConversationId = createClientId()
     setMessages([])
     setChatInput('')

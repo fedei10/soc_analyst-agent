@@ -20,7 +20,7 @@ import structlog
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.errors import GraphRecursionError
-from langgraph.prebuilt import create_react_agent
+from langgraph.prebuilt import ToolNode, create_react_agent
 
 from app.config import settings
 from app.core.observability.callbacks import observability_callbacks
@@ -33,6 +33,7 @@ from app.orchestration.investigation_service import (
     get_investigation_service,
 )
 from app.services.wazuh.gateway import WazuhGateway
+from app.services.wazuh.tool_results import failure as wazuh_tool_failure
 from app.utils.helpers import gather
 from app.soc_assistant.references import (
     InvestigationReferenceError,
@@ -192,6 +193,26 @@ def _clip(value: Any) -> str:
             ],
         }
     )
+
+
+def _safe_tool_error(error: Exception) -> str:
+    """Return a model-visible failure without leaking exception internals."""
+    failed = wazuh_tool_failure(error)
+    if failed["error"]["code"] == "WAZUH_TOOL_ERROR":
+        failed = {
+            "ok": False,
+            "error": {
+                "code": "TOOL_EXECUTION_FAILED",
+                "message": "The selected SOC tool could not complete.",
+                "retryable": False,
+            },
+        }
+    logger.warning(
+        "soc_tool_agent_tool_failed",
+        error_type=type(error).__name__,
+        error_code=failed["error"]["code"],
+    )
+    return json.dumps(failed)
 
 
 def build_tools(
@@ -704,9 +725,14 @@ class SOCToolAgent:
             created_by=created_by,
             conversation_id=conversation_id,
         )
+        selected_tools = _select_agent_tools(question, available_tools)
+        tool_node = ToolNode(
+            selected_tools,
+            handle_tool_errors=_safe_tool_error,
+        )
         agent = create_react_agent(
             self.llm.get_client(),
-            _select_agent_tools(question, available_tools),
+            tool_node,
             prompt=SYSTEM_PROMPT,
         )
         try:
@@ -737,9 +763,10 @@ class SOCToolAgent:
         for message in result["messages"]:
             if isinstance(message, ToolMessage):
                 tool_calls.append(str(message.name))
-                # ToolNode swallows tool exceptions and hands the text back to
-                # the model, which is free to narrate success anyway. Record
-                # the failure here so the answer cannot hide it.
+                # Some tools may deliberately return an error ToolMessage.
+                # Runtime exceptions escape agent.invoke and are handled by
+                # the assistant service; record explicit error messages here
+                # so the model cannot narrate success over them either.
                 if getattr(message, "status", None) == "error":
                     failed_tools.append(str(message.name))
                 found = self._alert_id_from_tool_result(

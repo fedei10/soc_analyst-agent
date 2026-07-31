@@ -47,6 +47,7 @@ def main(argv: list[str] | None = None) -> None:
             logger.error(
                 "alert_ingestion_cycle_failed",
                 error_type=type(exc).__name__,
+                exc_info=True,
             )
         elapsed = time.monotonic() - started
         delay = max(1.0, settings.WAZUH_INGESTION_INTERVAL_SECONDS - elapsed)

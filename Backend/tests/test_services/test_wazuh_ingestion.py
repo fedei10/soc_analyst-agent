@@ -330,3 +330,45 @@ def test_correlation_marks_every_group_member_beyond_evidence_display_cap():
     )
     with pytest.raises(IngestionAlreadyRunningError):
         service.ingest()
+
+
+class _Finding:
+    def __init__(self, *, recommended=True, score=12):
+        self.investigation_recommended = recommended
+        self.severity_score = score
+
+
+class _Verdict:
+    def __init__(self, *, verdict="malicious", confidence=0.9):
+        self.verdict = verdict
+        self.confidence = confidence
+
+
+def test_auto_investigate_is_off_by_default(monkeypatch):
+    monkeypatch.setattr(settings, "MAPEK_AUTO_INVESTIGATE_ENABLED", False)
+    assert (
+        AlertIngestionService._should_auto_investigate(_Finding(), _Verdict())
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "finding,verdict,expected",
+    [
+        (_Finding(), _Verdict(), True),
+        # Not severe enough for the aggregator to recommend it.
+        (_Finding(recommended=False), _Verdict(), False),
+        # Benign and inconclusive verdicts must never open an incident.
+        (_Finding(), _Verdict(verdict="benign"), False),
+        (_Finding(), _Verdict(verdict="inconclusive"), False),
+        # Below the confidence floor.
+        (_Finding(), _Verdict(confidence=0.5), False),
+    ],
+)
+def test_auto_investigate_policy_gate(monkeypatch, finding, verdict, expected):
+    monkeypatch.setattr(settings, "MAPEK_AUTO_INVESTIGATE_ENABLED", True)
+    monkeypatch.setattr(settings, "MAPEK_AUTO_INVESTIGATE_MIN_CONFIDENCE", 0.7)
+    assert (
+        AlertIngestionService._should_auto_investigate(finding, verdict)
+        is expected
+    )

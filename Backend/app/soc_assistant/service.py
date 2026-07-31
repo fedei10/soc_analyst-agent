@@ -35,6 +35,7 @@ from app.services.wazuh.normalization.serializers import (
 )
 from app.services.wazuh.triage.service import run_triage
 from app.soc_assistant.catalog import public_catalog
+from app.soc_assistant.command_explainer import MAX_COMMAND_LENGTH, explain_command
 from app.soc_assistant.question_agent import SOCQuestionAgent
 from app.soc_assistant.tool_agent import SOCToolAgent
 from app.soc_assistant.router import AssistantIntentRouter
@@ -53,8 +54,8 @@ from app.soc_assistant.schemas import (
 INDICATOR_TYPES = {"ip", "domain", "hash", "process", "user", "path", "other"}
 RUNNING_ACTIVITY = {
     AssistantCommandName.CHAT: (
-        "soc_question_agent",
-        "Preparing a read-only SOC answer",
+        "soc_tool_agent",
+        "Preparing an evidence-backed SOC answer",
     ),
     AssistantCommandName.ALERTS: (
         "search_alerts",
@@ -84,12 +85,17 @@ RUNNING_ACTIVITY = {
         "wazuh_health",
         "Checking Wazuh manager and indexer connectivity",
     ),
+    AssistantCommandName.EXPLAIN: (
+        "explain_command",
+        "Analyzing the command line as untrusted data",
+    ),
     AssistantCommandName.HELP: (
         None,
         "Loading the SOC capability catalog",
     ),
 }
 WAZUH_BACKED_COMMANDS = {
+    AssistantCommandName.CHAT,
     AssistantCommandName.ALERTS,
     AssistantCommandName.SUMMARY,
     AssistantCommandName.HUNT,
@@ -400,6 +406,14 @@ class SOCAssistant:
                 "Retry with a smaller window, for example `/alerts --hours 1 --limit 10`.",
             ],
         }
+        if command == AssistantCommandName.CHAT:
+            payload.update(
+                {
+                    "display_mode": "conversation",
+                    "answer_type": "live_data_unavailable",
+                    "grounded": False,
+                }
+            )
         return message, payload, [tool] if tool else [], {}
 
     @staticmethod
@@ -554,6 +568,11 @@ class SOCAssistant:
                         [],
                         {},
                     )
+                if _is_wazuh_runtime_error(exc):
+                    # A live-tool failure must remain visible. Falling back
+                    # to the tool-less question agent would turn an outage
+                    # into a fluent but ungrounded SOC answer.
+                    raise
                 # Fall through to the context-primed question agent.
                 pass
             try:
@@ -611,6 +630,32 @@ class SOCAssistant:
                 "Choose a capability below or type `/` to search commands.",
                 {"commands": catalog},
                 [],
+                {},
+            )
+
+        if command == AssistantCommandName.EXPLAIN:
+            command_line = str(arguments.get("command") or "").strip()
+            if not command_line:
+                return (
+                    "Provide a command line, for example `/explain whoami`.",
+                    {"required": ["command"]},
+                    [],
+                    {},
+                )
+            explanation, explanation_usage = explain_command(
+                command_line[:MAX_COMMAND_LENGTH]
+            )
+            payload = explanation.model_dump(mode="json")
+            payload.update(
+                {
+                    "display_mode": "command_explanation",
+                    "model_usage": explanation_usage,
+                }
+            )
+            return (
+                explanation.plain_english,
+                payload,
+                ["explain_command"],
                 {},
             )
 

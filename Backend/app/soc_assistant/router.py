@@ -28,6 +28,54 @@ FLAG_OPTIONS = {
     "--all": "all_results",
 }
 
+COMMAND_ARGUMENTS = {
+    AssistantCommandName.CHAT: {"question"},
+    AssistantCommandName.HELP: set(),
+    AssistantCommandName.ALERTS: {
+        "hours",
+        "min_level",
+        "limit",
+        "agent_id",
+        "text",
+        "since",
+        "severity",
+        "new_only",
+        "open_only",
+        "all_results",
+    },
+    AssistantCommandName.SUMMARY: {"hours"},
+    AssistantCommandName.HUNT: {
+        "indicator",
+        "indicator_type",
+        "hours",
+        "limit",
+        "agent_id",
+    },
+    AssistantCommandName.TRIAGE: {"hours", "min_level", "limit"},
+    AssistantCommandName.INVESTIGATE: {"alert_id", "agent_id"},
+    AssistantCommandName.STATUS: {"investigation_id"},
+    AssistantCommandName.HEALTH: set(),
+    AssistantCommandName.EXPLAIN: {"command"},
+}
+
+ARGUMENT_ALIASES = {
+    "agent": "agent_id",
+    "alert": "alert_id",
+    "investigation": "investigation_id",
+    "query": "text",
+}
+
+INVALID_ALERT_REFERENCES = {
+    "alert",
+    "alerts",
+    "it",
+    "this",
+    "that",
+    "these",
+    "those",
+    "investigation",
+}
+
 # Bare, targetless imperatives ("analyze them", "check these", "what do you
 # think", a lone "investigate") name nothing concrete to filter on. Routing
 # these into the tool-calling chat agent invites it to chain several broad
@@ -111,9 +159,84 @@ class AssistantIntentRouter:
             if not positional:
                 raise ValueError("/ask requires a question.")
             options["question"] = " ".join(positional)
+        elif command.name == AssistantCommandName.EXPLAIN:
+            if not positional:
+                raise ValueError("/explain requires a command line.")
+            options["command"] = " ".join(positional)
         elif positional:
             raise ValueError(f"{command.slash} does not accept positional arguments.")
         return AssistantIntent(command=command.name, arguments=options)
+
+    @staticmethod
+    def _canonical_argument_name(name: str) -> str:
+        snake = re.sub(r"(?<!^)(?=[A-Z])", "_", name).replace("-", "_").lower()
+        return ARGUMENT_ALIASES.get(snake, snake)
+
+    @classmethod
+    def _normalize_arguments(
+        cls,
+        command: AssistantCommandName,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        allowed = COMMAND_ARGUMENTS[command]
+        normalized: dict[str, Any] = {}
+        unsupported: list[str] = []
+        for name, value in arguments.items():
+            canonical = cls._canonical_argument_name(str(name))
+            if canonical not in allowed:
+                unsupported.append(str(name))
+                continue
+            normalized[canonical] = value
+        if unsupported:
+            rendered = ", ".join(sorted(unsupported))
+            raise ValueError(
+                f"Unsupported arguments for {command.value}: {rendered}"
+            )
+        return normalized
+
+    @staticmethod
+    def _alert_id(message: str) -> str | None:
+        patterns = (
+            # IDs commonly include the word "alert" as part of the token.
+            r"\b(alert[-_][A-Za-z0-9][A-Za-z0-9_.-]{1,250})\b",
+            # Explicit references: "alert 12345", "alert id ALERT-99".
+            r"\balert(?:\s+id)?\s*(?:[:#]\s*)?([A-Za-z0-9][A-Za-z0-9_.-]{2,255})\b",
+            # Compact formal forms such as "mapek 12345".
+            r"\b(?:investigate|mapek)\s*[:#]?\s+([A-Za-z0-9][A-Za-z0-9_.-]{2,255})\b",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, message, re.I)
+            if match and match.group(1).lower() not in INVALID_ALERT_REFERENCES:
+                return match.group(1)
+        return None
+
+    @staticmethod
+    def _alert_filters(message: str) -> dict[str, Any]:
+        lower = message.lower()
+        arguments: dict[str, Any] = {}
+        duration = re.search(
+            r"\blast\s+(?:(\d+)\s+)?(hour|hours|day|days)\b",
+            lower,
+        )
+        if duration:
+            quantity = int(duration.group(1) or 1)
+            arguments["hours"] = quantity * (
+                24 if duration.group(2).startswith("day") else 1
+            )
+        elif "overnight" in lower:
+            arguments["hours"] = 12
+        elif "today" in lower:
+            arguments["hours"] = 24
+
+        if "critical" in lower:
+            arguments["severity"] = "critical"
+        elif "high severity" in lower or "high-severity" in lower:
+            arguments["severity"] = "high"
+
+        agent = re.search(r"\bagent(?:\s+id)?\s*[:#]?\s*([A-Za-z0-9_.-]+)", message, re.I)
+        if agent:
+            arguments["agent_id"] = agent.group(1)
+        return arguments
 
     @staticmethod
     def _indicator(message: str) -> tuple[str | None, str]:
@@ -140,11 +263,7 @@ class AssistantIntentRouter:
                 arguments={"vague_fallback": True},
             )
         investigation = re.search(r"\bINV-[A-Za-z0-9-]+\b", message, re.I)
-        alert = re.search(
-            r"(?:alert(?:\s+id)?|mapek|investigate)\s*[:#]?\s+([A-Za-z0-9_.-]{3,256})",
-            message,
-            re.I,
-        )
+        alert_id = self._alert_id(message)
         if stripped in {
             "hi",
             "hello",
@@ -165,6 +284,17 @@ class AssistantIntentRouter:
             for phrase in ("this alert", "that alert", "previous alert")
         ):
             return AssistantIntent(command=AssistantCommandName.STATUS)
+        explain = re.search(
+            r"\b(?:explain(?:\s+this|\s+the)?\s+command|"
+            r"what\s+does\s+(?:this|the)\s+command\s+do)\s*[:\-]?\s*(.+)$",
+            message,
+            re.I,
+        )
+        if explain and explain.group(1).strip():
+            return AssistantIntent(
+                command=AssistantCommandName.EXPLAIN,
+                arguments={"command": explain.group(1).strip()},
+            )
         if any(
             phrase in normalized
             for phrase in (
@@ -180,7 +310,12 @@ class AssistantIntentRouter:
         ):
             return AssistantIntent(
                 command=AssistantCommandName.INVESTIGATE,
-                arguments={"alert_id": alert.group(1)} if alert else {},
+                arguments={"alert_id": alert_id} if alert_id else {},
+            )
+        if re.search(r"\b(isolate|contain|block|remediate)\b", lower):
+            return AssistantIntent(
+                command=AssistantCommandName.CHAT,
+                arguments={"question": message},
             )
         if "investigate" in lower:
             # Casual phrasing ("could u investigate him 1.2.3.4") that isn't
@@ -207,7 +342,13 @@ class AssistantIntentRouter:
             for phrase in ("triage findings", "triage alerts", "show findings")
         ):
             return AssistantIntent(command=AssistantCommandName.TRIAGE)
-        if any(
+        alert_query = bool(re.search(r"\balerts?\b", lower)) and bool(
+            re.search(
+                r"\b(show|list|get|find|any|which|what|recent|latest|newest|came)\b",
+                lower,
+            )
+        )
+        if alert_query or any(
             phrase in lower
             for phrase in (
                 "get only alerts",
@@ -218,10 +359,22 @@ class AssistantIntentRouter:
                 "wazuh alerts",
             )
         ):
-            return AssistantIntent(command=AssistantCommandName.ALERTS)
+            return AssistantIntent(
+                command=AssistantCommandName.ALERTS,
+                arguments=self._alert_filters(message),
+            )
         if any(phrase in lower for phrase in ("alert summary", "alert overview", "how many alerts")):
             return AssistantIntent(command=AssistantCommandName.SUMMARY)
-        if any(phrase in lower for phrase in ("wazuh health", "service health", "connections")):
+        if any(
+            phrase in lower
+            for phrase in (
+                "wazuh health",
+                "service health",
+                "connections",
+                "connection status",
+                "are we connected",
+            )
+        ):
             return AssistantIntent(command=AssistantCommandName.HEALTH)
         if lower.strip() in {"help", "what can you do", "options", "commands"}:
             return AssistantIntent(command=AssistantCommandName.HELP)
@@ -276,8 +429,15 @@ class AssistantIntentRouter:
                     },
                 ],
             )
-            routed = AssistantIntent.model_validate(intent).model_copy(
-                update={"source": "oxy"}
+            routed = AssistantIntent.model_validate(intent)
+            routed = routed.model_copy(
+                update={
+                    "arguments": self._normalize_arguments(
+                        routed.command,
+                        routed.arguments,
+                    ),
+                    "source": "oxy",
+                }
             )
             if routed.confidence < 0.65:
                 # An uncertain classification is not a reason to dead-end the

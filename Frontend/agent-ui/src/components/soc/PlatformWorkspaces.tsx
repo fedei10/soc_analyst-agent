@@ -29,6 +29,7 @@ import { FormEvent, ReactNode, useEffect, useState } from 'react'
 import { toast } from 'sonner'
 
 import {
+  executeApproved,
   getAgents,
   getAlerts,
   getPrioritizedVulnerabilities,
@@ -49,6 +50,16 @@ import type {
   WazuhAlert,
   WorkspaceView
 } from '@/types/soc'
+
+/** Response-action statuses that mean the plan already left the gate. */
+const EXECUTED_ACTION_STATUSES = new Set([
+  'accepted',
+  'applied',
+  'dry_run',
+  'executed',
+  'failed',
+  'outcome_unknown'
+])
 
 function titleCase(value: string): string {
   return value
@@ -195,6 +206,15 @@ export default function PlatformWorkspaces({
   const [vulns, setVulns] = useState<PrioritizedVulnerability[]>([])
   const [vulnsBusy, setVulnsBusy] = useState(false)
   const [telegramTestBusy, setTelegramTestBusy] = useState(false)
+  const [approvalComments, setApprovalComments] = useState<
+    Record<string, string>
+  >({})
+  const [decidingApprovalId, setDecidingApprovalId] = useState<string | null>(
+    null
+  )
+  const [executingApprovalId, setExecutingApprovalId] = useState<string | null>(
+    null
+  )
   const [services, setServices] = useState<ServicesHealth | null>(null)
   const [storage, setStorage] = useState<StorageHealth | null>(null)
   const [healthBusy, setHealthBusy] = useState(false)
@@ -295,21 +315,58 @@ export default function PlatformWorkspaces({
     approvalId: string,
     decision: 'approve' | 'reject'
   ) {
+    const comment = (approvalComments[approvalId] || '').trim()
+    if (decision === 'reject' && !comment) {
+      toast.error('A rejection needs a reason for the audit trail.')
+      return
+    }
+    setDecidingApprovalId(approvalId)
     try {
       await submitApproval(investigationId, {
         approval_id: approvalId,
-        decision
+        decision,
+        comment: comment || undefined
       })
       toast.success(
         decision === 'approve'
-          ? 'Response plan approved.'
+          ? 'Response plan approved. Run it from Awaiting execution.'
           : 'Response plan rejected.'
       )
+      setApprovalComments((current) => {
+        const next = { ...current }
+        delete next[approvalId]
+        return next
+      })
       await onRefreshPlatform()
     } catch (error) {
       toast.error(
         error instanceof Error ? error.message : 'Decision could not be saved.'
       )
+    } finally {
+      setDecidingApprovalId(null)
+    }
+  }
+
+  // Approval only records the decision; the workflow parks at the execution
+  // gate until this claim arrives, so an approved plan needs an explicit run.
+  async function handleExecute(investigationId: string, approvalId: string) {
+    setExecutingApprovalId(approvalId)
+    try {
+      const investigation = await executeApproved(investigationId, approvalId)
+      toast.success(
+        `Response executed for ${investigation.investigation_id} (${titleCase(
+          investigation.status
+        )}).`
+      )
+      await onRefreshPlatform()
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : 'The response plan could not be executed.'
+      )
+    } finally {
+      setExecutingApprovalId(null)
     }
   }
 
@@ -594,6 +651,19 @@ export default function PlatformWorkspaces({
     const pending =
       platform?.pending_approvals.filter((item) => item.status === 'pending') ||
       []
+    // An approved plan is still parked at the execution gate until a response
+    // action for its investigation actually reaches a run state.
+    const ranInvestigations = new Set(
+      (platform?.response_actions || [])
+        .filter((item) => EXECUTED_ACTION_STATUSES.has(item.status))
+        .map((item) => item.investigation_id)
+    )
+    const awaitingExecution =
+      platform?.pending_approvals.filter(
+        (item) =>
+          item.status === 'approve' &&
+          !ranInvestigations.has(item.investigation_id)
+      ) || []
     return (
       <div className="platform-workspace">
         <WorkspaceHeader
@@ -657,6 +727,18 @@ export default function PlatformWorkspaces({
                     </div>
                   ))}
                 </div>
+                <textarea
+                  className="approval-comment"
+                  rows={2}
+                  placeholder="Decision note (required to reject)"
+                  value={approvalComments[approval.approval_id] || ''}
+                  onChange={(event) =>
+                    setApprovalComments((current) => ({
+                      ...current,
+                      [approval.approval_id]: event.target.value
+                    }))
+                  }
+                />
                 <footer>
                   <span>
                     Expires {new Date(approval.expires_at).toLocaleString()}
@@ -664,6 +746,7 @@ export default function PlatformWorkspaces({
                   <div>
                     <button
                       className="button button-danger"
+                      disabled={decidingApprovalId === approval.approval_id}
                       onClick={() =>
                         void handleApproval(
                           approval.investigation_id,
@@ -677,6 +760,7 @@ export default function PlatformWorkspaces({
                     </button>
                     <button
                       className="button button-primary"
+                      disabled={decidingApprovalId === approval.approval_id}
                       onClick={() =>
                         void handleApproval(
                           approval.investigation_id,
@@ -697,6 +781,60 @@ export default function PlatformWorkspaces({
                 icon={<CheckCircle2 size={24} />}
                 title="No pending approvals"
                 detail="Proposed response actions will appear here."
+              />
+            )}
+          </div>
+        </Panel>
+        <Panel title="Awaiting execution" icon={<Play size={17} />}>
+          <div className="approval-queue">
+            {awaitingExecution.map((approval) => (
+              <article key={approval.approval_id}>
+                <header>
+                  <div className="queue-title">
+                    <strong>{approval.investigation_id}</strong>
+                    <span>
+                      Approved · {approval.proposed_actions.length} action
+                      {approval.proposed_actions.length === 1 ? '' : 's'} ready
+                    </span>
+                  </div>
+                  <Status value="approved" />
+                </header>
+                <div className="queue-actions">
+                  {approval.proposed_actions.map((action) => (
+                    <div key={action.action_id}>
+                      <strong>{titleCase(action.action_type)}</strong>
+                      <span>{action.target}</span>
+                      <small>Risk {action.risk_level}</small>
+                    </div>
+                  ))}
+                </div>
+                <footer>
+                  <span>
+                    Expires {new Date(approval.expires_at).toLocaleString()}
+                  </span>
+                  <button
+                    className="button button-primary"
+                    disabled={executingApprovalId === approval.approval_id}
+                    onClick={() =>
+                      void handleExecute(
+                        approval.investigation_id,
+                        approval.approval_id
+                      )
+                    }
+                  >
+                    <Play size={14} />
+                    {executingApprovalId === approval.approval_id
+                      ? 'Executing...'
+                      : 'Execute plan'}
+                  </button>
+                </footer>
+              </article>
+            ))}
+            {!platformBusy && awaitingExecution.length === 0 && (
+              <EmptyState
+                icon={<CheckCircle2 size={24} />}
+                title="Nothing awaiting execution"
+                detail="Approved response plans appear here until they are run."
               />
             )}
           </div>

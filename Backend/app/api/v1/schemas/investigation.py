@@ -99,6 +99,10 @@ class ApprovalDecisionInput(APIModel):
     )
 
 
+class ExecutionInput(APIModel):
+    approval_id: str = Field(min_length=1, max_length=100)
+
+
 class InvestigationStartInput(APIModel):
     alert_id: str = Field(min_length=1, max_length=256)
     agent_id: str | None = Field(

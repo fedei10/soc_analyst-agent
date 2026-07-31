@@ -3,11 +3,15 @@
 import json
 
 from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.tools import tool
 from langgraph.errors import GraphRecursionError
+from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.prebuilt import ToolNode
 
 from app.db.repositories.reports import InMemoryReportRepository
 from app.soc_assistant.tool_agent import (
     SOCToolAgent,
+    _safe_tool_error,
     _select_agent_tools,
     build_tools,
 )
@@ -172,6 +176,46 @@ def test_answer_flags_a_failed_tool_the_model_narrated_as_success(monkeypatch):
     assert tool_calls == ["save_report"]
     assert "Tool failure" in answer
     assert "`save_report`" in answer
+
+
+def test_tool_node_converts_runtime_errors_to_safe_error_messages():
+    @tool
+    def failing_lookup(indicator: str) -> str:
+        """Look up one indicator."""
+        raise RuntimeError("postgresql://secret-user:secret-password@db")
+
+    node = ToolNode(
+        [failing_lookup],
+        handle_tool_errors=_safe_tool_error,
+    )
+    builder = StateGraph(MessagesState)
+    builder.add_node("tools", node)
+    builder.add_edge(START, "tools")
+    builder.add_edge("tools", END)
+    graph = builder.compile()
+    result = graph.invoke(
+        {
+            "messages": [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "failing_lookup",
+                            "args": {"indicator": "192.0.2.10"},
+                            "id": "call-1",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ]
+        }
+    )
+
+    message = result["messages"][-1]
+    assert isinstance(message, ToolMessage)
+    assert message.status == "error"
+    assert "TOOL_EXECUTION_FAILED" in str(message.content)
+    assert "secret-password" not in str(message.content)
 
 
 def test_save_report_truncates_oversized_fields():

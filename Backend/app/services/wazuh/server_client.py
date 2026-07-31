@@ -184,23 +184,43 @@ class _AuthenticatedWazuhTransport:
         token: str,
         timeout_seconds: float | None = None,
     ) -> httpx.Response:
-        try:
-            request_kwargs: dict[str, Any] = {
-                "headers": {"Authorization": f"Bearer {token}"},
-                "params": params,
-                "json": json,
-            }
-            if timeout_seconds is not None:
-                request_kwargs["timeout"] = timeout_seconds
-            return self._client.request(method, path, **request_kwargs)
-        except httpx.TimeoutException as exc:
-            raise WazuhTimeoutError(
-                f"Wazuh API {method} {path} exceeded its configured timeout."
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise WazuhAPIError(
-                f"Wazuh API {method} {path} transport error: {exc.__class__.__name__}"
-            ) from exc
+        request_kwargs: dict[str, Any] = {
+            "headers": {"Authorization": f"Bearer {token}"},
+            "params": params,
+            "json": json,
+        }
+        if timeout_seconds is not None:
+            request_kwargs["timeout"] = timeout_seconds
+        attempts = max(1, int(settings.WAZUH_REQUEST_MAX_ATTEMPTS))
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._client.request(method, path, **request_kwargs)
+            except httpx.TimeoutException as exc:
+                # A connect timeout never reached Wazuh, so replaying it is
+                # safe. A read timeout means the command may already have been
+                # applied - retrying an active response would execute it
+                # twice, so only idempotent reads get a second chance.
+                retryable = isinstance(exc, httpx.ConnectTimeout) or (
+                    method == "GET"
+                )
+                if not retryable or attempt == attempts:
+                    raise WazuhTimeoutError(
+                        f"Wazuh API {method} {path} exceeded its configured "
+                        "timeout."
+                    ) from exc
+            except httpx.ConnectError as exc:
+                if attempt == attempts:
+                    raise WazuhAPIError(
+                        f"Wazuh API {method} {path} transport error: "
+                        f"{exc.__class__.__name__}"
+                    ) from exc
+            except httpx.HTTPError as exc:
+                raise WazuhAPIError(
+                    f"Wazuh API {method} {path} transport error: "
+                    f"{exc.__class__.__name__}"
+                ) from exc
+            time.sleep(min(2.0, 0.25 * (2 ** (attempt - 1))))
+        raise WazuhAPIError(f"Wazuh API {method} {path} exhausted its retries.")
 
     @staticmethod
     def _raise_for_http_status(response: httpx.Response, method: str, path: str) -> None:

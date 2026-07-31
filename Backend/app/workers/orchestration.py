@@ -81,6 +81,7 @@ def main(argv: list[str] | None = None) -> None:
             logger.error(
                 "orchestration_cycle_failed",
                 error_type=type(exc).__name__,
+                exc_info=True,
             )
         delay = max(1.0, interval - (time.monotonic() - started))
         deadline = time.monotonic() + delay

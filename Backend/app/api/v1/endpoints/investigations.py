@@ -11,6 +11,7 @@ from fastapi.responses import StreamingResponse
 from app.api.auth.deps import (
     AuthPrincipal,
     require_approve,
+    require_execute,
     require_investigate,
     require_read,
 )
@@ -18,12 +19,16 @@ from app.api.v1.schemas.investigation import (
     AgentChatRequest,
     ApprovalDecisionInput,
     CommandExplainInput,
+    ExecutionInput,
     InvestigationStartInput,
 )
 from app.config import settings
 from app.orchestration.investigation_service import (
     InvestigationNotFoundError,
     get_investigation_service,
+)
+from app.db.repositories.investigations import (
+    ResponseExecutionConflictError,
 )
 from app.db.repositories.findings import (
     FindingRepository,
@@ -58,6 +63,7 @@ InvestigatorPrincipal = Annotated[
     Depends(require_investigate),
 ]
 ApproverPrincipal = Annotated[AuthPrincipal, Depends(require_approve)]
+ExecutorPrincipal = Annotated[AuthPrincipal, Depends(require_execute)]
 AssistantGateway = Annotated[WazuhGateway, Depends(get_wazuh_gateway)]
 FindingRepo = Annotated[FindingRepository, Depends(get_finding_repository)]
 activity_store = EphemeralRedis()
@@ -224,6 +230,43 @@ def decide_investigation(
         actor_roles=principal.roles,
         organization_id=principal.scope_id,
     )
+    _publish_activity(snapshot)
+    return {"data": _public_data(snapshot)}
+
+
+@read.get("/investigations/{investigation_id}", tags=["investigations"])
+def get_investigation(investigation_id: str, principal: ReadPrincipal):
+    return {
+        "data": _public_data(
+            _snapshot(investigation_id, organization_id=principal.scope_id)
+        )
+    }
+
+
+@write.post("/investigations/{investigation_id}/execute", tags=["investigations"])
+def execute_investigation(
+    investigation_id: str,
+    request: ExecutionInput,
+    principal: ExecutorPrincipal,
+):
+    """Resume an approved plan at the execution-authorization interrupt.
+
+    Approval alone only records the decision; the graph parks at
+    execution_authorization until this claim arrives, so without this route an
+    approved plan never runs.
+    """
+    try:
+        snapshot = get_investigation_service().execute_approved(
+            investigation_id,
+            approval_id=request.approval_id,
+            executed_by=principal.user_id,
+            executor_roles=principal.roles,
+            organization_id=principal.scope_id,
+        )
+    except InvestigationNotFoundError:
+        raise HTTPException(404, f"Investigation {investigation_id} not found.")
+    except ResponseExecutionConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc
     _publish_activity(snapshot)
     return {"data": _public_data(snapshot)}
 

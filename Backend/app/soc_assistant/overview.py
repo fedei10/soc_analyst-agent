@@ -72,6 +72,9 @@ def _recent_investigation(snapshot: dict[str, Any]) -> dict[str, Any]:
         "current_stage": snapshot.get("current_stage"),
         "severity": snapshot.get("severity"),
         "confidence": snapshot.get("confidence"),
+        # Distinguishes "the worker gave up on this" (WORKER_RETRY_LIMIT) from
+        # a workflow that ran and concluded badly.
+        "failure_code": snapshot.get("failure_code"),
         "updated_at": timestamps[-1] if timestamps else None,
     }
 
