@@ -26,6 +26,9 @@ class AssistantCommandName(StrEnum):
     CONTINUE = "continue"
     HEALTH = "health"
     EXPLAIN = "explain"
+    # "I cannot resolve what you meant." A representable answer, so the
+    # router stops having to guess or crash when an entity is ambiguous.
+    CLARIFY = "clarify"
 
 
 class AssistantIntent(StrictModel):
@@ -33,6 +36,8 @@ class AssistantIntent(StrictModel):
     arguments: dict[str, Any] = Field(default_factory=dict)
     confidence: float = Field(default=1.0, ge=0, le=1)
     source: str = "deterministic"
+    # Set with command=CLARIFY: what to ask before anything can proceed.
+    question: str | None = Field(default=None, max_length=500)
 
 
 class QuestionAnswer(StrictModel):

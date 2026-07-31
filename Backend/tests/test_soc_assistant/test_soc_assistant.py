@@ -24,12 +24,12 @@ from app.db.repositories.reports import InMemoryReportRepository
 
 
 class FailingLLM:
-    def invoke_structured(self, schema, messages):
+    def invoke_structured(self, schema, messages, **_kwargs):
         raise RuntimeError("provider unavailable")
 
 
 class RoutedLLM:
-    def invoke_structured(self, schema, messages):
+    def invoke_structured(self, schema, messages, **_kwargs):
         return (
             AssistantIntent(
                 command=AssistantCommandName.SUMMARY,
@@ -40,7 +40,7 @@ class RoutedLLM:
 
 
 class LowConfidenceLLM:
-    def invoke_structured(self, schema, messages):
+    def invoke_structured(self, schema, messages, **_kwargs):
         return (
             AssistantIntent(
                 command=AssistantCommandName.HELP,
@@ -55,7 +55,7 @@ class ArgumentAliasLLM:
         self.command = command
         self.arguments = arguments
 
-    def invoke_structured(self, schema, messages):
+    def invoke_structured(self, schema, messages, **_kwargs):
         return (
             AssistantIntent(
                 command=self.command,
@@ -306,7 +306,7 @@ def test_ambiguous_language_uses_oxy_classifier_and_fails_soft():
         "Give me an operational picture."
     )
     assert fallback.command == AssistantCommandName.CHAT
-    assert fallback.source == "fallback"
+    assert fallback.source == "router_error"
     assert fallback.arguments["question"] == "Give me an operational picture."
     assert usage == {"input_tokens": 0, "output_tokens": 0}
 
@@ -383,7 +383,7 @@ def test_unknown_oxy_arguments_fail_closed_to_chat():
     intent, _ = router.route("Give me the scoped operational record.")
 
     assert intent.command == AssistantCommandName.CHAT
-    assert intent.source == "fallback"
+    assert intent.source == "router_error"
 
 
 @pytest.mark.parametrize(
@@ -1219,3 +1219,153 @@ def test_chat_get_investigation_status_tool_reports_missing_investigation(
     result = json.loads(raw)
 
     assert "was not found" in result["error"]
+
+
+# --- Section 1: the router must not fail open into a write path ------------
+
+
+class RouterCrashLLM:
+    """Reproduces Groq 400 tool_use_failed on both the forced and retry call."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def invoke_structured(self, schema, messages, **_kwargs):
+        self.calls += 1
+        error = RuntimeError("tool_use_failed: model did not call a tool")
+        error.status_code = 400
+        raise error
+
+
+def test_router_400_degrades_to_router_error_after_one_retry():
+    from app.soc_assistant.router import AssistantIntentRouter
+
+    llm = RouterCrashLLM()
+    intent, _usage = AssistantIntentRouter(llm=llm).route(
+        "yes investigation for the evil u_ser"
+    )
+
+    # Forced call, then exactly one unforced retry.
+    assert llm.calls == 2
+    assert intent.source == "router_error"
+    assert intent.confidence == 0
+
+
+def test_state_changing_tools_are_unreachable_after_a_router_failure():
+    """A crashed router must not be able to create durable state."""
+    from app.soc_assistant.tool_agent import (
+        READ_ONLY_TOOLS,
+        _select_agent_tools,
+    )
+
+    class FakeTool:
+        def __init__(self, name):
+            self.name = name
+
+    tools = [
+        FakeTool(name)
+        for name in (
+            "search_alerts",
+            "alert_summary",
+            "get_alert",
+            "rule_mitre_context",
+            "list_findings",
+            "start_investigation",
+            "get_investigation_status",
+            "save_report",
+        )
+    ]
+    question = "yes investigation for the evil u_ser, save a report"
+
+    trusted = {
+        tool.name
+        for tool in _select_agent_tools(question, tools, allow_state_changes=True)
+    }
+    untrusted = {
+        tool.name
+        for tool in _select_agent_tools(question, tools, allow_state_changes=False)
+    }
+
+    # The phrasing alone would otherwise bind both write tools.
+    assert "start_investigation" in trusted
+    assert "save_report" in trusted
+    assert "start_investigation" not in untrusted
+    assert "save_report" not in untrusted
+    assert untrusted <= READ_ONLY_TOOLS
+    # Read-only capability is retained, so the turn still answers.
+    assert "search_alerts" in untrusted
+
+
+def test_unlisted_tools_are_denied_by_default():
+    """A tool added later is withheld unless declared read-only."""
+    from app.soc_assistant.tool_agent import _select_agent_tools
+
+    class FakeTool:
+        def __init__(self, name):
+            self.name = name
+
+    # Simulates a future mutating tool nobody remembered to blocklist.
+    tools = [FakeTool("search_alerts"), FakeTool("quarantine_host")]
+    selected = {
+        tool.name
+        for tool in _select_agent_tools(
+            "quarantine_host please investigate",
+            tools,
+            allow_state_changes=False,
+        )
+    }
+    assert "quarantine_host" not in selected
+
+
+def test_clarify_intent_round_trips_through_the_schema():
+    from app.soc_assistant.schemas import AssistantCommandName, AssistantIntent
+
+    intent = AssistantIntent(
+        command=AssistantCommandName.CLARIFY,
+        question="Which alert do you mean - there are two for evil_user?",
+        confidence=0.9,
+        source="oxy",
+    )
+    restored = AssistantIntent.model_validate(intent.model_dump(mode="json"))
+    assert restored.command == AssistantCommandName.CLARIFY
+    assert restored.question == intent.question
+
+
+def test_router_failure_is_reported_as_failed_not_completed(monkeypatch):
+    """The operator must be able to see that the router crashed."""
+    monkeypatch.setattr("app.soc_assistant.service.database_url", lambda: None)
+    service = SOCAssistant(
+        gateway=FakeGateway(),
+        investigations=FakeInvestigations(),
+        router=AssistantIntentRouter(llm=RouterCrashLLM()),
+        tool_agent=UnavailableToolAgent(),
+    )
+
+    response = respond(service, "yes investigation for the evil u_ser")
+
+    router_steps = [
+        item
+        for item in response.activities
+        if item.tool == "intent_router"
+    ]
+    assert len(router_steps) == 1
+    assert router_steps[0].status == "failed"
+    assert "failed" in router_steps[0].label.lower()
+
+
+def test_clarify_answers_without_touching_tools_or_state(monkeypatch):
+    monkeypatch.setattr("app.soc_assistant.service.database_url", lambda: None)
+    service, gateway, investigations = assistant()
+
+    message, payload, tools, _ = service._execute(
+        AssistantCommandName.CLARIFY,
+        {"question": "Which alert do you mean?"},
+        organization_id="local",
+        user_id="analyst",
+    )
+
+    assert message == "Which alert do you mean?"
+    assert payload["answer_type"] == "clarification_required"
+    assert tools == []
+    assert gateway.calls == []
+    assert investigations.started == []

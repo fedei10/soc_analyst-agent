@@ -446,6 +446,8 @@ class LLMProvider:
         self,
         schema: type[BaseModel],
         messages: list[dict[str, str]],
+        *,
+        method: str = "function_calling",
     ) -> tuple[BaseModel, dict[str, Any]]:
         rendered = json.dumps(messages, default=str)
         estimated_input_tokens = (len(rendered) + 3) // 4
@@ -454,7 +456,7 @@ class LLMProvider:
         def structured(client: Any) -> Any:
             return client.with_structured_output(
                 schema,
-                method="function_calling",
+                method=method,
                 include_raw=True,
             )
 

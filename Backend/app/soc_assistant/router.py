@@ -7,10 +7,14 @@ import re
 import shlex
 from typing import Any
 
+import structlog
+
 from app.mape_k.llm import LLMProvider, LLMTier, get_llm_provider
 from app.soc_assistant.catalog import COMMANDS, COMMAND_BY_SLASH
 from app.soc_assistant.schemas import AssistantCommandName, AssistantIntent
 
+
+logger = structlog.get_logger("tsage.soc_assistant.router")
 
 OPTION_NAMES = {
     "--hours": "hours",
@@ -438,8 +442,8 @@ class AssistantIntentRouter:
             }
             for command in COMMANDS
         ]
-        try:
-            intent, usage = self.llm.invoke_structured(
+        def classify(method: str):
+            return self.llm.invoke_structured(
                 AssistantIntent,
                 [
                     {
@@ -448,7 +452,11 @@ class AssistantIntentRouter:
                             "Select exactly one SOC capability. Return only arguments "
                             "explicitly present in the message. Use chat for explanatory "
                             "questions or requests for defensive guidance. Use help only "
-                            "when the user asks about available capabilities."
+                            "when the user asks about available capabilities. "
+                            "When the message names an entity you cannot resolve to "
+                            "exactly one candidate, use clarify and put the question "
+                            "to the analyst in the question field - never guess a "
+                            "target."
                         ),
                     },
                     {
@@ -456,7 +464,20 @@ class AssistantIntentRouter:
                         "content": f"Capabilities: {catalog}\nMessage: {message[:2000]}",
                     },
                 ],
+                method=method,
             )
+
+        try:
+            try:
+                intent, usage = classify("function_calling")
+            except Exception as exc:
+                # The provider returns 400 tool_use_failed when the model
+                # answers in prose instead of calling the forced tool - it is
+                # usually trying to ask a question. Give it one unforced shot
+                # before writing the turn off.
+                if getattr(exc, "status_code", None) != 400:
+                    raise
+                intent, usage = classify("json_mode")
             routed = AssistantIntent.model_validate(intent)
             routed = routed.model_copy(
                 update={
@@ -467,6 +488,19 @@ class AssistantIntentRouter:
                     "source": "oxy",
                 }
             )
+            if routed.command == AssistantCommandName.CLARIFY:
+                # Carry the question where the executor reads arguments from.
+                return (
+                    routed.model_copy(
+                        update={
+                            "arguments": {
+                                **routed.arguments,
+                                "question": routed.question or "",
+                            }
+                        }
+                    ),
+                    usage,
+                )
             if routed.confidence < 0.65:
                 # An uncertain classification is not a reason to dead-end the
                 # user at a menu message - hand the raw message to the
@@ -485,12 +519,16 @@ class AssistantIntentRouter:
             # Route to chat rather than a dead-end HELP message: the chat path
             # has its own graceful "model unavailable" fallback, so the user
             # gets an honest answer either way instead of a non-sequitur menu.
+            # source is router_error, not fallback: the turn is degraded, the
+            # UI must show the router step as failed, and state-changing tools
+            # stay unbound because nothing established what the analyst wanted.
+            logger.warning("intent_router_failed", exc_info=True)
             return (
                 AssistantIntent(
                     command=AssistantCommandName.CHAT,
                     arguments={"question": message},
                     confidence=0,
-                    source="fallback",
+                    source="router_error",
                 ),
                 {"input_tokens": 0, "output_tokens": 0},
             )

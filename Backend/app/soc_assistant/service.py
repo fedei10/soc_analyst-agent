@@ -574,7 +574,25 @@ class SOCAssistant:
         conversation_id: str | None = None,
         recent_context: dict[str, str] | None = None,
         conversation_history: list[dict[str, str]] | None = None,
+        intent_source: str = "deterministic",
+        intent_confidence: float = 1.0,
     ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
+        if command == AssistantCommandName.CLARIFY:
+            # The router could not resolve the target. Ask, change nothing,
+            # and spend no model call doing it.
+            return (
+                str(
+                    arguments.get("question")
+                    or "Which alert or finding should I use? I could not "
+                    "resolve that to a single candidate."
+                ),
+                {
+                    "display_mode": "conversation",
+                    "answer_type": "clarification_required",
+                },
+                [],
+                {},
+            )
         if command == AssistantCommandName.CHAT:
             question = str(arguments.get("question") or "").strip()
             if question.lower() in {
@@ -605,6 +623,8 @@ class SOCAssistant:
                     organization_id=organization_id,
                     created_by=user_id,
                     conversation_id=conversation_id,
+                    intent_source=intent_source,
+                    intent_confidence=intent_confidence,
                 )
                 agent_answer, tool_calls, active_alert_id = agent_result
                 failed_tools = list(
@@ -1452,6 +1472,8 @@ class SOCAssistant:
         conversation_id: str | None = None,
         recent_context: dict[str, str] | None = None,
         conversation_history: list[dict[str, str]] | None = None,
+        intent_source: str = "deterministic",
+        intent_confidence: float = 1.0,
     ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
         return self._execute(
             command,
@@ -1461,6 +1483,8 @@ class SOCAssistant:
             conversation_id=conversation_id,
             recent_context=recent_context,
             conversation_history=conversation_history,
+            intent_source=intent_source,
+            intent_confidence=intent_confidence,
         )
 
     @traceable(
@@ -1542,11 +1566,17 @@ class SOCAssistant:
                 intent.arguments["investigation_id"] = recent_context[
                     "investigation"
                 ]
+        router_failed = intent.source == "router_error"
         activities = [
             self._activity(
                 1,
-                f"Selected {intent.command.value} capability",
+                (
+                    "Intent router failed; answering read-only"
+                    if router_failed
+                    else f"Selected {intent.command.value} capability"
+                ),
                 tool="intent_router",
+                status="failed" if router_failed else "completed",
             )
         ]
         try:
@@ -1558,6 +1588,8 @@ class SOCAssistant:
                 conversation_id=active_conversation_id,
                 recent_context=recent_context,
                 conversation_history=conversation_history,
+                intent_source=intent.source,
+                intent_confidence=intent.confidence,
             )
             for tool_name in payload.get("tools_called") or []:
                 activities.append(
