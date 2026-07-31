@@ -28,6 +28,64 @@ SSH_FAILURE_EVENT_TYPES = {
 }
 
 
+# Hard caps on the facts view. The prompt already carries evidence summaries,
+# priors and inventory, and MAPEK_MAX_INPUT_TOKENS is 8000, so this stays a
+# bounded excerpt rather than a log dump - unrestricted raw logs would both
+# blow the budget and widen the untrusted-input surface.
+_FACTS_MAX_REQUIREMENTS = 6
+_FACTS_MAX_RECORDS = 3
+_FACTS_MAX_CHARS = 500
+
+
+def _trimmed(value: Any, limit: int) -> Any:
+    """Serialise a payload fragment, truncating rather than dropping it."""
+
+    text = json.dumps(value, sort_keys=True, default=str)
+    if len(text) <= limit:
+        return value
+    return {"truncated_json": text[:limit]}
+
+
+def _bounded_evidence_facts(
+    monitor_context: dict[str, Any],
+    results: list[Any],
+) -> list[dict[str, Any]]:
+    """A few real records per requirement, so the model can weigh them.
+
+    Requirements that answered unfavourably (not_found) are kept: their
+    emptiness is the finding, and dropping them is how a contradicting
+    signal silently becomes a supporting one.
+    """
+
+    capability_evidence = monitor_context.get("capability_evidence") or {}
+    views: list[dict[str, Any]] = []
+    for item in results:
+        payload = capability_evidence.get(item.evidence_type)
+        facts: Any = payload
+        if isinstance(payload, dict):
+            for key in ("items", "events", "records", "alerts"):
+                if isinstance(payload.get(key), list):
+                    facts = payload[key][:_FACTS_MAX_RECORDS]
+                    break
+        elif isinstance(payload, list):
+            facts = payload[:_FACTS_MAX_RECORDS]
+        views.append(
+            {
+                "requirement": item.evidence_type,
+                "collection_status": str(item.status),
+                "records_examined": item.records,
+                "facts": (
+                    _trimmed(facts, _FACTS_MAX_CHARS)
+                    if facts is not None
+                    else None
+                ),
+            }
+        )
+        if len(views) >= _FACTS_MAX_REQUIREMENTS:
+            break
+    return views
+
+
 class IncidentAnalyzer:
     def __init__(
         self,
@@ -406,6 +464,13 @@ class IncidentAnalyzer:
                 item.model_dump(mode="json")
                 for item in state.evidence_collection_results
             ],
+            # The records themselves, not just how many there were. Without
+            # these the model can report "7 records collected" but cannot say
+            # whether they support or contradict the hypothesis.
+            "evidence_facts": _bounded_evidence_facts(
+                monitor_context,
+                state.evidence_collection_results,
+            ),
             "asset_context": {
                 "agent_id": state.agent_id,
                 "monitor_profile": monitor_context.get("evidence_profile"),

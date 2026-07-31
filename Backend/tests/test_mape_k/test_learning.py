@@ -235,8 +235,13 @@ def test_unavailable_collector_yields_telemetry_unavailable_not_confidence():
     assert assessed.evidence_completeness == 0.5
 
 
-def test_not_found_counts_as_answered_evidence():
-    """'Searched and found nothing' is a real answer, not a gap."""
+def test_not_found_is_answered_evidence_that_weakens_the_hypothesis():
+    """'Searched and found nothing' is a real answer - and an unfavourable one.
+
+    It still counts toward completeness (the collector ran), but the predicted
+    artefact is absent, so it must cost the verdict a band rather than being
+    silently folded into supporting evidence.
+    """
     from app.mape_k.schemas import DiagnosisVerdict, assess_evidence
 
     assessed = assess_evidence(
@@ -249,7 +254,9 @@ def test_not_found_counts_as_answered_evidence():
     )
     assert assessed.evidence_completeness == 1.0
     assert assessed.telemetry_gaps == []
-    assert assessed.verdict == DiagnosisVerdict.CONFIRMED_MALICIOUS
+    assert assessed.contradicting_requirements == ["post_login_activity"]
+    # 0.96 confidence would otherwise be CONFIRMED_MALICIOUS.
+    assert assessed.verdict == DiagnosisVerdict.LIKELY_MALICIOUS
 
 
 def test_remediation_blocked_by_gaps_and_low_completeness():
@@ -328,3 +335,73 @@ def test_permanent_gap_does_not_request_another_pass():
     )
     assert assessed.verdict == DiagnosisVerdict.TELEMETRY_UNAVAILABLE
     assert assessed.needs_more_evidence is False
+
+
+def test_factual_capability_cannot_reach_a_malicious_verdict():
+    """A confirmed CVE is a confirmed fact, not a confirmed compromise."""
+    from app.mape_k.capabilities import capability_for_incident
+    from app.mape_k.schemas import (
+        DiagnosisVerdict,
+        ObservedCondition,
+        assess_evidence,
+    )
+
+    diagnosis = _diag(
+        incident_type="high_risk_vulnerability_exposure", confidence=0.9
+    )
+    capability = capability_for_incident(diagnosis.incident_type)
+    assert capability is not None and capability.threat_bearing is False
+
+    assessed = assess_evidence(
+        diagnosis,
+        [_result("vulnerability_identity", "collected")],
+        completeness_threshold=0.8,
+        threat_bearing=capability.threat_bearing,
+    )
+    # The observation is established; the threat claim is not.
+    assert assessed.observed_condition == ObservedCondition.CONFIRMED
+    assert assessed.verdict == DiagnosisVerdict.SUSPICIOUS
+
+
+def test_threat_bearing_capability_still_reaches_malicious():
+    """The cap must not blunt genuine attack-pattern capabilities."""
+    from app.mape_k.capabilities import capability_for_incident
+    from app.mape_k.schemas import DiagnosisVerdict, assess_evidence
+
+    diagnosis = _diag(
+        incident_type="command_and_control_activity", confidence=0.9
+    )
+    capability = capability_for_incident(diagnosis.incident_type)
+    assert capability is not None and capability.threat_bearing is True
+
+    assessed = assess_evidence(
+        diagnosis,
+        [_result("network_destination", "collected")],
+        completeness_threshold=0.8,
+        threat_bearing=capability.threat_bearing,
+    )
+    assert assessed.verdict == DiagnosisVerdict.CONFIRMED_MALICIOUS
+
+
+def test_contradicting_evidence_blocks_remediation():
+    """Enough unfavourable answers must drop below the remediation bar."""
+    from app.mape_k.schemas import assess_evidence, remediation_allowed
+
+    assessed = assess_evidence(
+        _diag(),
+        [
+            _result("auth_timeline", "collected"),
+            _result("post_login_activity", "not_found"),
+            _result("process_inventory", "not_found"),
+        ],
+        completeness_threshold=0.8,
+    )
+    assert len(assessed.contradicting_requirements) == 2
+    assert (
+        remediation_allowed(
+            assessed,
+            confidence_threshold=0.8,
+            completeness_threshold=0.8,
+        )
+        is False
+    )

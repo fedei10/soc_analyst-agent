@@ -38,6 +38,11 @@ class AttackCapability:
     min_rule_level: int = 10
     required_field: str | None = None
     confidence: float = 0.84
+    # False when the capability establishes a fact rather than an attack: a
+    # CVE is present, a package changed, a file was modified, someone
+    # authenticated. `confidence` then measures certainty in that fact, and
+    # must not be read as probability of compromise.
+    threat_bearing: bool = True
     investigation_steps: tuple[str, ...] = ()
     containment_recommendations: tuple[str, ...] = ()
 
@@ -200,6 +205,7 @@ CAPABILITIES: tuple[AttackCapability, ...] = (
     ),
     AttackCapability(
         capability_id="file-integrity",
+        threat_bearing=False,
         incident_type="suspicious_file_change",
         evidence_profile="file_integrity_and_process",
         evidence_requirements=(
@@ -230,6 +236,7 @@ CAPABILITIES: tuple[AttackCapability, ...] = (
     ),
     AttackCapability(
         capability_id="vulnerability",
+        threat_bearing=False,
         incident_type="high_risk_vulnerability_exposure",
         evidence_profile="vulnerability_and_asset",
         evidence_requirements=(
@@ -259,6 +266,7 @@ CAPABILITIES: tuple[AttackCapability, ...] = (
     ),
     AttackCapability(
         capability_id="software-change",
+        threat_bearing=False,
         incident_type="unauthorized_software_change",
         evidence_profile="package_and_process",
         evidence_requirements=(

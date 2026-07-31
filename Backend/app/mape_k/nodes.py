@@ -14,6 +14,7 @@ from pydantic import ValidationError
 
 from app.config import settings
 from app.mape_k.analyze import IncidentAnalyzer
+from app.mape_k.capabilities import capability_for_incident
 from app.mape_k.executor import RestrictedExecutor
 from app.mape_k.knowledge import build_final_report
 from app.mape_k.monitor import WazuhMonitor
@@ -171,6 +172,14 @@ def analyze_node(
             (getattr(state, "monitor_context", {}) or {}).get(
                 "related_alerts_truncated"
             )
+        ),
+        # A capability that only establishes a fact must not spend its
+        # certainty in that fact on a maliciousness claim. Unknown incident
+        # types (the model path) stay threat-bearing.
+        threat_bearing=getattr(
+            capability_for_incident(diagnosis.incident_type),
+            "threat_bearing",
+            True,
         ),
     )
     inconclusive = (

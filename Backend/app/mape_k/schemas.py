@@ -151,6 +151,18 @@ class AuthenticationEvidenceSummary(StrictModel):
     missing_evidence: list[str] = Field(default_factory=list)
 
 
+class ObservedCondition(StrEnum):
+    """Whether the factual observation itself is established.
+
+    Deliberately separate from DiagnosisVerdict. "An unpatched CVE is present"
+    and "this host is compromised" are different questions, and a capability
+    can be certain of the first while having no evidence for the second.
+    """
+
+    CONFIRMED = "confirmed"
+    UNCONFIRMED = "unconfirmed"
+
+
 class DiagnosisVerdict(StrEnum):
     """Conclusion, including the two ways of declining to conclude.
 
@@ -204,7 +216,13 @@ class Diagnosis(StrictModel):
     contradicting_evidence_ids: list[str] = Field(default_factory=list)
     missing_evidence: list[str] = Field(default_factory=list)
     evidence_completeness: float = Field(default=0.0, ge=0, le=1)
+    # The threat judgement. Never raise this above SUSPICIOUS for a
+    # capability that only establishes a fact - see assess_evidence.
     verdict: DiagnosisVerdict = DiagnosisVerdict.SUSPICIOUS
+    observed_condition: ObservedCondition = ObservedCondition.UNCONFIRMED
+    # Required requirements whose search ran and came back empty. The
+    # hypothesis predicted an artefact that is not there, which weakens it.
+    contradicting_requirements: list[str] = Field(default_factory=list)
     # Requirements whose collector never answered, so their absence proves
     # nothing. Kept separate from missing_evidence, which also covers
     # truncated and stale results.
@@ -542,12 +560,21 @@ class IncidentWorkflowState(BaseModel):
         return value
 
 
+# Ordered strongest to weakest; contradicting evidence walks down this list.
+_THREAT_BANDS = (
+    DiagnosisVerdict.CONFIRMED_MALICIOUS,
+    DiagnosisVerdict.LIKELY_MALICIOUS,
+    DiagnosisVerdict.SUSPICIOUS,
+)
+
+
 def assess_evidence(
     diagnosis: Diagnosis,
     collection_results: list[EvidenceCollectionResult],
     *,
     completeness_threshold: float,
     truncated: bool = False,
+    threat_bearing: bool = True,
 ) -> Diagnosis:
     """Stamp completeness and verdict onto a diagnosis, deterministically.
 
@@ -579,6 +606,21 @@ def assess_evidence(
         if item.status not in ANSWERED_COLLECTION_STATUSES
     ]
 
+    # A required search that ran and found nothing contradicts a hypothesis
+    # which predicted that artefact. Collection status says the collector
+    # answered; this says the answer was unfavourable to the hypothesis.
+    contradicting = [
+        item.evidence_type
+        for item in required
+        if item.status == EvidenceCollectionStatus.NOT_FOUND
+    ]
+    contradicting_ids = [
+        evidence_id
+        for item in required
+        if item.status == EvidenceCollectionStatus.NOT_FOUND
+        for evidence_id in item.evidence_ids
+    ]
+
     if gaps:
         # Cannot distinguish "clean" from "unobserved" - say so rather than
         # letting the confidence score speak for evidence that never arrived.
@@ -589,6 +631,12 @@ def assess_evidence(
         or completeness < completeness_threshold
     ):
         verdict = DiagnosisVerdict.INSUFFICIENT_EVIDENCE
+    elif not threat_bearing:
+        # The capability establishes a fact (a CVE exists, a package
+        # changed, a file was modified, someone authenticated). Confidence
+        # measures certainty in that fact, not in an attack, so it must not
+        # be spent on a maliciousness claim no evidence here supports.
+        verdict = DiagnosisVerdict.SUSPICIOUS
     elif diagnosis.confidence >= 0.9:
         verdict = DiagnosisVerdict.CONFIRMED_MALICIOUS
     elif diagnosis.confidence >= 0.75:
@@ -596,9 +644,33 @@ def assess_evidence(
     else:
         verdict = DiagnosisVerdict.SUSPICIOUS
 
+    # Each unfavourable answer costs one band. Evidence that argues against
+    # the hypothesis has to be able to change the conclusion, or collecting
+    # it was pointless.
+    if contradicting and verdict in _THREAT_BANDS:
+        index = _THREAT_BANDS.index(verdict)
+        verdict = _THREAT_BANDS[
+            min(index + len(contradicting), len(_THREAT_BANDS) - 1)
+        ]
+
+    observed_condition = (
+        ObservedCondition.CONFIRMED
+        if not gaps
+        and completeness >= completeness_threshold
+        and diagnosis.confidence >= 0.75
+        else ObservedCondition.UNCONFIRMED
+    )
+
     return diagnosis.model_copy(
         update={
             "verdict": verdict,
+            "observed_condition": observed_condition,
+            "contradicting_requirements": contradicting,
+            "contradicting_evidence_ids": list(
+                dict.fromkeys(
+                    [*diagnosis.contradicting_evidence_ids, *contradicting_ids]
+                )
+            ),
             "evidence_completeness": round(completeness, 3),
             "telemetry_gaps": gaps,
             "missing_evidence": list(

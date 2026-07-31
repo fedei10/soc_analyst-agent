@@ -132,7 +132,11 @@ CONTINUE_FOLLOW_UP_PATTERN = re.compile(
     r"(?:continue|resume)(?: it| the investigation| the workflow)?"
 )
 PLAN_FOLLOW_UP_PATTERN = re.compile(
-    r"(?:show|review|open)(?: me)? (?:the )?(?:plan|remediation plan)"
+    # "start/generate a remediation plan" is a request to see the plan for the
+    # active investigation, not a new capability. It still routes to PLAN,
+    # which reports plan availability - it never bypasses Analyze.
+    r"(?:show|review|open|start|create|generate|prepare|build)"
+    r"(?: me)? (?:a |the )?(?:plan|remediation plan)"
 )
 WAZUH_RETRY_HINTS = {
     "WAZUH_UNAVAILABLE": (
