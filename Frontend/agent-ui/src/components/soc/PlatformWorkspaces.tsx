@@ -399,7 +399,7 @@ export default function PlatformWorkspaces({
         <WorkspaceHeader
           eyebrow="Wazuh indexer"
           title="Alerts"
-          detail="Quick glance at the most recent level 7+ events. Use the SOC Assistant to filter, correlate, or hunt."
+          detail="Quick glance at the most recent level 7+ events. Use the AI SOC Analyst to filter, correlate, or hunt."
           action={
             <div className="header-actions">
               {platform?.wazuh_dashboard_url && (
@@ -993,15 +993,19 @@ export default function PlatformWorkspaces({
     return (
       <div className="platform-workspace">
         <WorkspaceHeader
-          eyebrow="Inference routing"
+          eyebrow="Analyst inference"
           title="AI Models"
-          detail="Fixed provider assignments for the SOC orchestrator and analyst tiers."
+          detail="The fixed provider assignment and bounded execution limits for the AI SOC analyst."
         />
-        <Panel title="Role assignments" icon={<Bot size={17} />}>
+        <Panel title="Analyst assignment" icon={<Bot size={17} />}>
           <div className="model-grid">
             {platform?.model_assignments.map((assignment) => (
               <article key={assignment.role}>
-                <span>{titleCase(assignment.role)}</span>
+                <span>
+                  {assignment.role === 'ai_soc_analyst'
+                    ? 'AI SOC Analyst'
+                    : titleCase(assignment.role)}
+                </span>
                 <strong>{titleCase(assignment.provider)}</strong>
                 <code>{assignment.model || 'Provider default model'}</code>
               </article>
@@ -1026,8 +1030,24 @@ export default function PlatformWorkspaces({
               </strong>
             </div>
             <div>
+              <span>Analyst tool calls per turn</span>
+              <strong>
+                {String(
+                  platform?.response_policy.analyst_max_tool_calls ?? '-'
+                )}
+              </strong>
+            </div>
+            <div>
+              <span>Analyst query result cap</span>
+              <strong>
+                {String(
+                  platform?.response_policy.analyst_max_query_results ?? '-'
+                )}
+              </strong>
+            </div>
+            <div>
               <span>Provider routing</span>
-              <strong>Fixed by SOC role</strong>
+              <strong>Single analyst assignment</strong>
             </div>
             <div>
               <span>Structured output</span>

@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     # Single MAPE-K reasoning provider. Only Analyze and Plan may use it.
     LLM_PROVIDER: str = "oxy"
     LLM_API_KEY: SecretStr = SecretStr("")
+    # EvoMap's raw token is supplied separately; never reuse another provider's key.
+    K_API_KEY: SecretStr = SecretStr("")
     LLM_BASE_URL: str = "https://api.oxyy.ai/v1"
     LLM_MODEL: str = "gpt-oss-120b"
     LLM_TIMEOUT_SECONDS: int = 30
@@ -77,6 +79,16 @@ class Settings(BaseSettings):
     MAPEK_MAX_PLANNING_RETRIES: int = 1
     MAPEK_MAX_INPUT_TOKENS: int = 8000
     MAPEK_MAX_TOOL_CALLS_PER_STAGE: int = 4
+    # Conversational analyst budgets are separate from MAPE-K stage budgets.
+    # They keep ordinary chat cheap and bounded without weakening the formal
+    # response workflow's own limits.
+    SOC_ANALYST_MAX_TOOL_CALLS: int = 4
+    SOC_ANALYST_MAX_HISTORY_MESSAGES: int = 8
+    SOC_ANALYST_MAX_EVIDENCE_REFS: int = 12
+    SOC_ANALYST_MAX_TOOL_OUTPUT_CHARS: int = 6000
+    SOC_ANALYST_MAX_QUERY_HOURS: int = 168
+    SOC_ANALYST_MAX_QUERY_RESULTS: int = 100
+    SOC_ANALYST_MAX_INPUT_CHARS: int = 4000
     MAPEK_CORRELATION_WINDOW_SECONDS: int = 600
     MAPEK_SSH_BRUTE_FORCE_MIN_FAILURES: int = 5
     MAPEK_SSH_BRUTE_FORCE_MIN_EVENTS: int = 3

@@ -40,13 +40,6 @@ class AssistantIntent(StrictModel):
     question: str | None = Field(default=None, max_length=500)
 
 
-class QuestionAnswer(StrictModel):
-    answer: str = Field(min_length=1, max_length=4000)
-    confidence: float = Field(default=0.7, ge=0, le=1)
-    references: list[str] = Field(default_factory=list, max_length=10)
-    limitations: list[str] = Field(default_factory=list, max_length=5)
-
-
 class AssistantCommand(StrictModel):
     name: AssistantCommandName
     slash: str

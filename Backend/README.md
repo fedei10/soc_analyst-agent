@@ -109,13 +109,17 @@ and receive a non-executable advisory when no registered playbook fits.
 
 The SOC assistant accepts deterministic slash commands and natural-language
 requests. Its server-owned capability catalog is exposed to the frontend for
-autocomplete. Ambiguous requests may use Oxy only for typed intent
-classification; provider failure does not disable known commands.
+autocomplete. Free-form requests route directly to one bounded AI SOC analyst;
+there is no classifier-model call or second ungrounded question-agent fallback.
+The analyst can call only tenant-scoped, allowlisted evidence tools.
 
 Use `/ask <question>` or natural-language questions for read-only SOC
-explanations. The Oxy question agent receives only bounded conversation history
-and validated alert, finding, and investigation context. It cannot call write
-tools, approve actions, execute commands, or change workflow state.
+investigation and explanations. Counts, timelines, deduplication, coverage, and
+exact authentication correlation are deterministic; the model interprets those
+facts and states uncertainty. Ordinary chat cannot start or execute a response.
+Use explicit `/investigate <alert-id>` to enter the durable MAPE-K workflow,
+which retains policy, approval, execution authorization, verification,
+rollback, and audit gates.
 
 ## LangSmith
 

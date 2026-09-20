@@ -285,9 +285,9 @@ def estimated_tokens(payload: Any) -> int:
     return (len(json.dumps(payload, default=str)) + 3) // 4
 
 
-# All three speak the OpenAI wire format, so one ChatOpenAI client with a
+# These providers speak the OpenAI wire format, so one ChatOpenAI client with a
 # different base_url covers them; langchain-groq buys nothing here.
-SUPPORTED_LLM_PROVIDERS = {"oxy", "mistral", "groq"}
+SUPPORTED_LLM_PROVIDERS = {"oxy", "mistral", "groq", "evomap"}
 
 
 class LLMTier(StrEnum):
@@ -305,6 +305,11 @@ class LLMTier(StrEnum):
 
 
 def effective_llm_api_key() -> str:
+    if settings.LLM_PROVIDER.strip().lower() == "evomap":
+        token = settings.K_API_KEY.get_secret_value().strip()
+        if not token:
+            return ""
+        return token if token.startswith("sk-evomap-") else f"sk-evomap-{token}"
     return settings.LLM_API_KEY.get_secret_value().strip()
 
 

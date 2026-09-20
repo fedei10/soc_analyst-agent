@@ -16,7 +16,6 @@ from app.services.wazuh.models import (
 from app.soc_assistant.command_explainer import CommandExplanation
 from app.soc_assistant.router import AssistantIntentRouter
 from app.soc_assistant.schemas import AssistantCommandName, AssistantIntent
-from app.soc_assistant.schemas import QuestionAnswer
 from app.soc_assistant.service import SOCAssistant
 from app.soc_assistant.tool_agent import SOCToolAgentAnswer, build_tools
 from app.db.repositories.alert_memory import InMemoryAlertMemoryRepository
@@ -77,14 +76,7 @@ class FakeQuestionAgent:
 
     def answer(self, **kwargs):
         self.calls.append(kwargs)
-        return (
-            QuestionAnswer(
-                answer="Block the source only after validating it is not an approved scanner.",
-                confidence=0.86,
-                limitations=["No firewall state was provided."],
-            ),
-            {"input_tokens": 40, "output_tokens": 18},
-        )
+        raise AssertionError("the retired question agent must never run")
 
 
 class FakeGateway:
@@ -282,7 +274,7 @@ def test_general_what_happened_question_is_not_forced_to_status():
             "run the whole MAPE-K process for alert alert-1",
             AssistantCommandName.INVESTIGATE,
         ),
-        ("investigate it", AssistantCommandName.INVESTIGATE),
+        ("investigate it", AssistantCommandName.CHAT),
         ("how do I fix these alerts?", AssistantCommandName.CHAT),
         ("check status INV-ABC123", AssistantCommandName.STATUS),
     ],
@@ -294,19 +286,19 @@ def test_common_natural_language_routes_without_llm(message, command):
     assert usage == {"input_tokens": 0, "output_tokens": 0}
 
 
-def test_ambiguous_language_uses_oxy_classifier_and_fails_soft():
+def test_ambiguous_language_routes_to_the_single_analyst_without_classifier():
     routed, usage = AssistantIntentRouter(llm=RoutedLLM()).route(
         "Give me an operational picture."
     )
-    assert routed.command == AssistantCommandName.SUMMARY
-    assert routed.source == "oxy"
-    assert usage["input_tokens"] == 10
+    assert routed.command == AssistantCommandName.CHAT
+    assert routed.source == "deterministic"
+    assert usage["input_tokens"] == 0
 
     fallback, usage = AssistantIntentRouter(llm=FailingLLM()).route(
         "Give me an operational picture."
     )
     assert fallback.command == AssistantCommandName.CHAT
-    assert fallback.source == "router_error"
+    assert fallback.source == "deterministic"
     assert fallback.arguments["question"] == "Give me an operational picture."
     assert usage == {"input_tokens": 0, "output_tokens": 0}
 
@@ -317,25 +309,30 @@ def test_low_confidence_classification_routes_to_chat_not_a_dead_end():
     )
     assert routed.command == AssistantCommandName.CHAT
     assert routed.arguments["question"] == "Give me an operational picture."
-    assert usage["input_tokens"] == 5
+    assert usage["input_tokens"] == 0
 
 
 @pytest.mark.parametrize(
-    ("message", "expected_alert_id"),
+    ("message", "expected_command", "expected_alert_id"),
     [
-        ("investigate alert 12345", "12345"),
-        ("investigate alert ALERT-99", "ALERT-99"),
-        ("investigate this", None),
-        ("start investigation alert-xyz", "alert-xyz"),
+        ("investigate alert 12345", AssistantCommandName.CHAT, None),
+        ("investigate alert ALERT-99", AssistantCommandName.CHAT, None),
+        ("investigate this", AssistantCommandName.CHAT, None),
+        (
+            "start formal investigation alert-xyz",
+            AssistantCommandName.INVESTIGATE,
+            "alert-xyz",
+        ),
     ],
 )
 def test_natural_investigation_references_do_not_capture_placeholders(
     message,
+    expected_command,
     expected_alert_id,
 ):
     intent, usage = AssistantIntentRouter(llm=FailingLLM()).route(message)
 
-    assert intent.command == AssistantCommandName.INVESTIGATE
+    assert intent.command == expected_command
     assert intent.arguments.get("alert_id") == expected_alert_id
     assert usage == {"input_tokens": 0, "output_tokens": 0}
 
@@ -355,7 +352,7 @@ def test_natural_investigation_references_do_not_capture_placeholders(
         ),
     ],
 )
-def test_oxy_argument_aliases_are_normalized(
+def test_classifier_injection_is_ignored_by_single_analyst_router(
     command,
     raw_arguments,
     expected_arguments,
@@ -366,10 +363,10 @@ def test_oxy_argument_aliases_are_normalized(
 
     intent, usage = router.route("Give me the scoped operational record.")
 
-    assert intent.command == command
-    assert intent.arguments == expected_arguments
-    assert intent.source == "oxy"
-    assert usage["input_tokens"] == 8
+    assert intent.command == AssistantCommandName.CHAT
+    assert intent.arguments == {"question": "Give me the scoped operational record."}
+    assert intent.source == "deterministic"
+    assert usage == {"input_tokens": 0, "output_tokens": 0}
 
 
 def test_unknown_oxy_arguments_fail_closed_to_chat():
@@ -383,26 +380,37 @@ def test_unknown_oxy_arguments_fail_closed_to_chat():
     intent, _ = router.route("Give me the scoped operational record.")
 
     assert intent.command == AssistantCommandName.CHAT
-    assert intent.source == "router_error"
+    assert intent.source == "deterministic"
 
 
 @pytest.mark.parametrize(
     ("message", "command", "arguments"),
     [
+        # A named window makes these "recent" questions, which is a different
+        # reference point from "new since my last check".
         (
             "what alerts came in overnight?",
             AssistantCommandName.ALERTS,
-            {"hours": 12},
+            {"hours": 12, "change_subject": "alerts", "change_mode": "recent"},
         ),
         (
             "any critical alerts in the last hour?",
             AssistantCommandName.ALERTS,
-            {"hours": 1, "severity": "critical"},
+            {
+                "hours": 1,
+                "severity": "critical",
+                "change_subject": "alerts",
+                "change_mode": "recent",
+            },
         ),
         (
             "show me alerts from agent 004",
             AssistantCommandName.ALERTS,
-            {"agent_id": "004"},
+            {
+                "agent_id": "004",
+                "change_subject": "alerts",
+                "change_mode": "recent",
+            },
         ),
         ("are we connected?", AssistantCommandName.HEALTH, {}),
         (
@@ -464,9 +472,7 @@ def test_vague_targetless_messages_short_circuit_to_one_summary_call(message):
 def test_vague_shortcut_does_not_swallow_targeted_or_formal_phrasing():
     router = AssistantIntentRouter(llm=FailingLLM())
 
-    assert router.route("investigate it")[0].command == (
-        AssistantCommandName.INVESTIGATE
-    )
+    assert router.route("investigate it")[0].command == AssistantCommandName.CHAT
     assert router.route("check status INV-ABC123")[0].command == (
         AssistantCommandName.STATUS
     )
@@ -545,7 +551,7 @@ def test_greeting_is_conversational_and_does_not_call_tools(monkeypatch):
     assert gateway.calls == []
 
 
-def test_question_agent_answers_read_only_soc_questions(monkeypatch):
+def test_chat_has_no_second_ungrounded_model_fallback(monkeypatch):
     monkeypatch.setattr("app.soc_assistant.service.database_url", lambda: None)
     question_agent = FakeQuestionAgent()
     gateway = FakeGateway()
@@ -553,7 +559,6 @@ def test_question_agent_answers_read_only_soc_questions(monkeypatch):
         gateway=gateway,
         investigations=FakeInvestigations(),
         router=AssistantIntentRouter(llm=FailingLLM()),
-        question_agent=question_agent,
         tool_agent=UnavailableToolAgent(),
     )
 
@@ -561,10 +566,32 @@ def test_question_agent_answers_read_only_soc_questions(monkeypatch):
 
     assert response.selected_command == AssistantCommandName.CHAT
     assert response.response["display_mode"] == "conversation"
-    assert response.response["answer_type"] == "soc_question"
-    assert response.tools_used == ["soc_question_agent"]
-    assert "Block the source" in response.assistant_message
-    assert question_agent.calls[0]["question"] == "how do I fix these alerts?"
+    assert response.response["answer_type"] == "model_unavailable"
+    assert response.tools_used == []
+    assert "analyst model is unavailable" in response.assistant_message
+    assert question_agent.calls == []
+    assert gateway.calls == []
+
+
+@pytest.mark.parametrize("local_budget", [False, True])
+def test_chat_context_limit_is_not_mislabeled_as_model_outage(monkeypatch, local_budget):
+    from app.mape_k.llm import LLMInputLimitError
+
+    class PayloadTooLarge(Exception):
+        status_code = 413
+
+    class ContextLimitedAgent:
+        def answer(self, **kwargs):
+            raise LLMInputLimitError("local context budget") if local_budget else PayloadTooLarge("payload too large")
+
+    monkeypatch.setattr("app.soc_assistant.service.database_url", lambda: None)
+    gateway = FakeGateway()
+    service = SOCAssistant(gateway=gateway, investigations=FakeInvestigations(),
+                           router=AssistantIntentRouter(llm=FailingLLM()), tool_agent=ContextLimitedAgent())
+    response = respond(service, "how do I fix these alerts?")
+    assert response.response["answer_type"] == "context_limit_exceeded"
+    assert response.response["grounded"] is False
+    assert "model is unavailable" not in response.assistant_message
     assert gateway.calls == []
 
 
@@ -584,7 +611,6 @@ def test_live_tool_failure_never_falls_back_to_ungrounded_answer(monkeypatch):
         gateway=FakeGateway(),
         investigations=FakeInvestigations(),
         router=AssistantIntentRouter(llm=FailingLLM()),
-        question_agent=SpyQuestionAgent(),
         tool_agent=FailingLiveToolAgent(),
     )
 
@@ -594,7 +620,7 @@ def test_live_tool_failure_never_falls_back_to_ungrounded_answer(monkeypatch):
     assert response.response["answer_type"] == "live_data_unavailable"
     assert response.response["grounded"] is False
     assert response.response["error"]["code"] == "WAZUH_UNAVAILABLE"
-    assert response.tools_used == ["soc_tool_agent"]
+    assert response.tools_used == ["soc_analyst"]
     assert response.activities[-1].status == "failed"
 
 
@@ -608,7 +634,6 @@ def test_live_tool_timeout_is_reported_as_timeout(monkeypatch):
         gateway=FakeGateway(),
         investigations=FakeInvestigations(),
         router=AssistantIntentRouter(llm=FailingLLM()),
-        question_agent=FakeQuestionAgent(),
         tool_agent=TimingOutToolAgent(),
     )
 
@@ -628,7 +653,6 @@ def test_question_agent_failure_does_not_break_commands(monkeypatch):
         gateway=FakeGateway(),
         investigations=FakeInvestigations(),
         router=AssistantIntentRouter(llm=FailingLLM()),
-        question_agent=FailingQuestionAgent(),
         tool_agent=UnavailableToolAgent(),
     )
 
@@ -661,7 +685,6 @@ def test_chat_rate_limit_skips_question_agent_fallback(monkeypatch):
         gateway=FakeGateway(),
         investigations=FakeInvestigations(),
         router=AssistantIntentRouter(llm=FailingLLM()),
-        question_agent=question_agent,
         tool_agent=RateLimitedToolAgent(),
     )
 
@@ -937,7 +960,7 @@ def test_durable_alerts_query_postgresql_memory_not_live_wazuh(monkeypatch):
     assert gateway.calls == []
 
 
-def test_conversation_reference_resolves_investigate_it(monkeypatch):
+def test_conversation_reference_does_not_turn_read_only_chat_into_workflow(monkeypatch):
     memory = InMemoryAlertMemoryRepository()
     memory.remember_alert_document(
         AlertIngestionDocument(
@@ -975,9 +998,9 @@ def test_conversation_reference_resolves_investigate_it(monkeypatch):
 
     result = respond(service, "investigate it")
 
-    assert result.active_alert_id == "alert-1"
-    assert result.active_investigation_id == "INV-TEST"
-    assert investigations.started[0]["alert_id"] == "alert-1"
+    assert result.selected_command == AssistantCommandName.CHAT
+    assert result.active_investigation_id is None
+    assert investigations.started == []
     assert not any(call[0] == "get_raw_alert_by_id" for call in gateway.calls)
 
 
@@ -1062,14 +1085,13 @@ def test_tool_agent_answers_with_live_tool_calls(monkeypatch):
         gateway=FakeGateway(),
         investigations=FakeInvestigations(),
         router=AssistantIntentRouter(llm=FailingLLM()),
-        question_agent=FakeQuestionAgent(),
         tool_agent=FakeToolAgent(),
     )
 
     response = respond(service, "any failed SSH logins today?")
 
     assert response.selected_command == AssistantCommandName.CHAT
-    assert response.response["answer_type"] == "soc_tool_agent"
+    assert response.response["answer_type"] == "soc_analyst"
     assert "search_alerts" in response.tools_used
     assert any(
         activity.label == "Queried search_alerts"
@@ -1092,13 +1114,12 @@ def test_tool_agent_failure_is_machine_visible_in_chat_payload(monkeypatch):
         gateway=FakeGateway(),
         investigations=FakeInvestigations(),
         router=AssistantIntentRouter(llm=FailingLLM()),
-        question_agent=FakeQuestionAgent(),
         tool_agent=PartiallyFailingToolAgent(),
     )
 
     response = respond(service, "show suspicious activity")
 
-    assert response.response["answer_type"] == "soc_tool_agent_partial"
+    assert response.response["answer_type"] == "soc_analyst_partial"
     assert response.response["grounded"] is False
     assert response.response["failed_tools"] == ["search_alerts"]
 
@@ -1117,7 +1138,6 @@ def test_chat_answer_that_surfaces_an_alert_updates_active_alert_id(monkeypatch)
         gateway=FakeGateway(),
         investigations=FakeInvestigations(),
         router=AssistantIntentRouter(llm=FailingLLM()),
-        question_agent=FakeQuestionAgent(),
         tool_agent=FakeToolAgentWithAlert(),
     )
 
@@ -1138,59 +1158,6 @@ def _chat_tools(gateway, investigations):
             conversation_id=None,
         )
     }
-
-
-def test_chat_start_investigation_tool_starts_a_real_investigation(monkeypatch):
-    monkeypatch.setattr("app.soc_assistant.service.database_url", lambda: None)
-    gateway, investigations = FakeGateway(), FakeInvestigations()
-    tools = _chat_tools(gateway, investigations)
-
-    raw = tools["start_investigation"].invoke(
-        {"alert_id": "alert-1", "agent_id": "001"}
-    )
-    result = json.loads(raw)
-
-    assert result["investigation_id"] == "INV-TEST"
-    assert result["current_stage"] == "human_approval"
-    assert "existing" not in result
-    assert investigations.started[0]["alert_id"] == "alert-1"
-    assert investigations.started[0]["initiated_by"] == "user-test"
-
-
-def test_chat_start_investigation_tool_returns_existing_investigation(monkeypatch):
-    monkeypatch.setattr("app.soc_assistant.service.database_url", lambda: None)
-    gateway, investigations = FakeGateway(), FakeInvestigations()
-    investigations.active_for_alert = lambda alert_id, organization_id: {
-        "investigation_id": "INV-EXISTING",
-        "alert_id": alert_id,
-        "agent_id": "001",
-        "status": "running",
-        "current_stage": "analyze",
-    }
-    tools = _chat_tools(gateway, investigations)
-
-    raw = tools["start_investigation"].invoke({"alert_id": "alert-1"})
-    result = json.loads(raw)
-
-    assert result == {
-        "investigation_id": "INV-EXISTING",
-        "status": "running",
-        "current_stage": "analyze",
-        "existing": True,
-    }
-    assert investigations.started == []
-
-
-def test_chat_start_investigation_tool_rejects_placeholder_alert_id(monkeypatch):
-    monkeypatch.setattr("app.soc_assistant.service.database_url", lambda: None)
-    gateway, investigations = FakeGateway(), FakeInvestigations()
-    tools = _chat_tools(gateway, investigations)
-
-    raw = tools["start_investigation"].invoke({"alert_id": "ALERT-ID"})
-    result = json.loads(raw)
-
-    assert result["error"] == "INVALID_ALERT_ID"
-    assert investigations.started == []
 
 
 def test_chat_get_investigation_status_tool_reports_snapshot(monkeypatch):
@@ -1218,7 +1185,9 @@ def test_chat_get_investigation_status_tool_reports_missing_investigation(
     )
     result = json.loads(raw)
 
-    assert "was not found" in result["error"]
+    assert result["ok"] is False
+    assert result["error"]["code"] == "INVESTIGATION_NOT_FOUND"
+    assert "was not found" in result["error"]["message"]
 
 
 # --- Section 1: the router must not fail open into a write path ------------
@@ -1237,7 +1206,7 @@ class RouterCrashLLM:
         raise error
 
 
-def test_router_400_degrades_to_router_error_after_one_retry():
+def test_classifier_provider_is_never_called_for_free_form_chat():
     from app.soc_assistant.router import AssistantIntentRouter
 
     llm = RouterCrashLLM()
@@ -1245,10 +1214,9 @@ def test_router_400_degrades_to_router_error_after_one_retry():
         "yes investigation for the evil u_ser"
     )
 
-    # Forced call, then exactly one unforced retry.
-    assert llm.calls == 2
-    assert intent.source == "router_error"
-    assert intent.confidence == 0
+    assert llm.calls == 0
+    assert intent.source == "deterministic"
+    assert intent.confidence == 1
 
 
 def test_state_changing_tools_are_unreachable_after_a_router_failure():
@@ -1286,8 +1254,8 @@ def test_state_changing_tools_are_unreachable_after_a_router_failure():
         for tool in _select_agent_tools(question, tools, allow_state_changes=False)
     }
 
-    # The phrasing alone would otherwise bind both write tools.
-    assert "start_investigation" in trusted
+    # Response workflow creation is never a model-facing chat tool.
+    assert "start_investigation" not in trusted
     assert "save_report" in trusted
     assert "start_investigation" not in untrusted
     assert "save_report" not in untrusted
@@ -1331,8 +1299,7 @@ def test_clarify_intent_round_trips_through_the_schema():
     assert restored.question == intent.question
 
 
-def test_router_failure_is_reported_as_failed_not_completed(monkeypatch):
-    """The operator must be able to see that the router crashed."""
+def test_deterministic_router_is_reported_as_completed(monkeypatch):
     monkeypatch.setattr("app.soc_assistant.service.database_url", lambda: None)
     service = SOCAssistant(
         gateway=FakeGateway(),
@@ -1346,11 +1313,11 @@ def test_router_failure_is_reported_as_failed_not_completed(monkeypatch):
     router_steps = [
         item
         for item in response.activities
-        if item.tool == "intent_router"
+        if item.tool == "deterministic_router"
     ]
     assert len(router_steps) == 1
-    assert router_steps[0].status == "failed"
-    assert "failed" in router_steps[0].label.lower()
+    assert router_steps[0].status == "completed"
+    assert "chat" in router_steps[0].label.lower()
 
 
 def test_clarify_answers_without_touching_tools_or_state(monkeypatch):

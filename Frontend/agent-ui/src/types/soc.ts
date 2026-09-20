@@ -35,10 +35,41 @@ export interface AssistantCommandCatalog {
   count: number
 }
 
+export interface AnalystMetrics {
+  elapsed_ms?: number
+  tool_calls?: number
+  unique_tools?: string[]
+  failed_tools?: number
+  evidence_references?: number
+  input_tokens?: number
+  output_tokens?: number
+  tool_call_budget?: number
+  limit_reached?: boolean
+  /** Total records the underlying queries reported as matching. */
+  matched_records?: number
+  /** Records actually returned, i.e. what the answer could have read. */
+  sampled_records?: number
+  /** True when a tool result was cut to fit the output budget. */
+  truncated?: boolean
+}
+
+export interface AnalystResponsePayload {
+  display_mode?: string
+  answer_type?: string
+  grounded?: boolean
+  grounding_status?: string
+  failed_tools?: string[]
+  evidence_references?: string[]
+  tools_called?: string[]
+  analyst_metrics?: AnalystMetrics
+  context_references?: Record<string, string>
+  [key: string]: unknown
+}
+
 export interface AgentChatResponse {
   conversation_id: string
   assistant_message: string
-  response: Record<string, unknown>
+  response: AnalystResponsePayload
   tools_used: string[]
   activities: ChatActivity[]
   active_investigation_id?: string | null
@@ -67,7 +98,7 @@ export interface ChatMessage {
   id: string
   role: 'user' | 'agent' | 'error'
   content: string
-  response?: Record<string, unknown>
+  response?: AnalystResponsePayload
   investigation?: Investigation
   tools?: string[]
   activities?: ChatActivity[]

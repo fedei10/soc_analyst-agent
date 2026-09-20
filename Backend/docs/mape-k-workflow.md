@@ -591,7 +591,7 @@ CLERK_EXECUTOR_USER_IDS=
 | L1/L2/L3 runtime agents | Retired from formal response runtime | Explicit MAPE-K graph stages |
 | Tier supervisors and subgraphs | Retired from formal response runtime | Deterministic conditional graph edges |
 | Tier-agent conversation endpoint | Returns HTTP 410 | Formal investigation API |
-| SOC assistant | Kept as a bounded router | Allowlisted reads, questions, and workflow operations |
+| SOC assistant | Consolidated into one AI SOC analyst | Allowlisted evidence reads; explicit commands enter the workflow |
 | Multi-provider agent pool | Retired from formal workflow | One lazy Oxy provider for bounded semantic fallback |
 | Per-tier tool loops | Retired from formal workflow | Deterministic Monitor, Analyze, Plan, Policy, Execute, Verify, and Knowledge implementations |
 | Wazuh gateway and normalizers | Kept and hardened | Timestamp-bounded evidence acquisition and normalization |
@@ -611,13 +611,15 @@ commands:
 - `/investigate` starts the formal MAPE-K workflow.
 - `/status` loads a durable investigation snapshot.
 - `/health` checks Wazuh manager and indexer connectivity.
-- `/ask` answers a read-only SOC question with bounded validated context.
+- `/ask` asks the one read-only AI SOC analyst with bounded validated context.
 - `/help` returns the current capability catalog.
 
-Known commands and common natural-language requests route deterministically.
-Only ambiguous routing and bounded semantic analysis use Oxy. The model cannot
-invent tools, approve actions, execute commands, mutate workflow state, or
-access responder credentials.
+Known commands route deterministically. All other natural language goes straight
+to the single analyst, without a classifier model or secondary question agent.
+The model cannot invent tools, approve actions, execute commands, mutate
+workflow state, or access responder credentials. Natural "investigate" and
+"analyze" requests remain read-only; `/investigate <alert-id>` is the explicit
+boundary into formal response orchestration.
 
 ## Current lab boundaries
 

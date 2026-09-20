@@ -3032,3 +3032,162 @@ time {
     flex-direction: column;
   }
 }
+
+/* Analyst messages render as sanitized GitHub-flavoured Markdown. These rules
+   give the rendered tree the same typography the old plain-text <p> had, so
+   bold, headings, lists, tables and code read as formatting instead of
+   literal syntax. */
+.message-markdown,
+.markdown-body {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 10px;
+  color: var(--text-soft);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+.message-markdown > div,
+.message-markdown p {
+  margin: 0;
+}
+
+.message-markdown h1,
+.message-markdown h2,
+.message-markdown h3,
+.message-markdown h4,
+.message-markdown h5,
+.message-markdown h6 {
+  margin: 4px 0 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.message-markdown h1 {
+  font-size: 15px;
+}
+
+.message-markdown h2 {
+  font-size: 14px;
+}
+
+.message-markdown strong,
+.message-markdown b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.message-markdown ul,
+.message-markdown ol {
+  display: flex;
+  flex-direction: column;
+  padding-left: 20px;
+  gap: 4px;
+}
+
+.message-markdown ul {
+  list-style: disc;
+}
+
+.message-markdown ol {
+  list-style: decimal;
+}
+
+.message-markdown blockquote {
+  border-left: 2px solid var(--line-strong);
+  padding-left: 10px;
+  color: var(--text-dim);
+}
+
+.message-markdown a {
+  color: var(--cyan);
+  text-decoration: underline;
+}
+
+.message-markdown table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.message-markdown table th,
+.message-markdown table td {
+  border-bottom: 1px solid var(--line);
+  padding: 6px 8px;
+  text-align: left;
+}
+
+.message-markdown table th {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* Tables and fenced blocks scroll inside their own box; the transcript column
+   itself must never scroll sideways on a phone. */
+.message-markdown > div:has(> div > table) {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.markdown-inline-code {
+  border-radius: 3px;
+  background: var(--ink-0);
+  padding: 1px 5px;
+  color: var(--cyan);
+  font-family: var(--font-dm-mono), monospace;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.markdown-code-block {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--ink-0);
+}
+
+.markdown-code-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--line);
+  padding: 5px 9px;
+  color: var(--text-dim);
+  font-size: 9px;
+  text-transform: uppercase;
+}
+
+.markdown-code-head button {
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: transparent;
+  padding: 2px 8px;
+  color: var(--text-soft);
+  font-size: 9px;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.markdown-code-head button:hover {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.markdown-code-block pre {
+  max-width: 100%;
+  margin: 0;
+  overflow-x: auto;
+  padding: 10px 12px;
+}
+
+.markdown-code-block code {
+  color: var(--text-soft);
+  font-family: var(--font-dm-mono), monospace;
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre;
+}

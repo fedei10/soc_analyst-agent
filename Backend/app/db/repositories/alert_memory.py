@@ -138,7 +138,11 @@ class InMemoryAlertMemoryRepository:
         finding_version: int | None = None,
     ) -> None:
         with self._lock:
-            self._cursors[user_id] = checked_at
+            current = self._cursors.get(user_id)
+            # Monotonic: two checks racing, or one arriving late, must never
+            # rewind the mark and make already-seen activity look new again.
+            if current is None or checked_at > current:
+                self._cursors[user_id] = checked_at
 
     def count_alerts_since(
         self,
@@ -607,7 +611,9 @@ class SQLAlchemyAlertMemoryRepository:
     def get_user_cursor(self, user_id: str) -> datetime | None:
         with self._session_factory() as session:
             record = session.get(UserAlertCursorRecord, user_id)
-            return record.last_checked_at if record else None
+            # Always timezone-aware: callers compare this against
+            # datetime.now(UTC), and a naive value would raise there.
+            return _as_utc(record.last_checked_at) if record else None
 
     def advance_user_cursor(
         self,
@@ -627,10 +633,18 @@ class SQLAlchemyAlertMemoryRepository:
                     )
                 )
             else:
-                record.last_checked_at = checked_at
+                # Monotonic, and under the row lock the UPDATE already takes:
+                # concurrent or out-of-order checks must not rewind the mark
+                # and resurface activity the analyst has already been shown.
+                existing = _as_utc(record.last_checked_at)
+                if existing is None or checked_at > existing:
+                    record.last_checked_at = checked_at
+                    record.updated_at = checked_at
                 if finding_version is not None:
-                    record.last_seen_finding_version = finding_version
-                record.updated_at = checked_at
+                    record.last_seen_finding_version = max(
+                        int(record.last_seen_finding_version or 0),
+                        int(finding_version),
+                    )
 
     def count_alerts_since(
         self,

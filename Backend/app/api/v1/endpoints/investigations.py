@@ -516,17 +516,7 @@ def get_soc_platform(principal: ReadPrincipal):
     )
     assignments = [
         {
-            "role": "soc_assistant",
-            "provider": settings.LLM_PROVIDER,
-            "model": settings.LLM_MODEL,
-        },
-        {
-            "role": "intent_router",
-            "provider": settings.LLM_PROVIDER,
-            "model": settings.LLM_ROUTER_MODEL or settings.LLM_MODEL,
-        },
-        {
-            "role": "mape_k_analyze_and_plan",
+            "role": "ai_soc_analyst",
             "provider": settings.LLM_PROVIDER,
             "model": settings.LLM_MODEL,
         },
@@ -542,6 +532,8 @@ def get_soc_platform(principal: ReadPrincipal):
             "self_healing_enabled": settings.SELF_HEALING_ENABLED,
             "human_approval_required": True,
             "max_tool_calls_per_stage": settings.MAPEK_MAX_TOOL_CALLS_PER_STAGE,
+            "analyst_max_tool_calls": settings.SOC_ANALYST_MAX_TOOL_CALLS,
+            "analyst_max_query_results": settings.SOC_ANALYST_MAX_QUERY_RESULTS,
         },
         retention={
             "messages_days": settings.RETENTION_MESSAGES_DAYS,
@@ -594,7 +586,7 @@ def stream_with_soc_orchestrator(
             "activity",
             {
                 "id": "activity-routing",
-                "tool": "intent_router",
+                "tool": "deterministic_router",
                 "label": "Routing the request to a bounded SOC capability",
                 "status": "running",
             },
@@ -607,7 +599,7 @@ def stream_with_soc_orchestrator(
                 "activity",
                 {
                     "id": "activity-selected",
-                    "tool": "intent_router",
+                    "tool": "deterministic_router",
                     "label": f"Selected {intent.command.value} capability",
                     "status": "completed",
                 },

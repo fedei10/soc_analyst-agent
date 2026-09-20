@@ -291,6 +291,34 @@ def test_get_client_wires_the_shared_rate_limiter(monkeypatch):
     assert calls == [2000 + (len('"hello"') + 3) // 4]
 
 
+@pytest.mark.parametrize("token,expected", [("raw-token", "sk-evomap-raw-token"),
+                                            ("sk-evomap-token", "sk-evomap-token"),
+                                            ("", "")])
+def test_evomap_uses_k_api_key_without_double_prefix_or_groq_fallback(monkeypatch, token, expected):
+    from pydantic import SecretStr
+    from app.mape_k.llm import effective_llm_api_key, settings
+
+    monkeypatch.setattr(settings, "LLM_PROVIDER", "evomap")
+    monkeypatch.setattr(settings, "K_API_KEY", SecretStr(token))
+    monkeypatch.setattr(settings, "LLM_API_KEY", SecretStr("old-groq-key"))
+    assert effective_llm_api_key() == expected
+
+
+def test_evomap_endpoint_uses_configured_model_and_url(monkeypatch):
+    from pydantic import SecretStr
+    from app.mape_k.llm import settings
+
+    monkeypatch.setattr(settings, "LLM_PROVIDER", "evomap")
+    monkeypatch.setattr(settings, "K_API_KEY", SecretStr("raw-token"))
+    monkeypatch.setattr(settings, "LLM_BASE_URL", "https://api.evomap.ai/v1")
+    monkeypatch.setattr(settings, "LLM_MODEL", "evomap-glm-5.2")
+    endpoint = LLMProvider()._endpoint()
+    assert endpoint["provider"] == "evomap"
+    assert endpoint["api_key"] == "sk-evomap-raw-token"
+    assert endpoint["model"] == "evomap-glm-5.2"
+    assert endpoint["base_url"] == "https://api.evomap.ai/v1"
+
+
 class FakeSlotCache:
     """Stands in for EphemeralRedis.acquire_rate_slot."""
 

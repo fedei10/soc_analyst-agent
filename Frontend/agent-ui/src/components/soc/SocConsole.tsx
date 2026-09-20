@@ -55,6 +55,7 @@ import {
 } from '@/api/soc'
 import type {
   AlertSummary,
+  AnalystResponsePayload,
   AnalystReport,
   AssistantCommand,
   ChatActivity,
@@ -99,7 +100,7 @@ const TERMINAL_INVESTIGATION_STATUSES = new Set([
 
 const WORKSPACE_TITLES: Record<WorkspaceView, string> = {
   overview: 'Operations overview',
-  chat: 'SOC Assistant',
+  chat: 'AI SOC Analyst',
   alerts: 'Alerts',
   assets: 'Assets',
   playbooks: 'Playbooks',
@@ -203,6 +204,18 @@ function Panel({
   )
 }
 
+// Debugging affordance for every answer, including conversational ones: the
+// prose is the default, the structured payload stays one click away instead
+// of being dumped into the transcript.
+function StructuredResult({ result }: { result: Record<string, unknown> }) {
+  return (
+    <details className="raw-result">
+      <summary>View structured result</summary>
+      <pre>{JSON.stringify(result, null, 2)}</pre>
+    </details>
+  )
+}
+
 function ResultDetails({ result }: { result: Record<string, unknown> }) {
   const summary = typeof result.summary === 'string' ? result.summary : null
   const primaryFields = [
@@ -246,23 +259,128 @@ function ResultDetails({ result }: { result: Record<string, unknown> }) {
           )
         })}
       </div>
-      {facts.length > 0 && (
-        <details className="raw-result">
-          <summary>View complete structured result</summary>
-          <pre>{JSON.stringify(result, null, 2)}</pre>
-        </details>
-      )}
+      {facts.length > 0 && <StructuredResult result={result} />}
     </div>
   )
 }
 
-function shouldShowResultDetails(result?: Record<string, unknown>): boolean {
+const GROUNDING_MEANING: Record<string, string> = {
+  grounded:
+    'Every claim is backed by evidence references the analyst actually cited, over a query that returned all matching records.',
+  partial:
+    'Backed by real evidence, but the query sampled or truncated the matching records, or a tool failed - treat distributions and totals as indicative only.',
+  ungrounded:
+    'No verified evidence reference was cited for this answer. Treat it as commentary, not a finding.'
+}
+
+/**
+ * Evidence coverage for one analyst turn.
+ *
+ * "Grounded" here deliberately does not mean "a tool ran". It means the answer
+ * cited at least one evidence reference that the backend saw come back from a
+ * tool, with no tool failures and no sampling or truncation in the underlying
+ * query. Anything less is reported as partial, with the limit named.
+ */
+function ConversationEvidence({ result }: { result: AnalystResponsePayload }) {
+  const metrics = result.analyst_metrics
+  const references = result.evidence_references || []
+  const failedTools = result.failed_tools || []
+  const status = result.grounding_status
+  const hasDetails =
+    Boolean(status) ||
+    references.length > 0 ||
+    failedTools.length > 0 ||
+    Boolean(metrics)
+
+  if (result.display_mode !== 'conversation' || !hasDetails) return null
+
+  const headline = [
+    `${metrics?.tool_calls ?? 0} tool call${metrics?.tool_calls === 1 ? '' : 's'}`,
+    typeof metrics?.matched_records === 'number'
+      ? `${metrics.matched_records} matching record${metrics.matched_records === 1 ? '' : 's'}`
+      : null,
+    typeof metrics?.sampled_records === 'number'
+      ? `${metrics.sampled_records} sampled record${metrics.sampled_records === 1 ? '' : 's'}`
+      : null,
+    `${references.length} verified evidence reference${references.length === 1 ? '' : 's'}`
+  ]
+    .filter(Boolean)
+    .join(' · ')
+
+  return (
+    <details className="message-activity">
+      <summary>Evidence: {headline}</summary>
+      <div className="trace-list">
+        {status && (
+          <div>
+            {status === 'grounded' ? (
+              <CheckCircle2 size={14} aria-hidden="true" />
+            ) : (
+              <AlertTriangle size={14} aria-hidden="true" />
+            )}
+            <span>
+              <strong>{titleCase(status)}</strong> —{' '}
+              {GROUNDING_MEANING[status] || 'Coverage was not reported.'}
+            </span>
+          </div>
+        )}
+        {metrics && (
+          <div>
+            <Activity size={14} aria-hidden="true" />
+            <span>
+              {metrics.tool_calls ?? 0} tool calls
+              {typeof metrics.elapsed_ms === 'number'
+                ? ` in ${metrics.elapsed_ms} ms`
+                : ''}
+              {typeof metrics.tool_call_budget === 'number'
+                ? ` (budget ${metrics.tool_call_budget}, not required to be spent)`
+                : ''}
+            </span>
+          </div>
+        )}
+        {metrics?.truncated && (
+          <div>
+            <AlertTriangle size={14} aria-hidden="true" />
+            <span>
+              Results were truncated to fit the tool output budget, so counts
+              below the total are a sample, not the full population.
+            </span>
+          </div>
+        )}
+        {references.map((reference) => (
+          <div key={reference}>
+            <FileText size={14} aria-hidden="true" />
+            <span>{reference}</span>
+          </div>
+        ))}
+        {failedTools.map((tool) => (
+          <div key={tool}>
+            <AlertTriangle size={14} aria-hidden="true" />
+            <span>{titleCase(tool)} failed</span>
+          </div>
+        ))}
+      </div>
+    </details>
+  )
+}
+
+const ROUTING_ONLY_KEYS = [
+  'intent',
+  'token_usage',
+  'display_mode',
+  'answer_type',
+  'recent_context'
+]
+
+function hasInspectablePayload(result?: AnalystResponsePayload): boolean {
+  if (!result) return false
+  return Object.keys(result).some((key) => !ROUTING_ONLY_KEYS.includes(key))
+}
+
+function shouldShowResultDetails(result?: AnalystResponsePayload): boolean {
   if (!result || Object.keys(result).length === 0) return false
   if (result.display_mode === 'conversation') return false
-  const visibleKeys = Object.keys(result).filter(
-    (key) => !['intent', 'token_usage', 'display_mode'].includes(key)
-  )
-  return visibleKeys.length > 0
+  return hasInspectablePayload(result)
 }
 
 function ChatMessageItem({ message }: { message: ChatMessage }) {
@@ -284,7 +402,7 @@ function ChatMessageItem({ message }: { message: ChatMessage }) {
       <div className="message-content">
         <div className="message-meta">
           <strong>
-            {isUser ? 'You' : isError ? 'Agent error' : 'SOC Analyst'}
+            {isUser ? 'You' : isError ? 'Analyst error' : 'AI SOC Analyst'}
           </strong>
           <time>
             {new Date(message.createdAt).toLocaleTimeString([], {
@@ -293,10 +411,27 @@ function ChatMessageItem({ message }: { message: ChatMessage }) {
             })}
           </time>
         </div>
-        <p>{message.content}</p>
-        {shouldShowResultDetails(message.response) && message.response && (
-          <ResultDetails result={message.response} />
+        {isUser ? (
+          <p>{message.content}</p>
+        ) : (
+          // Analyst text is GitHub-flavoured Markdown. Rendering it into a
+          // bare <p> was why `**bold**`, `| tables |`, `### headings` and any
+          // raw `<br>`/`<svg>` the model emitted showed up as literal source.
+          <MarkdownRenderer classname="message-markdown">
+            {message.content}
+          </MarkdownRenderer>
         )}
+        {message.response &&
+          (shouldShowResultDetails(message.response) ? (
+            <ResultDetails result={message.response} />
+          ) : (
+            // Conversational answers keep the payload available without
+            // pasting it into the transcript.
+            hasInspectablePayload(message.response) && (
+              <StructuredResult result={message.response} />
+            )
+          ))}
+        {message.response && <ConversationEvidence result={message.response} />}
         {message.investigation && (
           <div className="result-details investigation-summary">
             <div className="result-facts">
@@ -319,7 +454,7 @@ function ChatMessageItem({ message }: { message: ChatMessage }) {
         )}
         {message.activities && message.activities.length > 0 && (
           <details className="message-activity">
-            <summary>Investigation activity</summary>
+            <summary>Analyst activity</summary>
             <div className="trace-list">
               {message.activities.map((activity, index) => (
                 <div
@@ -676,17 +811,15 @@ export default function SocConsole() {
       if (result.tools_used?.includes('save_report')) {
         void refreshReports()
       }
-      if (result.tools_used?.includes('start_investigation')) {
-        void Promise.all([refreshOverview(), refreshPlatform()])
-      }
       if (result.investigation) {
+        void Promise.all([refreshOverview(), refreshPlatform()])
         void trackInvestigation(result.investigation)
       }
     } catch (error) {
       const message =
         error instanceof Error
           ? error.message
-          : 'The SOC agent did not respond.'
+          : 'The AI SOC analyst did not respond.'
       setMessages((current) => [...current, createMessage('error', message)])
     } finally {
       setChatBusy(false)
@@ -820,7 +953,7 @@ export default function SocConsole() {
             }}
           >
             <MessageSquare size={17} />
-            SOC Assistant
+            AI SOC Analyst
           </button>
           <button
             className={view === 'alerts' ? 'active' : ''}
@@ -1169,8 +1302,10 @@ export default function SocConsole() {
                 <div className="orchestrator-node">
                   <Bot size={17} />
                   <div>
-                    <strong>Bounded SOC command router</strong>
-                    <span>Slash commands or natural-language requests</span>
+                    <strong>Single AI SOC analyst</strong>
+                    <span>
+                      Natural-language analysis with bounded evidence tools
+                    </span>
                   </div>
                 </div>
                 <ChevronRight size={16} />
@@ -1178,8 +1313,8 @@ export default function SocConsole() {
                   className="specialist-nodes"
                   aria-label="SOC workflow boundaries"
                 >
-                  <span>Formal investigation</span>
-                  <span>Human approval gate</span>
+                  <span>Read-only investigation</span>
+                  <span>Approval-gated response</span>
                 </div>
               </div>
 
@@ -1189,11 +1324,13 @@ export default function SocConsole() {
                     <div className="empty-icon">
                       <ShieldAlert size={26} />
                     </div>
-                    <span>SOC Assistant</span>
-                    <h2>Choose a capability</h2>
+                    <span>AI SOC Analyst</span>
+                    <h2>Investigate conversationally</h2>
                     <p>
-                      Type <strong>/</strong> for commands or describe the SOC
-                      task in your own words.
+                      Ask a security question in your own words, or type{' '}
+                      <strong>/</strong> for deterministic commands. Use{' '}
+                      <strong>/investigate</strong> to start the formal
+                      workflow.
                     </p>
                     <div className="prompt-list">
                       {SUGGESTED_PROMPTS.map((prompt) => (
@@ -1220,9 +1357,11 @@ export default function SocConsole() {
                       </div>
                       <div className="message-content">
                         <div className="message-meta">
-                          <strong>SOC Analyst</strong>
+                          <strong>AI SOC Analyst</strong>
                         </div>
-                        <p>{liveAnswer}</p>
+                        <MarkdownRenderer classname="message-markdown">
+                          {liveAnswer}
+                        </MarkdownRenderer>
                       </div>
                     </article>
                   ) : (

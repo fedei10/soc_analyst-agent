@@ -1,4 +1,4 @@
-"""Deterministic command parsing with one bounded Oxy intent fallback."""
+"""Deterministic command parsing for the single conversational analyst."""
 
 from __future__ import annotations
 
@@ -7,14 +7,9 @@ import re
 import shlex
 from typing import Any
 
-import structlog
-
-from app.mape_k.llm import LLMProvider, LLMTier, get_llm_provider
-from app.soc_assistant.catalog import COMMANDS, COMMAND_BY_SLASH
+from app.soc_assistant.catalog import COMMAND_BY_SLASH
 from app.soc_assistant.schemas import AssistantCommandName, AssistantIntent
 
-
-logger = structlog.get_logger("tsage.soc_assistant.router")
 
 OPTION_NAMES = {
     "--hours": "hours",
@@ -30,46 +25,6 @@ FLAG_OPTIONS = {
     "--new": "new_only",
     "--open": "open_only",
     "--all": "all_results",
-}
-
-COMMAND_ARGUMENTS = {
-    AssistantCommandName.CHAT: {"question"},
-    AssistantCommandName.HELP: set(),
-    AssistantCommandName.ALERTS: {
-        "hours",
-        "min_level",
-        "limit",
-        "agent_id",
-        "text",
-        "since",
-        "severity",
-        "new_only",
-        "open_only",
-        "all_results",
-    },
-    AssistantCommandName.SUMMARY: {"hours"},
-    AssistantCommandName.HUNT: {
-        "indicator",
-        "indicator_type",
-        "hours",
-        "limit",
-        "agent_id",
-    },
-    AssistantCommandName.TRIAGE: {"hours", "min_level", "limit"},
-    AssistantCommandName.INVESTIGATE: {"alert_id", "agent_id"},
-    AssistantCommandName.STATUS: {"investigation_id"},
-    AssistantCommandName.PLAN: {"investigation_id"},
-    AssistantCommandName.COLLECT: {"investigation_id"},
-    AssistantCommandName.CONTINUE: {"investigation_id"},
-    AssistantCommandName.HEALTH: set(),
-    AssistantCommandName.EXPLAIN: {"command"},
-}
-
-ARGUMENT_ALIASES = {
-    "agent": "agent_id",
-    "alert": "alert_id",
-    "investigation": "investigation_id",
-    "query": "text",
 }
 
 INVALID_ALERT_REFERENCES = {
@@ -97,13 +52,33 @@ VAGUE_NO_TARGET_PATTERN = re.compile(
     r"|any\s*(?:thing)?\s*suspicious"
 )
 
+# "new", "recent" and "changed" are three different questions that used to
+# collapse into one broad alert listing. They are separated here so the
+# executor can answer each against the right reference point: a recent time
+# window, the user's previous successful check, or a state comparison.
+CHANGE_SUBJECT_PATTERNS = (
+    ("findings", re.compile(r"\bfindings?\b")),
+    ("analysis", re.compile(r"\banalys[ei]s\b|\banalyses\b")),
+    ("alerts", re.compile(r"\balerts?\b")),
+)
+NEW_PATTERN = re.compile(
+    r"\bnew\b|\bsince (?:my |the |our |we )?last\b|\bsince i last\b"
+)
+CHANGED_PATTERN = re.compile(
+    r"\b(?:changed|changes|different|updated|updates)\b"
+)
+RECENT_PATTERN = re.compile(r"\b(?:recent|latest|newest|current)\b")
+# An explicit instruction to show rows, as opposed to a question about what
+# moved. Anything else about alerts is a question for the analyst model.
+LIST_PATTERN = re.compile(r"^(?:show|list|display|give me|get)\b")
+
 
 class AssistantIntentRouter:
-    def __init__(self, llm: LLMProvider | None = None) -> None:
-        # Intent classification is a small structured pick, not reasoning -
-        # keeping it on the cheap tier leaves the reasoning budget for
-        # diagnosis and the analyst chat loop.
-        self.llm = llm or get_llm_provider(LLMTier.ROUTER)
+    def __init__(self, llm: Any | None = None) -> None:
+        # Kept as an ignored compatibility argument for callers from before
+        # the single-analyst refactor. Free-form language no longer incurs a
+        # second model call merely to classify intent.
+        self.llm = llm
 
     @staticmethod
     def _arguments(tokens: list[str]) -> tuple[list[str], dict[str, Any]]:
@@ -182,33 +157,6 @@ class AssistantIntentRouter:
         return AssistantIntent(command=command.name, arguments=options)
 
     @staticmethod
-    def _canonical_argument_name(name: str) -> str:
-        snake = re.sub(r"(?<!^)(?=[A-Z])", "_", name).replace("-", "_").lower()
-        return ARGUMENT_ALIASES.get(snake, snake)
-
-    @classmethod
-    def _normalize_arguments(
-        cls,
-        command: AssistantCommandName,
-        arguments: dict[str, Any],
-    ) -> dict[str, Any]:
-        allowed = COMMAND_ARGUMENTS[command]
-        normalized: dict[str, Any] = {}
-        unsupported: list[str] = []
-        for name, value in arguments.items():
-            canonical = cls._canonical_argument_name(str(name))
-            if canonical not in allowed:
-                unsupported.append(str(name))
-                continue
-            normalized[canonical] = value
-        if unsupported:
-            rendered = ", ".join(sorted(unsupported))
-            raise ValueError(
-                f"Unsupported arguments for {command.value}: {rendered}"
-            )
-        return normalized
-
-    @staticmethod
     def _alert_id(message: str) -> str | None:
         patterns = (
             # IDs commonly include the word "alert" as part of the token.
@@ -251,6 +199,48 @@ class AssistantIntentRouter:
         if agent:
             arguments["agent_id"] = agent.group(1)
         return arguments
+
+    @staticmethod
+    def _change_query(lower: str, *, has_window: bool = False) -> dict[str, Any] | None:
+        """Classify "what is new / recent / changed" questions.
+
+        Returns None for everything else, so an ordinary alert question
+        ("which IP is behind most of these?") reaches the analyst model
+        instead of being answered with a structured listing.
+        """
+
+        subject = next(
+            (
+                name
+                for name, pattern in CHANGE_SUBJECT_PATTERNS
+                if pattern.search(lower)
+            ),
+            None,
+        )
+        asks_changed = bool(CHANGED_PATTERN.search(lower))
+        asks_new = bool(NEW_PATTERN.search(lower))
+        if subject is None:
+            # "what changed?" / "anything new?" names no subject but still has
+            # a well-defined answer: everything the cursor tracks.
+            if asks_changed or (asks_new and re.search(r"\bany\b", lower)):
+                return {
+                    "change_subject": "all",
+                    "change_mode": "changed" if asks_changed else "new",
+                }
+            return None
+        if asks_new:
+            return {"change_subject": subject, "change_mode": "new"}
+        if asks_changed:
+            return {"change_subject": subject, "change_mode": "changed"}
+        # A named time window ("in the last hour", "overnight") makes this a
+        # window question, which is exactly what "recent" means here.
+        if (
+            RECENT_PATTERN.search(lower)
+            or LIST_PATTERN.match(lower.strip())
+            or has_window
+        ):
+            return {"change_subject": subject, "change_mode": "recent"}
+        return None
 
     @staticmethod
     def _indicator(message: str) -> tuple[str | None, str]:
@@ -333,11 +323,9 @@ class AssistantIntentRouter:
                 "full mapek",
                 "whole mapk",
                 "whole mapek",
-                "start investigation",
-                "investigate alert",
-                "investigate it",
-                "investigate this",
-                "investigate that",
+                "start formal investigation",
+                "start response workflow",
+                "run controlled response",
             )
         ):
             return AssistantIntent(
@@ -349,7 +337,9 @@ class AssistantIntentRouter:
                 command=AssistantCommandName.CHAT,
                 arguments={"question": message},
             )
-        if "investigate" in lower:
+        if "investigate" in lower or re.search(
+            r"\b(analyze|analyse|explain|review|correlate)\b", lower
+        ):
             # Casual phrasing ("could u investigate him 1.2.3.4") that isn't
             # a formal /investigate <alert_id> request. The formal workflow
             # needs a specific Wazuh alert ID; anything looser is a search
@@ -374,26 +364,17 @@ class AssistantIntentRouter:
             for phrase in ("triage findings", "triage alerts", "show findings")
         ):
             return AssistantIntent(command=AssistantCommandName.TRIAGE)
-        alert_query = bool(re.search(r"\balerts?\b", lower)) and bool(
-            re.search(
-                r"\b(show|list|get|find|any|which|what|recent|latest|newest|came)\b",
-                lower,
-            )
-        )
-        if alert_query or any(
-            phrase in lower
-            for phrase in (
-                "get only alerts",
-                "show alerts",
-                "recent alerts",
-                "latest alerts",
-                "newest alerts",
-                "wazuh alerts",
-            )
-        ):
+        # Only "what is new / recent / changed" and explicit listing requests
+        # are answered deterministically. Every other alert question - "which
+        # IP is responsible for these?", "is this a brute force?" - used to be
+        # captured here too and answered with a structured dump; it now falls
+        # through to the analyst model, which can actually investigate it.
+        filters = self._alert_filters(message)
+        change = self._change_query(lower, has_window="hours" in filters)
+        if change is not None:
             return AssistantIntent(
                 command=AssistantCommandName.ALERTS,
-                arguments=self._alert_filters(message),
+                arguments={**filters, **change},
             )
         if any(phrase in lower for phrase in ("alert summary", "alert overview", "how many alerts")):
             return AssistantIntent(command=AssistantCommandName.SUMMARY)
@@ -434,101 +415,12 @@ class AssistantIntentRouter:
         if deterministic is not None:
             return deterministic, {"input_tokens": 0, "output_tokens": 0}
 
-        catalog = [
-            {
-                "command": command.name,
-                "description": command.description,
-                "usage": command.usage,
-            }
-            for command in COMMANDS
-        ]
-        def classify(method: str):
-            return self.llm.invoke_structured(
-                AssistantIntent,
-                [
-                    {
-                        "role": "system",
-                        "content": (
-                            "Select exactly one SOC capability. Return only arguments "
-                            "explicitly present in the message. Use chat for explanatory "
-                            "questions or requests for defensive guidance. Use help only "
-                            "when the user asks about available capabilities. "
-                            "When the message names an entity you cannot resolve to "
-                            "exactly one candidate, use clarify and put the question "
-                            "to the analyst in the question field - never guess a "
-                            "target."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Capabilities: {catalog}\nMessage: {message[:2000]}",
-                    },
-                ],
-                method=method,
-            )
-
-        try:
-            try:
-                intent, usage = classify("function_calling")
-            except Exception as exc:
-                # The provider returns 400 tool_use_failed when the model
-                # answers in prose instead of calling the forced tool - it is
-                # usually trying to ask a question. Give it one unforced shot
-                # before writing the turn off.
-                if getattr(exc, "status_code", None) != 400:
-                    raise
-                intent, usage = classify("json_mode")
-            routed = AssistantIntent.model_validate(intent)
-            routed = routed.model_copy(
-                update={
-                    "arguments": self._normalize_arguments(
-                        routed.command,
-                        routed.arguments,
-                    ),
-                    "source": "oxy",
-                }
-            )
-            if routed.command == AssistantCommandName.CLARIFY:
-                # Carry the question where the executor reads arguments from.
-                return (
-                    routed.model_copy(
-                        update={
-                            "arguments": {
-                                **routed.arguments,
-                                "question": routed.question or "",
-                            }
-                        }
-                    ),
-                    usage,
-                )
-            if routed.confidence < 0.65:
-                # An uncertain classification is not a reason to dead-end the
-                # user at a menu message - hand the raw message to the
-                # general-purpose (read-only) chat capability instead, which
-                # can actually search and answer it.
-                routed = AssistantIntent(
-                    command=AssistantCommandName.CHAT,
-                    arguments={"question": message},
-                    confidence=routed.confidence,
-                    source="oxy",
-                )
-            return routed, usage
-        except Exception:
-            # Slash commands and deterministic natural-language routes must stay
-            # available when the optional intent-classification call is down.
-            # Route to chat rather than a dead-end HELP message: the chat path
-            # has its own graceful "model unavailable" fallback, so the user
-            # gets an honest answer either way instead of a non-sequitur menu.
-            # source is router_error, not fallback: the turn is degraded, the
-            # UI must show the router step as failed, and state-changing tools
-            # stay unbound because nothing established what the analyst wanted.
-            logger.warning("intent_router_failed", exc_info=True)
-            return (
-                AssistantIntent(
-                    command=AssistantCommandName.CHAT,
-                    arguments={"question": message},
-                    confidence=0,
-                    source="router_error",
-                ),
-                {"input_tokens": 0, "output_tokens": 0},
-            )
+        return (
+            AssistantIntent(
+                command=AssistantCommandName.CHAT,
+                arguments={"question": message},
+                confidence=1.0,
+                source="deterministic",
+            ),
+            {"input_tokens": 0, "output_tokens": 0},
+        )

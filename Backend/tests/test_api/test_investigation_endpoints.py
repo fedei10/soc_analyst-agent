@@ -80,12 +80,7 @@ def test_soc_platform_metadata_does_not_initialize_model_providers(monkeypatch):
 
     assignments = response["data"]["model_assignments"]
     assert [(item["role"], item["provider"]) for item in assignments] == [
-        ("soc_assistant", investigations.settings.LLM_PROVIDER),
-        ("intent_router", investigations.settings.LLM_PROVIDER),
-        (
-            "mape_k_analyze_and_plan",
-            investigations.settings.LLM_PROVIDER,
-        ),
+        ("ai_soc_analyst", investigations.settings.LLM_PROVIDER),
     ]
     assert response["data"]["response_policy"]["human_approval_required"] is True
 

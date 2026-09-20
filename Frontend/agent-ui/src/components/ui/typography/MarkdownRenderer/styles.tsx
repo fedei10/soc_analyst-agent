@@ -1,6 +1,6 @@
 'use client'
 
-import { FC, useState } from 'react'
+import React, { FC, useState } from 'react'
 
 import Image from 'next/image'
 import Link from 'next/link'
@@ -121,13 +121,61 @@ const HorizontalRule = ({ className, ...props }: HorizontalRuleProps) => (
   />
 )
 
-const InlineCode: FC<PreparedTextProps> = ({ children }) => {
+const toPlainText = (node: React.ReactNode): string => {
+  if (typeof node === 'string' || typeof node === 'number') return String(node)
+  if (Array.isArray(node)) return node.map(toPlainText).join('')
+  if (React.isValidElement(node)) {
+    return toPlainText((node.props as { children?: React.ReactNode }).children)
+  }
+  return ''
+}
+
+// react-markdown v9 dropped the `inline` prop, so a fenced block is told apart
+// from a span of inline code by the `language-*` class remark puts on the
+// former. Fenced blocks get a copy affordance; the clipboard receives the
+// node's own text, so backslashes and quoting in a suggested shell command
+// survive verbatim.
+const CodeBlock: FC<PreparedTextProps & { className?: string }> = ({
+  className,
+  children
+}) => {
+  const [copied, setCopied] = useState(false)
+  const language = /language-([\w-]+)/.exec(className || '')?.[1]
+
+  if (!language) {
+    return <code className="markdown-inline-code">{children}</code>
+  }
+
+  const source = toPlainText(children)
   return (
-    <code className="relative whitespace-pre-wrap rounded-sm bg-background-secondary/50 p-1">
-      {children}
-    </code>
+    <div className="markdown-code-block">
+      <div className="markdown-code-head">
+        <span>{language}</span>
+        <button
+          type="button"
+          onClick={() => {
+            void navigator.clipboard?.writeText(source).then(
+              () => {
+                setCopied(true)
+                setTimeout(() => setCopied(false), 1500)
+              },
+              () => setCopied(false)
+            )
+          }}
+        >
+          {copied ? 'Copied' : 'Copy'}
+        </button>
+      </div>
+      <pre>
+        <code className={className}>{children}</code>
+      </pre>
+    </div>
   )
 }
+
+// CodeBlock emits its own <pre>; without overriding `pre` the fenced block
+// would end up wrapped in a second one.
+const PreBlock: FC<PreparedTextProps> = ({ children }) => <>{children}</>
 
 const Blockquote = ({ className, ...props }: BlockquoteProps) => (
   <blockquote
@@ -209,7 +257,9 @@ const Img = ({ src, alt }: ImgProps) => {
 }
 
 const Table = ({ className, ...props }: TableProps) => (
-  <div className="w-full max-w-[560px] overflow-hidden rounded-md border border-border">
+  // Fluid rather than a fixed 560px cap: the same transcript has to stay
+  // readable on a phone and on a wide console.
+  <div className="w-full max-w-full overflow-hidden rounded-md border border-border">
     <div className="w-full overflow-x-auto">
       <table className={cn(className, 'w-full')} {...filterProps(props)} />
     </div>
@@ -268,7 +318,8 @@ export const components = {
   del: DeletedText,
   hr: HorizontalRule,
   blockquote: Blockquote,
-  code: InlineCode,
+  code: CodeBlock,
+  pre: PreBlock,
   a: AnchorLink,
   img: Img,
   p: Paragraph,

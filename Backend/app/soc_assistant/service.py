@@ -13,7 +13,7 @@ from langsmith import traceable
 from opensearchpy import exceptions as opensearch_exc
 
 from app.config import settings
-from app.mape_k.llm import is_rate_limit_error
+from app.mape_k.llm import LLMErrorCode, LLMInputLimitError, classify_llm_error, is_rate_limit_error
 from app.orchestration.investigation_service import (
     InvestigationNotFoundError,
     InvestigationService,
@@ -38,8 +38,7 @@ from app.services.wazuh.normalization.serializers import (
 from app.services.wazuh.triage.service import run_triage
 from app.soc_assistant.catalog import public_catalog
 from app.soc_assistant.command_explainer import MAX_COMMAND_LENGTH, explain_command
-from app.soc_assistant.question_agent import SOCQuestionAgent
-from app.soc_assistant.tool_agent import SOCToolAgent
+from app.soc_assistant.tool_agent import SOCAnalyst, SOCToolAgent
 from app.soc_assistant.router import AssistantIntentRouter
 from app.soc_assistant.references import (
     InvestigationReferenceError,
@@ -56,7 +55,7 @@ from app.soc_assistant.schemas import (
 INDICATOR_TYPES = {"ip", "domain", "hash", "process", "user", "path", "other"}
 RUNNING_ACTIVITY = {
     AssistantCommandName.CHAT: (
-        "soc_tool_agent",
+        "soc_analyst",
         "Preparing an evidence-backed SOC answer",
     ),
     AssistantCommandName.ALERTS: (
@@ -278,100 +277,14 @@ class SOCAssistant:
         gateway: WazuhGateway | None = None,
         investigations: InvestigationService | None = None,
         router: AssistantIntentRouter | None = None,
-        question_agent: SOCQuestionAgent | None = None,
         tool_agent: "SOCToolAgent | None" = None,
     ) -> None:
         self.gateway = gateway or WazuhGateway()
         self.investigations = investigations or get_investigation_service()
         self.router = router or AssistantIntentRouter()
-        self.question_agent = question_agent or SOCQuestionAgent()
-        self.tool_agent = tool_agent or SOCToolAgent(
+        self.tool_agent = tool_agent or SOCAnalyst(
             gateway=self.gateway, investigations=self.investigations
         )
-
-    def _question_context(
-        self,
-        *,
-        recent_context: dict[str, str],
-        organization_id: str,
-    ) -> dict[str, Any]:
-        context: dict[str, Any] = {
-            "references": dict(recent_context),
-        }
-        alert_id = recent_context.get("wazuh_alert")
-        if alert_id:
-            try:
-                alert = get_alert_memory_repository().get_alert_by_document_id(
-                    alert_id
-                )
-            except Exception:
-                alert = None
-            if alert:
-                context["alert"] = {
-                    key: alert.get(key)
-                    for key in (
-                        "wazuh_document_id",
-                        "event_timestamp",
-                        "agent_id",
-                        "agent_name",
-                        "rule_id",
-                        "rule_level",
-                        "source_ip",
-                        "target_user",
-                        "event_type",
-                        "correlation_status",
-                    )
-                }
-
-        finding_id = recent_context.get("finding")
-        if finding_id:
-            try:
-                finding = get_finding_repository().get(
-                    finding_id,
-                    organization_id=settings.WAZUH_INGESTION_ORGANIZATION_ID,
-                )
-            except Exception:
-                finding = None
-            if finding:
-                context["finding"] = {
-                    "finding_id": finding["finding_id"],
-                    "status": finding.get("status"),
-                    "version": finding.get("version"),
-                    "finding": finding.get("finding"),
-                    "verdict": finding.get("verdict"),
-                }
-
-        investigation_id = recent_context.get("investigation")
-        if investigation_id:
-            try:
-                snapshot = self.investigations.snapshot(
-                    investigation_id,
-                    organization_id=organization_id,
-                )
-            except Exception:
-                snapshot = None
-            if snapshot:
-                context["investigation"] = {
-                    key: snapshot.get(key)
-                    for key in (
-                        "investigation_id",
-                        "alert_id",
-                        "finding_id",
-                        "agent_id",
-                        "status",
-                        "current_stage",
-                        "severity",
-                        "confidence",
-                        "diagnosis",
-                        "remediation_plan",
-                        "advisory_plan",
-                        "verification",
-                        "failure_code",
-                        "failure_reason",
-                        "pending_nodes",
-                    )
-                }
-        return context
 
     @staticmethod
     def _activity(
@@ -551,6 +464,11 @@ class SOCAssistant:
                             str(finding["representative_alert_id"]),
                         )
                     )
+            for reference_type, reference_value in (
+                response.response.get("context_references") or {}
+            ).items():
+                if reference_type in {"source_ip", "target_user", "agent"}:
+                    references.append((str(reference_type), str(reference_value)))
             memory = get_alert_memory_repository()
             for reference_type, reference_value in dict.fromkeys(references):
                 memory.add_conversation_reference(
@@ -563,6 +481,420 @@ class SOCAssistant:
         except Exception:
             # Conversation persistence must not hide a successful SOC operation.
             return
+
+    @staticmethod
+    def _cursor_key(organization_id: str, user_id: str) -> str:
+        """Scope the durable change cursor to one tenant *and* one analyst.
+
+        The cursor row is keyed by a single string, so the scope is encoded in
+        the key rather than migrating the table. An analyst who can see two
+        organizations gets an independent "since my last check" in each, which
+        is the only reading of "what is new" that is not misleading.
+        """
+
+        return f"{organization_id}:{user_id}"
+
+    @staticmethod
+    def _interval_phrase(previous: datetime, now: datetime) -> str:
+        """Say how long ago the previous check was, from the real clock.
+
+        Both sides are timezone-aware UTC, so this never claims "a few minutes
+        ago" for a timestamp it never compared against the request time.
+        """
+
+        seconds = max(0, int((now - previous).total_seconds()))
+        if seconds < 90:
+            return f"{seconds} second{'' if seconds == 1 else 's'} ago"
+        minutes = seconds // 60
+        if minutes < 90:
+            return f"{minutes} minute{'' if minutes == 1 else 's'} ago"
+        hours = minutes // 60
+        if hours < 48:
+            return f"{hours} hour{'' if hours == 1 else 's'} ago"
+        days = hours // 24
+        return f"{days} day{'' if days == 1 else 's'} ago"
+
+    @staticmethod
+    def _clock(value: datetime) -> str:
+        return value.strftime("%H:%M:%S UTC")
+
+    def _alerts_capability(
+        self,
+        arguments: dict[str, Any],
+        *,
+        organization_id: str,
+        user_id: str,
+    ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
+        """Answer "any new / recent / changed alerts, findings, analysis?".
+
+        The three questions have three different reference points and used to
+        share one. `recent` is a time window; `new` and `changed` are measured
+        against this analyst's previous successful check. Only the latter two
+        move the durable cursor, and never for an explicitly historical window.
+        """
+
+        checked_at = datetime.now(UTC)
+        memory = get_alert_memory_repository()
+        cursor_key = self._cursor_key(organization_id, user_id)
+        previous_check = memory.get_user_cursor(cursor_key)
+
+        severity_levels = {
+            "informational": 0,
+            "low": 4,
+            "medium": 7,
+            "high": 10,
+            "critical": 13,
+        }
+        severity = str(arguments.get("severity") or "").lower()
+        if severity and severity not in severity_levels:
+            raise ValueError("Unsupported severity filter.")
+        explicit_window = bool(arguments.get("since") or "hours" in arguments)
+        window_hours = (
+            _duration_hours(arguments.get("since"))
+            if arguments.get("since")
+            else _bounded_int(
+                arguments.get("hours"), default=24, minimum=1, maximum=168
+            )
+        )
+        tool_inputs = {
+            "min_level": (
+                severity_levels[severity]
+                if severity
+                else _bounded_int(
+                    arguments.get("min_level"),
+                    default=0,
+                    minimum=0,
+                    maximum=16,
+                )
+            ),
+            "hours": window_hours,
+            "limit": _bounded_int(
+                arguments.get("limit"), default=20, minimum=1, maximum=50
+            ),
+            "agent_id": arguments.get("agent_id"),
+            "text": arguments.get("text"),
+        }
+
+        subject = str(arguments.get("change_subject") or "all")
+        mode = str(arguments.get("change_mode") or "")
+        if arguments.get("new_only"):
+            mode = "new"
+        elif not mode:
+            mode = (
+                "recent"
+                if explicit_window
+                or arguments.get("all_results")
+                or arguments.get("open_only")
+                else "new"
+            )
+        # An explicit window is a historical question. Answering it must not
+        # move the mark the next "what is new?" is measured from.
+        historical = explicit_window and mode != "new"
+        if historical:
+            mode = "recent"
+
+        if not getattr(memory, "durable", False):
+            return self._alerts_without_cursor(
+                tool_inputs,
+                checked_at=checked_at,
+                mode=mode,
+                subject=subject,
+            )
+
+        # Three questions, three reference points. Only "new"/"changed" with a
+        # cursor on record measures against the previous check; everything else
+        # measures against the requested window.
+        baseline_only = mode in {"new", "changed"} and previous_check is None
+        reference = (
+            previous_check
+            if previous_check is not None and not baseline_only and mode != "recent"
+            else checked_at - timedelta(hours=window_hours)
+        )
+
+        records = get_finding_repository().list(
+            organization_id=settings.WAZUH_INGESTION_ORGANIZATION_ID,
+            limit=tool_inputs["limit"],
+            severity=severity or None,
+            status="open" if arguments.get("open_only") else None,
+        )
+        if tool_inputs["agent_id"]:
+            finding_ids = memory.finding_ids_for_agent(tool_inputs["agent_id"])
+            records = [
+                record
+                for record in records
+                if record["finding_id"] in finding_ids
+            ]
+        text_filter = str(tool_inputs["text"] or "").strip().lower()
+        if text_filter:
+            records = [
+                record
+                for record in records
+                if text_filter
+                in " ".join(
+                    (
+                        str(record["finding"].get("title") or ""),
+                        str(record["finding"].get("summary") or ""),
+                        str(record.get("event_type") or ""),
+                    )
+                ).lower()
+            ]
+
+        new_records = [
+            record
+            for record in records
+            if _as_datetime(record["created_at"]) > reference
+        ]
+        updated_records = [
+            record
+            for record in records
+            if _as_datetime(record["created_at"]) <= reference
+            and _as_datetime(record["updated_at"]) > reference
+        ]
+        # "New analysis" is a verdict that was written or rewritten, which is
+        # not the same as a finding merely being touched.
+        reanalyzed = [
+            record
+            for record in updated_records
+            if (record.get("verdict") or {}).get("verdict")
+        ]
+        changed_ids = {
+            record["finding_id"] for record in [*new_records, *updated_records]
+        }
+        if mode == "new" and not baseline_only:
+            visible = new_records
+        elif arguments.get("all_results") or arguments.get("open_only") or mode == "recent":
+            visible = records
+        else:
+            visible = [
+                record
+                for record in records
+                if record["finding_id"] in changed_ids
+            ]
+
+        findings = []
+        for record in visible:
+            finding = dict(record["finding"])
+            finding.update(
+                {
+                    "finding_id": record["finding_id"],
+                    "status": record["status"],
+                    "version": record["version"],
+                    "verdict": record["verdict"].get("verdict"),
+                    "verdict_confidence": record["verdict"].get("confidence"),
+                }
+            )
+            findings.append(finding)
+
+        alert_count = memory.count_alerts_since(
+            reference,
+            agent_id=tool_inputs["agent_id"],
+            min_level=tool_inputs["min_level"],
+        )
+        comparable = mode in {"new", "changed"} and not baseline_only
+        payload: dict[str, Any] = {
+            "display_mode": "conversation",
+            "answer_type": f"change_report_{mode}",
+            "grounded": True,
+            "grounding_status": "grounded",
+            "change_subject": subject,
+            "mode": mode,
+            "raw_alert_count": alert_count,
+            "recent_alerts": alert_count,
+            "finding_count": len(findings),
+            "findings": findings,
+            "total_findings": len(records),
+            # None, not 0: before a baseline exists there is no such quantity,
+            # and reporting the window's whole history as "new" was the bug.
+            "new_alerts": alert_count if comparable else None,
+            "new_findings": len(new_records) if comparable else None,
+            "updated_findings": len(updated_records) if comparable else None,
+            "reanalyzed_findings": len(reanalyzed) if comparable else None,
+            "unchanged_findings": len(records) - len(changed_ids),
+            "since": reference.isoformat(),
+            "checked_at": checked_at.isoformat(),
+            "new_since_last_check": (
+                previous_check.isoformat() if previous_check else None
+            ),
+            "baseline_established": baseline_only,
+            "window_hours": window_hours if not comparable else None,
+            "cursor_status": "durable",
+            "cursor_advanced": False,
+            "source": "postgresql",
+        }
+
+        if mode in {"new", "changed"} and not historical:
+            memory.advance_user_cursor(
+                cursor_key,
+                checked_at,
+                finding_version=max(
+                    (int(record.get("version") or 0) for record in records),
+                    default=None,
+                ),
+            )
+            payload["cursor_advanced"] = True
+
+        return (
+            self._change_summary(
+                subject=subject,
+                mode=mode,
+                baseline_only=baseline_only,
+                previous_check=previous_check,
+                checked_at=checked_at,
+                window_hours=window_hours,
+                alert_count=alert_count,
+                total_findings=len(records),
+                new_findings=len(new_records),
+                updated_findings=len(updated_records),
+                reanalyzed=len(reanalyzed),
+            ),
+            payload,
+            ["query_alert_memory"],
+            {},
+        )
+
+    def _alerts_without_cursor(
+        self,
+        tool_inputs: dict[str, Any],
+        *,
+        checked_at: datetime,
+        mode: str,
+        subject: str,
+    ) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
+        """Live Wazuh answer for deployments with no durable alert memory.
+
+        Without the cursor there is no honest answer to "what is new", so this
+        says so instead of presenting a time window as a comparison.
+        """
+
+        result = self._run_tool(
+            tool_name="search_alerts",
+            inputs=tool_inputs,
+            fn=lambda: self.gateway.search_alerts(**tool_inputs),
+        )
+        compact = compact_alert_search_result(result)
+        compact.update(
+            {
+                "display_mode": "conversation",
+                "answer_type": "change_report_unavailable",
+                "grounded": True,
+                "grounding_status": "partial",
+                "change_subject": subject,
+                "mode": "recent",
+                "recent_alerts": result.returned,
+                "matched_alerts": result.total,
+                "new_alerts": None,
+                "new_findings": None,
+                "updated_findings": None,
+                "since": None,
+                "window_hours": tool_inputs["hours"],
+                "checked_at": checked_at.isoformat(),
+                "new_since_last_check": None,
+                "baseline_established": False,
+                "cursor_status": "unavailable",
+                "cursor_advanced": False,
+            }
+        )
+        comparison_note = (
+            " I cannot tell you what is new since your previous check: the "
+            "durable alert memory that stores that mark is unavailable."
+            if mode in {"new", "changed"}
+            else ""
+        )
+        return (
+            (
+                f"In the last {tool_inputs['hours']} hours Wazuh matched "
+                f"{result.total} alert{'' if result.total == 1 else 's'} and "
+                f"returned {result.returned} of them."
+                f"{comparison_note}"
+            ),
+            compact,
+            ["search_alerts"],
+            {},
+        )
+
+    def _change_summary(
+        self,
+        *,
+        subject: str,
+        mode: str,
+        baseline_only: bool,
+        previous_check: datetime | None,
+        checked_at: datetime,
+        window_hours: int,
+        alert_count: int,
+        total_findings: int,
+        new_findings: int,
+        updated_findings: int,
+        reanalyzed: int,
+    ) -> str:
+        """Plain-language answer built from the numbers actually retrieved."""
+
+        def plural(count: int, noun: str) -> str:
+            return f"{count} {noun}{'' if count == 1 else 's'}"
+
+        if baseline_only:
+            return (
+                "This is the first check I have on record for you, so I "
+                "cannot yet say what is new relative to an earlier one. I have "
+                f"set your baseline at {self._clock(checked_at)}. As of now "
+                f"there {'is' if alert_count == 1 else 'are'} "
+                f"{plural(alert_count, 'alert')} in the last {window_hours} "
+                f"hours and {plural(total_findings, 'finding')} on record — "
+                "that is the current state, not a list of new activity. From "
+                "your next check I will report only what moved since this "
+                "moment."
+            )
+
+        if mode == "recent" or previous_check is None:
+            headline = (
+                f"In the last {window_hours} hours there "
+                f"{'is' if alert_count == 1 else 'are'} "
+                f"{plural(alert_count, 'alert')} and "
+                f"{plural(total_findings, 'finding')} on record."
+            )
+            return (
+                f"{headline} This is a time window, not a comparison against "
+                "your previous check — ask \"anything new?\" for that."
+            )
+
+        stamp = self._clock(previous_check)
+        ago = self._interval_phrase(previous_check, checked_at)
+        unchanged = max(0, total_findings - new_findings - updated_findings)
+
+        if subject == "analysis":
+            if reanalyzed == 0:
+                return (
+                    f"No new analysis since your previous check at {stamp} "
+                    f"({ago}). {plural(total_findings, 'finding')} "
+                    f"{'is' if total_findings == 1 else 'are'} on record and "
+                    "no verdict has been written or revised in that interval."
+                )
+            return (
+                f"{plural(reanalyzed, 'finding')} had its verdict written or "
+                f"revised since your previous check at {stamp} ({ago}), out of "
+                f"{plural(total_findings, 'finding')} on record."
+            )
+
+        if alert_count == 0 and new_findings == 0 and updated_findings == 0:
+            noun = "findings" if subject == "findings" else "alerts"
+            return (
+                f"No new {noun} have appeared since your previous check at "
+                f"{stamp} ({ago}). There are still "
+                f"{plural(total_findings, 'existing finding')}, and none has "
+                "been updated."
+            )
+
+        parts = [
+            f"{plural(alert_count, 'new alert')}",
+            f"{plural(new_findings, 'new finding')}",
+            f"{plural(updated_findings, 'updated finding')}",
+        ]
+        return (
+            f"Since your previous check at {stamp} ({ago}): "
+            f"{', '.join(parts[:-1])}, and {parts[-1]}. "
+            f"{plural(unchanged, 'finding')} "
+            f"{'is' if unchanged == 1 else 'are'} unchanged."
+        )
 
     def _execute(
         self,
@@ -623,6 +955,7 @@ class SOCAssistant:
                     organization_id=organization_id,
                     created_by=user_id,
                     conversation_id=conversation_id,
+                    recent_context=recent_context or {},
                     intent_source=intent_source,
                     intent_confidence=intent_confidence,
                 )
@@ -633,24 +966,35 @@ class SOCAssistant:
                 evidence_references = list(
                     getattr(agent_result, "evidence_references", []) or []
                 )
+                metrics = dict(getattr(agent_result, "metrics", {}) or {})
+                context_references = dict(
+                    getattr(agent_result, "context_references", {}) or {}
+                )
                 return (
                     agent_answer,
                     {
                         "display_mode": "conversation",
                         "answer_type": (
-                            "soc_tool_agent_partial"
+                            "soc_analyst_partial"
                             if failed_tools
-                            else "soc_tool_agent"
+                            else "soc_analyst"
                         ),
-                        "grounded": not failed_tools,
+                        # Coverage, not "a tool ran". The analyst reports
+                        # ungrounded when it cited no evidence reference and
+                        # partial when the query sampled, truncated, or failed.
                         "grounding_status": (
-                            "partial" if failed_tools else "grounded"
+                            grounding_status := str(
+                                metrics.get("coverage_status") or "ungrounded"
+                            )
                         ),
+                        "grounded": grounding_status == "grounded",
                         "failed_tools": failed_tools,
                         "evidence_references": evidence_references,
                         "tools_called": tool_calls,
+                        "analyst_metrics": metrics,
+                        "context_references": context_references,
                     },
-                    ["soc_tool_agent", *tool_calls],
+                    ["soc_analyst", *tool_calls],
                     (
                         {"active_alert_id": active_alert_id}
                         if active_alert_id
@@ -658,9 +1002,20 @@ class SOCAssistant:
                     ),
                 )
             except Exception as exc:
+                if _is_wazuh_runtime_error(exc):
+                    # Live-source failures are not model/payload failures.
+                    raise
+                classified = classify_llm_error(exc, attempt=1, duration_ms=0)
+                if isinstance(exc, LLMInputLimitError) or classified.code == LLMErrorCode.MODEL_CONTEXT_LIMIT_EXCEEDED:
+                    return (
+                        "The analyst request exceeded the model's context or payload limit. "
+                        "Please narrow the agent, technique/CVE, or time range. This is not a Wazuh alert-not-found result.",
+                        {"display_mode": "conversation", "answer_type": "context_limit_exceeded", "grounded": False},
+                        [], {},
+                    )
                 if is_rate_limit_error(exc):
-                    # Falling through to question_agent would just spend
-                    # another request against the same exhausted limit.
+                    # A second model call would just spend another request
+                    # against the same exhausted limit.
                     return (
                         (
                             "The AI provider's rate limit was reached. Please "
@@ -673,61 +1028,21 @@ class SOCAssistant:
                         [],
                         {},
                     )
-                if _is_wazuh_runtime_error(exc):
-                    # A live-tool failure must remain visible. Falling back
-                    # to the tool-less question agent would turn an outage
-                    # into a fluent but ungrounded SOC answer.
-                    raise
-                # Fall through to the context-primed question agent.
-                pass
-            try:
-                answer, answer_usage = self.question_agent.answer(
-                    question=question,
-                    context=self._question_context(
-                        recent_context=recent_context or {},
-                        organization_id=organization_id,
-                    ),
-                    history=conversation_history or [],
-                )
-            except Exception as exc:
-                # "Unavailable" sends the analyst hunting for an outage; a
-                # rate limit only means "try again shortly". Same handling as
-                # the tool-agent path above, so both say which one it was.
-                rate_limited = is_rate_limit_error(exc)
                 return (
                     (
-                        "The AI provider's rate limit was reached. Please "
-                        "wait a moment and try again."
-                        if rate_limited
-                        else "I could not generate the SOC explanation "
-                        "because the question-answer model is unavailable. "
+                        "I could not generate the evidence-backed SOC answer "
+                        "because the analyst model is unavailable. "
                         "Deterministic commands such as `/alerts`, "
                         "`/status`, and `/health` are still available."
                     ),
                     {
                         "display_mode": "conversation",
-                        "answer_type": (
-                            "rate_limited"
-                            if rate_limited
-                            else "model_unavailable"
-                        ),
+                        "answer_type": "model_unavailable",
+                        "grounded": False,
                     },
                     [],
                     {},
                 )
-            return (
-                answer.answer,
-                {
-                    "display_mode": "conversation",
-                    "answer_type": "soc_question",
-                    "confidence": answer.confidence,
-                    "references": answer.references,
-                    "limitations": answer.limitations,
-                    "model_usage": answer_usage,
-                },
-                ["soc_question_agent"],
-                {},
-            )
 
         if command == AssistantCommandName.HELP:
             catalog = public_catalog()
@@ -765,259 +1080,10 @@ class SOCAssistant:
             )
 
         if command == AssistantCommandName.ALERTS:
-            checked_at = datetime.now(UTC)
-            memory = get_alert_memory_repository()
-            previous_check = memory.get_user_cursor(user_id)
-            severity_levels = {
-                "informational": 0,
-                "low": 4,
-                "medium": 7,
-                "high": 10,
-                "critical": 13,
-            }
-            severity = str(arguments.get("severity") or "").lower()
-            if severity and severity not in severity_levels:
-                raise ValueError("Unsupported severity filter.")
-            tool_inputs = {
-                "min_level": (
-                    severity_levels[severity]
-                    if severity
-                    else _bounded_int(
-                        arguments.get("min_level"),
-                        default=0,
-                        minimum=0,
-                        maximum=16,
-                    )
-                ),
-                "hours": (
-                    _duration_hours(arguments.get("since"))
-                    if arguments.get("since")
-                    else _bounded_int(
-                        arguments.get("hours"),
-                        default=24,
-                        minimum=1,
-                        maximum=168,
-                    )
-                ),
-                "limit": _bounded_int(
-                    arguments.get("limit"), default=20, minimum=1, maximum=50
-                ),
-                "agent_id": arguments.get("agent_id"),
-                "text": arguments.get("text"),
-            }
-            if getattr(memory, "durable", False):
-                explicit_window = bool(
-                    arguments.get("since") or "hours" in arguments
-                )
-                window_hours = (
-                    _duration_hours(arguments.get("since"))
-                    if arguments.get("since")
-                    else _bounded_int(
-                        arguments.get("hours"),
-                        default=24,
-                        minimum=1,
-                        maximum=168,
-                    )
-                )
-                effective_since = (
-                    checked_at - timedelta(hours=window_hours)
-                    if explicit_window or previous_check is None
-                    else previous_check
-                )
-                finding_scope = settings.WAZUH_INGESTION_ORGANIZATION_ID
-                records = get_finding_repository().list(
-                    organization_id=finding_scope,
-                    limit=tool_inputs["limit"],
-                    severity=severity or None,
-                    status=(
-                        "open" if arguments.get("open_only") else None
-                    ),
-                )
-                if tool_inputs["agent_id"]:
-                    finding_ids = memory.finding_ids_for_agent(
-                        tool_inputs["agent_id"]
-                    )
-                    records = [
-                        record
-                        for record in records
-                        if record["finding_id"] in finding_ids
-                    ]
-                text_filter = str(tool_inputs["text"] or "").strip().lower()
-                if text_filter:
-                    records = [
-                        record
-                        for record in records
-                        if text_filter
-                        in " ".join(
-                            (
-                                str(record["finding"].get("title") or ""),
-                                str(record["finding"].get("summary") or ""),
-                                str(record.get("event_type") or ""),
-                            )
-                        ).lower()
-                    ]
-
-                new_records = [
-                    record
-                    for record in records
-                    if _as_datetime(record["created_at"]) > effective_since
-                ]
-                updated_records = [
-                    record
-                    for record in records
-                    if _as_datetime(record["created_at"]) <= effective_since
-                    and _as_datetime(record["updated_at"]) > effective_since
-                ]
-                changed_ids = {
-                    record["finding_id"]
-                    for record in [*new_records, *updated_records]
-                }
-                if arguments.get("new_only"):
-                    visible = new_records
-                elif arguments.get("all_results") or arguments.get(
-                    "open_only"
-                ):
-                    visible = records
-                else:
-                    visible = [
-                        record
-                        for record in records
-                        if record["finding_id"] in changed_ids
-                    ]
-
-                findings = []
-                for record in visible:
-                    finding = dict(record["finding"])
-                    finding.update(
-                        {
-                            "finding_id": record["finding_id"],
-                            "status": record["status"],
-                            "version": record["version"],
-                            "verdict": record["verdict"].get("verdict"),
-                            "verdict_confidence": record[
-                                "verdict"
-                            ].get("confidence"),
-                        }
-                    )
-                    findings.append(finding)
-                new_alerts = memory.count_alerts_since(
-                    effective_since,
-                    agent_id=tool_inputs["agent_id"],
-                    min_level=tool_inputs["min_level"],
-                )
-                payload = {
-                    "raw_alert_count": new_alerts,
-                    "recent_alerts": new_alerts,
-                    "finding_count": len(findings),
-                    "findings": findings,
-                    "new_alerts": (
-                        new_alerts if previous_check is not None else None
-                    ),
-                    "new_findings": (
-                        len(new_records) if previous_check is not None else None
-                    ),
-                    "updated_findings": (
-                        len(updated_records)
-                        if previous_check is not None
-                        else None
-                    ),
-                    "unchanged_findings": (
-                        len(records) - len(changed_ids)
-                    ),
-                    "since": (
-                        effective_since.isoformat()
-                        if explicit_window or previous_check
-                        else None
-                    ),
-                    "checked_at": checked_at.isoformat(),
-                    "new_since_last_check": (
-                        previous_check.isoformat()
-                        if previous_check
-                        else None
-                    ),
-                    "baseline_established": previous_check is None,
-                    "cursor_status": "durable",
-                    "mode": (
-                        "new"
-                        if arguments.get("new_only")
-                        else "open"
-                        if arguments.get("open_only")
-                        else "all"
-                        if arguments.get("all_results")
-                        else "updated_since_last_check"
-                    ),
-                    "source": "postgresql",
-                }
-                memory.advance_user_cursor(
-                    user_id,
-                    checked_at,
-                    finding_version=max(
-                        (
-                            int(record.get("version") or 0)
-                            for record in records
-                        ),
-                        default=None,
-                    ),
-                )
-                if previous_check is None:
-                    summary = (
-                        f"Found {new_alerts} recent alert"
-                        f"{'' if new_alerts == 1 else 's'} and "
-                        f"{len(records)} current finding"
-                        f"{'' if len(records) == 1 else 's'}. "
-                        "This check established your durable baseline."
-                    )
-                else:
-                    summary = (
-                        f"Found {new_alerts} new alert"
-                        f"{'' if new_alerts == 1 else 's'}, "
-                        f"{len(new_records)} new finding"
-                        f"{'' if len(new_records) == 1 else 's'}, and "
-                        f"{len(updated_records)} updated finding"
-                        f"{'' if len(updated_records) == 1 else 's'}."
-                    )
-                return (
-                    summary,
-                    payload,
-                    ["query_alert_memory"],
-                    {},
-                )
-            result = self._run_tool(
-                tool_name="search_alerts",
-                inputs=tool_inputs,
-                fn=lambda: self.gateway.search_alerts(**tool_inputs),
-            )
-            compact = compact_alert_search_result(result)
-            compact.update(
-                {
-                    "recent_alerts": result.returned,
-                    "new_alerts": None,
-                    "new_findings": None,
-                    "updated_findings": None,
-                    "since": None,
-                    "checked_at": checked_at.isoformat(),
-                    "new_since_last_check": None,
-                    "baseline_established": False,
-                    "cursor_status": "unavailable",
-                }
-            )
-            compact["mode"] = (
-                "open"
-                if arguments.get("open_only")
-                else "all"
-                if arguments.get("all_results")
-                else "recent"
-            )
-            return (
-                (
-                    f"Found {result.returned} recent alert"
-                    f"{'' if result.returned == 1 else 's'} in the selected window. "
-                    "PostgreSQL alert memory is unavailable, so this result "
-                    "cannot prove what is new since your previous check."
-                ),
-                compact,
-                ["search_alerts"],
-                {},
+            return self._alerts_capability(
+                arguments,
+                organization_id=organization_id,
+                user_id=user_id,
             )
 
         if command == AssistantCommandName.TRIAGE:
@@ -1575,7 +1641,7 @@ class SOCAssistant:
                     if router_failed
                     else f"Selected {intent.command.value} capability"
                 ),
-                tool="intent_router",
+                tool="deterministic_router",
                 status="failed" if router_failed else "completed",
             )
         ]
