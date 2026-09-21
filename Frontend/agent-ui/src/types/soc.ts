@@ -37,6 +37,8 @@ export interface AssistantCommandCatalog {
 
 export interface AnalystMetrics {
   elapsed_ms?: number
+  agent_elapsed_ms?: number
+  tool_elapsed_ms?: number
   tool_calls?: number
   unique_tools?: string[]
   failed_tools?: number
@@ -45,11 +47,41 @@ export interface AnalystMetrics {
   output_tokens?: number
   tool_call_budget?: number
   limit_reached?: boolean
+  tool_calls_attempted?: number
+  tool_calls_executed?: number
+  tool_calls_successful?: number
+  tool_calls_cache_hits?: number
+  tool_calls_rejected?: number
+  tool_calls_failed?: number
+  tool_validation_errors?: number
+  tool_source_failures?: number
+  tool_errors?: number
+  evidence_retrieved?: number
+  source_evidence_retrieved?: number
+  evidence_cited?: number
+  event_details_examined?: number
+  cited_evidence?: Array<{
+    reference: string
+    support: 'reference_only' | 'summary_or_aggregate' | 'event_detail'
+  }>
+  grounding_status?: string
+  query_coverage_status?: string
+  cited_query_coverage_status?: string
+  investigation_status?: string
+  interruption_reason?: string
+  interruption_category?: string
+  failure?: Record<string, unknown>
+  citation_scope?: string
+  queries?: Array<Record<string, unknown>>
+  tool_events?: Array<Record<string, unknown>>
+  evidence_ledger?: Array<Record<string, unknown>>
+  schema?: Record<string, unknown>
+  adaptive_specialized_access?: Record<string, unknown>
   /** Total records the underlying queries reported as matching. */
   matched_records?: number
   /** Records actually returned, i.e. what the answer could have read. */
   sampled_records?: number
-  /** True when a tool result was cut to fit the output budget. */
+  /** True when any source query or delivered tool result was incomplete. */
   truncated?: boolean
 }
 
@@ -60,6 +92,7 @@ export interface AnalystResponsePayload {
   grounding_status?: string
   failed_tools?: string[]
   evidence_references?: string[]
+  retrieved_evidence_references?: string[]
   tools_called?: string[]
   analyst_metrics?: AnalystMetrics
   context_references?: Record<string, string>
@@ -347,25 +380,6 @@ export interface ApprovalInput {
   approval_id: string
   comment?: string
   modified_actions?: Record<string, unknown>[]
-}
-
-export interface ShiftHandoff {
-  summary: string
-  highlights: string[]
-  open_items: string[]
-  recommendations: string[]
-  window_hours: number
-  generated_at: string
-  investigation_count: number
-  finding_count: number
-}
-
-export interface CommandExplanation {
-  plain_english: string
-  behavior: string[]
-  risk: 'benign' | 'suspicious' | 'malicious' | 'unknown'
-  indicators: string[]
-  recommended_checks: string[]
 }
 
 export interface PrioritizedVulnerability {

@@ -309,12 +309,17 @@ def _build_services_health(gateway: WazuhGateway) -> tuple[ServicesHealthRespons
     results: dict[str, ServiceCheck] = {}
 
     llm_configured = bool(effective_llm_api_key())
+    required_llm_key = {
+        "groq": "GROQ_API_KEY",
+        "evomap": "K_API_KEY",
+    }.get(settings.LLM_PROVIDER.lower(), "LLM_API_KEY")
     results["central_llm"] = ServiceCheck(
         status="healthy" if llm_configured else "unhealthy",
         detail=(
             f"Configured model: {settings.LLM_MODEL}"
             if llm_configured
-            else "LLM_API_KEY is not configured. Deterministic playbooks still work."
+            else f"{required_llm_key} is not configured. "
+            "Deterministic playbooks still work."
         ),
     )
 

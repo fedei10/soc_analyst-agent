@@ -127,10 +127,6 @@ class AgentChatRequest(APIModel):
     )
 
 
-class CommandExplainInput(APIModel):
-    command: str = Field(min_length=1, max_length=4000)
-
-
 class OrchestratorChatRequest(APIModel):
     message: str = Field(min_length=1, max_length=8000)
     conversation_id: str | None = Field(

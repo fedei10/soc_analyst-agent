@@ -6,6 +6,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.db.base import Base
 from app.db.repositories.investigations import (
+    InMemoryInvestigationRepository,
     ResponseExecutionConflictError,
     SQLAlchemyInvestigationRepository,
 )
@@ -153,6 +154,7 @@ def test_repository_persists_runs_report_actions_and_audit_history():
         organization_id="org-test",
         status="completed",
     ) == 1
+
     assert len(store.list_agent_runs(
         "INV-PERSIST-001",
         organization_id="org-test",
@@ -183,6 +185,47 @@ def test_repository_persists_runs_report_actions_and_audit_history():
     )
     assert approvals[0]["approval_id"] == "APR-001"
     assert approvals[0]["decided_by_user_id"] == "analyst"
+
+
+@pytest.mark.parametrize("store_factory", [repository, InMemoryInvestigationRepository])
+def test_completed_analysis_audit_count_is_exact_scoped_and_time_bounded(store_factory):
+    store = store_factory()
+    value = snapshot()
+    value["audit_events"].extend(
+        [
+            {
+                "stage": "analyze",
+                "event": "analysis_completed",
+                "timestamp": "2026-07-23T10:05:00+00:00",
+            },
+            {
+                "stage": "analyze",
+                "event": "analysis_completed",
+                "timestamp": "2026-07-23T10:15:00+00:00",
+            },
+            {
+                "stage": "analyze",
+                "event": "analysis_escalated",
+                "timestamp": "2026-07-23T10:20:00+00:00",
+            },
+        ]
+    )
+    store.save_snapshot(value)
+
+    count = store.count_audit_events(
+        organization_id="org-test",
+        event="analysis_completed",
+        stage="analyze",
+        occurred_after=datetime(2026, 7, 23, 10, 0, tzinfo=UTC),
+        occurred_on_or_before=datetime(2026, 7, 23, 10, 10, tzinfo=UTC),
+    )
+
+    assert count == 1
+    assert store.count_audit_events(
+        organization_id="other-org",
+        event="analysis_completed",
+        stage="analyze",
+    ) == 0
 
 
 def test_escalated_investigation_remains_reusable_for_the_same_alert():

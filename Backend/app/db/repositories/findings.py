@@ -9,7 +9,7 @@ from functools import lru_cache
 from threading import RLock
 from typing import Any, Protocol
 
-from sqlalchemy import select
+from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
@@ -107,7 +107,30 @@ class FindingRepository(Protocol):
         severity: str | None = None,
         verdict: str | None = None,
         status: str | None = None,
+        has_verdict: bool | None = None,
+        finding_ids: set[str] | None = None,
+        text: str | None = None,
+        created_after: datetime | None = None,
+        updated_after: datetime | None = None,
+        created_on_or_before: datetime | None = None,
+        changed_after: datetime | None = None,
     ) -> list[dict[str, Any]]: ...
+
+    def count(
+        self,
+        *,
+        organization_id: str,
+        severity: str | None = None,
+        verdict: str | None = None,
+        status: str | None = None,
+        has_verdict: bool | None = None,
+        finding_ids: set[str] | None = None,
+        text: str | None = None,
+        created_after: datetime | None = None,
+        updated_after: datetime | None = None,
+        created_on_or_before: datetime | None = None,
+        changed_after: datetime | None = None,
+    ) -> int: ...
 
     def add_feedback(
         self,
@@ -244,6 +267,13 @@ class InMemoryFindingRepository:
         severity: str | None = None,
         verdict: str | None = None,
         status: str | None = None,
+        has_verdict: bool | None = None,
+        finding_ids: set[str] | None = None,
+        text: str | None = None,
+        created_after: datetime | None = None,
+        updated_after: datetime | None = None,
+        created_on_or_before: datetime | None = None,
+        changed_after: datetime | None = None,
     ) -> list[dict[str, Any]]:
         with self._lock:
             values = [
@@ -257,8 +287,48 @@ class InMemoryFindingRepository:
             values = [item for item in values if item["verdict"]["verdict"] == verdict]
         if status:
             values = [item for item in values if item["status"] == status]
+        if has_verdict is not None:
+            values = [
+                item
+                for item in values
+                if bool((item.get("verdict") or {}).get("verdict")) is has_verdict
+            ]
+        if finding_ids is not None:
+            values = [item for item in values if item["finding_id"] in finding_ids]
+        if text:
+            needle = text.strip().lower()
+            values = [
+                item
+                for item in values
+                if needle
+                in " ".join(
+                    (
+                        str(item["finding"].get("title") or ""),
+                        str(item["finding"].get("summary") or ""),
+                        str(item.get("event_type") or ""),
+                    )
+                ).lower()
+            ]
+        if created_after is not None:
+            values = [item for item in values if item["created_at"] > created_after]
+        if updated_after is not None:
+            values = [item for item in values if item["updated_at"] > updated_after]
+        if created_on_or_before is not None:
+            values = [
+                item for item in values if item["created_at"] <= created_on_or_before
+            ]
+        if changed_after is not None:
+            values = [
+                item
+                for item in values
+                if item["created_at"] > changed_after
+                or item["updated_at"] > changed_after
+            ]
         values.sort(key=lambda item: item["updated_at"], reverse=True)
         return values[offset : offset + limit]
+
+    def count(self, **filters: Any) -> int:
+        return len(self.list(limit=len(self._records) + 1, offset=0, **filters))
 
     def add_feedback(
         self,
@@ -452,6 +522,58 @@ class SQLAlchemyFindingRepository:
         data["feedback"] = self.list_feedback(finding_id, organization_id=organization_id)
         return data
 
+    @staticmethod
+    def _apply_filters(
+        statement: Any,
+        *,
+        organization_id: str,
+        severity: str | None = None,
+        verdict: str | None = None,
+        status: str | None = None,
+        has_verdict: bool | None = None,
+        finding_ids: set[str] | None = None,
+        text: str | None = None,
+        created_after: datetime | None = None,
+        updated_after: datetime | None = None,
+        created_on_or_before: datetime | None = None,
+        changed_after: datetime | None = None,
+    ) -> Any:
+        statement = statement.where(FindingRecord.organization_id == organization_id)
+        if severity:
+            statement = statement.where(FindingRecord.severity == severity)
+        if verdict:
+            statement = statement.where(FindingRecord.verdict_label == verdict)
+        if status:
+            statement = statement.where(FindingRecord.status == status)
+        if has_verdict is True:
+            statement = statement.where(FindingRecord.verdict_label.is_not(None))
+        elif has_verdict is False:
+            statement = statement.where(FindingRecord.verdict_label.is_(None))
+        if finding_ids is not None:
+            statement = statement.where(FindingRecord.finding_id.in_(finding_ids))
+        if text:
+            pattern = f"%{text.strip()}%"
+            statement = statement.where(
+                or_(
+                    FindingRecord.event_type.ilike(pattern),
+                    cast(FindingRecord.finding, String).ilike(pattern),
+                )
+            )
+        if created_after is not None:
+            statement = statement.where(FindingRecord.created_at > created_after)
+        if updated_after is not None:
+            statement = statement.where(FindingRecord.updated_at > updated_after)
+        if created_on_or_before is not None:
+            statement = statement.where(FindingRecord.created_at <= created_on_or_before)
+        if changed_after is not None:
+            statement = statement.where(
+                or_(
+                    FindingRecord.created_at > changed_after,
+                    FindingRecord.updated_at > changed_after,
+                )
+            )
+        return statement
+
     def list(
         self,
         *,
@@ -461,22 +583,68 @@ class SQLAlchemyFindingRepository:
         severity: str | None = None,
         verdict: str | None = None,
         status: str | None = None,
+        has_verdict: bool | None = None,
+        finding_ids: set[str] | None = None,
+        text: str | None = None,
+        created_after: datetime | None = None,
+        updated_after: datetime | None = None,
+        created_on_or_before: datetime | None = None,
+        changed_after: datetime | None = None,
     ) -> list[dict[str, Any]]:
+        statement = self._apply_filters(
+            select(FindingRecord),
+            organization_id=organization_id,
+            severity=severity,
+            verdict=verdict,
+            status=status,
+            has_verdict=has_verdict,
+            finding_ids=finding_ids,
+            text=text,
+            created_after=created_after,
+            updated_after=updated_after,
+            created_on_or_before=created_on_or_before,
+            changed_after=changed_after,
+        )
         statement = (
-            select(FindingRecord)
-            .where(FindingRecord.organization_id == organization_id)
+            statement
             .order_by(FindingRecord.updated_at.desc())
             .offset(offset)
             .limit(limit)
         )
-        if severity:
-            statement = statement.where(FindingRecord.severity == severity)
-        if verdict:
-            statement = statement.where(FindingRecord.verdict_label == verdict)
-        if status:
-            statement = statement.where(FindingRecord.status == status)
         with self._session_factory() as session:
             return [_finding_record_dict(record) for record in session.scalars(statement).all()]
+
+    def count(
+        self,
+        *,
+        organization_id: str,
+        severity: str | None = None,
+        verdict: str | None = None,
+        status: str | None = None,
+        has_verdict: bool | None = None,
+        finding_ids: set[str] | None = None,
+        text: str | None = None,
+        created_after: datetime | None = None,
+        updated_after: datetime | None = None,
+        created_on_or_before: datetime | None = None,
+        changed_after: datetime | None = None,
+    ) -> int:
+        statement = self._apply_filters(
+            select(func.count()).select_from(FindingRecord),
+            organization_id=organization_id,
+            severity=severity,
+            verdict=verdict,
+            status=status,
+            has_verdict=has_verdict,
+            finding_ids=finding_ids,
+            text=text,
+            created_after=created_after,
+            updated_after=updated_after,
+            created_on_or_before=created_on_or_before,
+            changed_after=changed_after,
+        )
+        with self._session_factory() as session:
+            return int(session.scalar(statement) or 0)
 
     def add_feedback(
         self,

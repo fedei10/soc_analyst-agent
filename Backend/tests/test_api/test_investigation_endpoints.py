@@ -64,8 +64,6 @@ def test_investigation_and_chat_routes_are_registered():
     assert "/api/v1/soc/assistant/commands" in paths
     assert "/api/v1/soc/overview" in paths
     assert "/api/v1/soc/platform" in paths
-    assert "/api/v1/soc/handoff" in paths
-    assert "/api/v1/soc/explain-command" in paths
     assert "/api/v1/soc/telegram/test" in paths
     assert "/api/v1/reports" in paths
     assert "/api/v1/reports/{report_id}" in paths

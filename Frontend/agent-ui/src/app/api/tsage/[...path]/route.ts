@@ -2,7 +2,7 @@ import { auth } from '@clerk/nextjs/server'
 import type { NextRequest } from 'next/server'
 
 export const runtime = 'nodejs'
-export const maxDuration = 300
+export const maxDuration = 600
 export const dynamic = 'force-dynamic'
 
 const backendUrl = (
@@ -55,7 +55,7 @@ async function proxy(
   const { path } = await context.params
   const pathname = path.map(encodeURIComponent).join('/')
   const target = `${backendUrl}/${pathname}${request.nextUrl.search}`
-  const timeoutMs = pathname.endsWith('/chat/stream') ? 300_000 : 120_000
+  const timeoutMs = pathname.endsWith('/chat/stream') ? 600_000 : 120_000
   const requestHeaders = new Headers()
 
   FORWARDED_REQUEST_HEADERS.forEach((name) => {

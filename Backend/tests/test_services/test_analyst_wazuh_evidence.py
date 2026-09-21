@@ -183,6 +183,31 @@ def test_current_turn_that_exceeds_budget_is_not_silently_truncated(monkeypatch)
         _bounded_analyst_prompt([])({"messages": [HumanMessage(content="Hunt T1040")]})
 
 
+def test_oversized_current_turn_evidence_is_shrunk_before_raising(monkeypatch):
+    """Many tool results in one turn can overflow budget with no history to
+    drop. That must shrink the evidence (explicitly flagged) instead of
+    crashing the whole turn - the fix for LLMInputLimitError surfacing to
+    users on ordinary multi-tool-call questions."""
+    from app.config import settings
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+    # SYSTEM_PROMPT alone is ~1540 estimated tokens; budget must clear that
+    # plus the shrunk notice (~60) but not the original ~1150-token payload.
+    monkeypatch.setattr(settings, "MAPEK_MAX_INPUT_TOKENS", 1800)
+    monkeypatch.setattr(settings, "LLM_RATE_LIMIT_MAX_TOKENS", 5000)
+    monkeypatch.setattr(settings, "LLM_OUTPUT_TOKEN_RESERVE", 1000)
+    big_result = json.dumps({"alerts": [{"id": i, "description": "x" * 200} for i in range(20)]})
+    current = [
+        HumanMessage(content="alerts"),
+        AIMessage(content="", tool_calls=[{"id": "c1", "name": "search_alerts", "args": {}}]),
+        ToolMessage(content=big_result, tool_call_id="c1"),
+    ]
+    result = _bounded_analyst_prompt([])({"messages": current})
+    shrunk = next(m for m in result if isinstance(m, ToolMessage))
+    assert shrunk.tool_call_id == "c1"
+    assert json.loads(shrunk.content)["truncated_for_budget"] is True
+    assert len(shrunk.content) < len(big_result)
+
+
 def test_ioc_archive_result_is_structured_and_unavailable_archive_is_partial():
     from app.services.wazuh.models import AlertEvidence, AlertSearchResult, ArchivedLogSearchResult, IOCHuntResult, RawAlertDocument
     class Gateway:

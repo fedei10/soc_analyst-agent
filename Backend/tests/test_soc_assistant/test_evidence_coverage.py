@@ -88,9 +88,10 @@ def test_sampled_results_are_not_reported_as_full_population(monkeypatch):
 
     assert result.metrics["matched_records"] == 871
     assert result.metrics["sampled_records"] == 100
-    # Cited real evidence, but over a sample - that is partial, not grounded.
-    assert result.metrics["coverage_status"] == "partial"
-    assert result.grounded is False
+    # Citation presence and query completeness are independent dimensions.
+    assert result.metrics["query_coverage_status"] == "partial"
+    assert result.metrics["grounding_status"] == "cited"
+    assert result.grounded is True
 
 
 def test_complete_coverage_with_a_citation_is_grounded(monkeypatch):
@@ -108,7 +109,8 @@ def test_complete_coverage_with_a_citation_is_grounded(monkeypatch):
 
     result = agent.answer(question="what happened?", history=[])
 
-    assert result.metrics["coverage_status"] == "grounded"
+    assert result.metrics["query_coverage_status"] == "complete"
+    assert result.metrics["grounding_status"] == "cited"
     assert result.grounded is True
     assert result.evidence_references == ["wazuh:alert:alert-1"]
 
@@ -128,7 +130,8 @@ def test_an_uncited_answer_is_reported_as_ungrounded(monkeypatch):
 
     result = agent.answer(question="anything suspicious?", history=[])
 
-    assert result.metrics["coverage_status"] == "ungrounded"
+    assert result.metrics["query_coverage_status"] == "complete"
+    assert result.metrics["grounding_status"] == "ungrounded"
     assert result.grounded is False
 
 

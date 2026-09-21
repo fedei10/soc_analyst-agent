@@ -18,7 +18,6 @@ from app.api.auth.deps import (
 from app.api.v1.schemas.investigation import (
     AgentChatRequest,
     ApprovalDecisionInput,
-    CommandExplainInput,
     ExecutionInput,
     InvestigationStartInput,
 )
@@ -39,19 +38,15 @@ from app.services.redis.ephemeral import EphemeralRedis
 from app.services.wazuh.dependencies import get_wazuh_gateway
 from app.services.wazuh.gateway import WazuhGateway
 from app.soc_assistant.catalog import public_catalog
-from app.soc_assistant.command_explainer import (
-    MAX_COMMAND_LENGTH,
-    explain_command,
-)
-from app.soc_assistant.handoff import build_shift_handoff
 from app.services.telegram.notifier import get_telegram_notifier
 from app.soc_assistant.overview import build_soc_overview, build_soc_platform
 from app.soc_assistant.references import (
     InvestigationReferenceError,
     resolve_investigation_reference,
 )
-from app.soc_assistant.schemas import AssistantRequest
+from app.soc_assistant.schemas import AssistantRequest, AssistantStopRequest
 from app.soc_assistant.service import SOCAssistant
+from app.soc_assistant.tool_agent import request_stop
 
 
 read = APIRouter(dependencies=[Depends(require_read)])
@@ -373,6 +368,24 @@ def chat_with_soc_orchestrator(
     return {"data": _public_data(result.model_dump(mode="json"))}
 
 
+@read.post(
+    "/soc/orchestrator/chat/stop",
+    tags=["assistant"],
+    dependencies=[Depends(require_investigate)],
+)
+def stop_soc_orchestrator_chat(
+    request: AssistantStopRequest,
+    _: InvestigatorPrincipal,
+):
+    """Cooperatively cancel an in-flight chat turn for this conversation.
+
+    Cancellation is checked between tool calls, not mid-model-generation, so
+    the current step may still finish before the turn stops.
+    """
+    stopped = request_stop(request.conversation_id)
+    return {"data": {"stopped": stopped}}
+
+
 @read.get("/soc/assistant/commands", tags=["assistant"])
 def get_soc_assistant_commands(_: ReadPrincipal):
     commands = public_catalog()
@@ -413,78 +426,6 @@ def get_soc_overview(
         window_hours=hours,
     )
     return {"data": _public_data(overview.model_dump(mode="json"))}
-
-
-@read.get("/soc/handoff", tags=["assistant"])
-def get_shift_handoff(
-    principal: ReadPrincipal,
-    gateway: AssistantGateway,
-    finding_repository: FindingRepo,
-    hours: int = Query(default=8, ge=1, le=48),
-):
-    service = get_investigation_service()
-    snapshots = service.list_history(
-        limit=50,
-        organization_id=principal.scope_id,
-    )
-    findings = finding_repository.list(
-        organization_id=settings.WAZUH_INGESTION_ORGANIZATION_ID,
-        limit=50,
-    )
-    try:
-        alert_summary = gateway.alert_summary(hours=hours)
-    except Exception as exc:
-        logger.warning(
-            "soc_handoff_wazuh_unavailable",
-            error_type=type(exc).__name__,
-        )
-        alert_summary = None
-    try:
-        handoff = build_shift_handoff(
-            investigations=snapshots,
-            findings=findings,
-            alert_summary=alert_summary,
-            window_hours=hours,
-        )
-    except Exception as exc:
-        logger.warning(
-            "soc_handoff_generation_failed",
-            error_type=type(exc).__name__,
-        )
-        raise HTTPException(
-            503,
-            "The handoff writer is unavailable. Try again shortly.",
-        )
-    return {"data": handoff}
-
-
-@read.post("/soc/explain-command", tags=["assistant"])
-def post_explain_command(
-    request: CommandExplainInput,
-    principal: ReadPrincipal,
-):
-    try:
-        explanation, usage = explain_command(
-            request.command[:MAX_COMMAND_LENGTH],
-        )
-    except Exception as exc:
-        logger.warning(
-            "soc_command_explainer_failed",
-            error_type=type(exc).__name__,
-        )
-        raise HTTPException(
-            503,
-            "The command explainer is unavailable. Try again shortly.",
-        )
-    return {
-        "data": {
-            **explanation.model_dump(mode="json"),
-            "token_usage": {
-                "input_tokens": usage.get("input_tokens"),
-                "output_tokens": usage.get("output_tokens"),
-            },
-        }
-    }
 
 
 @read.post(

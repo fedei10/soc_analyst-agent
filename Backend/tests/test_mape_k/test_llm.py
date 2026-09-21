@@ -291,6 +291,76 @@ def test_get_client_wires_the_shared_rate_limiter(monkeypatch):
     assert calls == [2000 + (len('"hello"') + 3) // 4]
 
 
+def test_bound_tool_schemas_are_included_in_rate_limit_cost(monkeypatch):
+    class FakeChatOpenAI:
+        def __init__(self, **_kwargs):
+            pass
+
+        def invoke(self, *args, **kwargs):
+            return {"args": args, "kwargs": kwargs}
+
+    monkeypatch.setattr("langchain_openai.ChatOpenAI", FakeChatOpenAI)
+    monkeypatch.setattr("app.mape_k.llm.settings.LLM_PROVIDER", "oxy")
+    monkeypatch.setattr(
+        "app.mape_k.llm.settings.LLM_API_KEY",
+        SimpleNamespace(get_secret_value=lambda: "test-key"),
+    )
+    monkeypatch.setattr("app.mape_k.llm.settings.LLM_OUTPUT_TOKEN_RESERVE", 0)
+    costs = []
+    limiter = SimpleNamespace(acquire=lambda cost: costs.append(cost))
+    tools = [{"type": "function", "function": {"name": "search_alerts"}}]
+
+    LLMProvider(limiter=limiter).get_client().invoke("hello", tools=tools)
+
+    expected_payload = {"messages": "hello", "tools": tools}
+    from app.mape_k.llm import estimated_tokens
+
+    assert costs == [estimated_tokens(expected_payload)]
+
+
+def test_groq_uses_groq_api_key_instead_of_generic_key(monkeypatch):
+    from pydantic import SecretStr
+
+    from app.mape_k.llm import effective_llm_api_key, settings
+
+    monkeypatch.setattr(settings, "LLM_PROVIDER", "groq")
+    monkeypatch.setattr(settings, "GROQ_API_KEY", SecretStr("groq-key"))
+    monkeypatch.setattr(settings, "LLM_API_KEY", SecretStr("generic-key"))
+
+    assert effective_llm_api_key() == "groq-key"
+
+
+def test_groq_provider_builds_native_chat_groq_client(monkeypatch):
+    from pydantic import SecretStr
+
+    from app.mape_k.llm import settings
+
+    created = {}
+
+    class FakeChatGroq:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+        def invoke(self, *_args, **_kwargs):
+            return "groq-response"
+
+    monkeypatch.setattr("langchain_groq.ChatGroq", FakeChatGroq)
+    monkeypatch.setattr(settings, "LLM_PROVIDER", "groq")
+    monkeypatch.setattr(settings, "GROQ_API_KEY", SecretStr("groq-key"))
+    monkeypatch.setattr(settings, "LLM_MODEL", "llama-3.3-70b-versatile")
+
+    client = LLMProvider(
+        limiter=SimpleNamespace(acquire=lambda _cost: None)
+    ).get_client()
+
+    assert client.invoke("hello") == "groq-response"
+    assert created["api_key"] == "groq-key"
+    assert created["model"] == "llama-3.3-70b-versatile"
+    assert created["temperature"] == 0
+    assert created["max_retries"] == 0
+    assert "base_url" not in created
+
+
 @pytest.mark.parametrize("token,expected", [("raw-token", "sk-evomap-raw-token"),
                                             ("sk-evomap-token", "sk-evomap-token"),
                                             ("", "")])

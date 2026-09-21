@@ -1288,6 +1288,28 @@ class InvestigationService:
             organization_id=organization_id,
         )
 
+    def completed_analysis_count(
+        self,
+        *,
+        organization_id: str,
+        occurred_after: datetime,
+        occurred_on_or_before: datetime,
+    ) -> int:
+        """Count persisted, completed MAPE-K diagnosis attempts.
+
+        ``analysis_completed`` is emitted only after Analyze produced and
+        evidence-assessed a diagnosis. Finding updates and verdict presence do
+        not participate in this metric.
+        """
+
+        return self.repository.count_audit_events(
+            organization_id=organization_id,
+            event="analysis_completed",
+            stage="analyze",
+            occurred_after=occurred_after,
+            occurred_on_or_before=occurred_on_or_before,
+        )
+
     def response_actions(
         self,
         investigation_id: str,

@@ -401,6 +401,16 @@ class InvestigationRepository(Protocol):
         organization_id: str,
     ) -> list[dict[str, Any]]: ...
 
+    def count_audit_events(
+        self,
+        *,
+        organization_id: str,
+        event: str,
+        stage: str | None = None,
+        occurred_after: datetime | None = None,
+        occurred_on_or_before: datetime | None = None,
+    ) -> int: ...
+
     def append_audit_events(
         self,
         investigation_id: str,
@@ -930,6 +940,52 @@ class InMemoryInvestigationRepository:
             organization_id=organization_id,
         )
         return deepcopy(snapshot.get("audit_events", [])) if snapshot else []
+
+    def count_audit_events(
+        self,
+        *,
+        organization_id: str,
+        event: str,
+        stage: str | None = None,
+        occurred_after: datetime | None = None,
+        occurred_on_or_before: datetime | None = None,
+    ) -> int:
+        with self._lock:
+            snapshots = [
+                snapshot
+                for (org_id, _), snapshot in self._snapshots.items()
+                if org_id == organization_id
+            ]
+        count = 0
+        for snapshot in snapshots:
+            for item in snapshot.get("audit_events", []):
+                if not isinstance(item, dict) or item.get("event") != event:
+                    continue
+                if stage is not None and item.get("stage") != stage:
+                    continue
+                raw_timestamp = item.get("timestamp")
+                if isinstance(raw_timestamp, datetime):
+                    occurred_at = raw_timestamp
+                elif isinstance(raw_timestamp, str):
+                    try:
+                        occurred_at = datetime.fromisoformat(
+                            raw_timestamp.replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        continue
+                else:
+                    continue
+                if occurred_at.tzinfo is None:
+                    occurred_at = occurred_at.replace(tzinfo=UTC)
+                if occurred_after is not None and occurred_at <= occurred_after:
+                    continue
+                if (
+                    occurred_on_or_before is not None
+                    and occurred_at > occurred_on_or_before
+                ):
+                    continue
+                count += 1
+        return count
 
     def append_audit_events(
         self,
@@ -3212,6 +3268,34 @@ class SQLAlchemyInvestigationRepository:
                 }
                 for record in session.scalars(statement).all()
             ]
+
+    def count_audit_events(
+        self,
+        *,
+        organization_id: str,
+        event: str,
+        stage: str | None = None,
+        occurred_after: datetime | None = None,
+        occurred_on_or_before: datetime | None = None,
+    ) -> int:
+        statement = (
+            select(func.count())
+            .select_from(AuditEventRecord)
+            .where(
+                AuditEventRecord.organization_id == organization_id,
+                AuditEventRecord.event == event,
+            )
+        )
+        if stage is not None:
+            statement = statement.where(AuditEventRecord.stage == stage)
+        if occurred_after is not None:
+            statement = statement.where(AuditEventRecord.occurred_at > occurred_after)
+        if occurred_on_or_before is not None:
+            statement = statement.where(
+                AuditEventRecord.occurred_at <= occurred_on_or_before
+            )
+        with self._session_factory() as session:
+            return int(session.scalar(statement) or 0)
 
     def append_audit_events(
         self,

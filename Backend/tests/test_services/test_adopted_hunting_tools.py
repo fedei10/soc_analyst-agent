@@ -173,8 +173,17 @@ def test_correlation_preserves_distinct_commands_with_same_description():
     result = json.loads(wrapper.invoke({"agent_id": "001", "timestamp": "2026-09-18T14:11:30Z"}))
     assert [item["alert_id"] for item in result["alerts"]] == ["tcpdump-id", "ping-id"]
     assert [item["process"]["command_line"] for item in result["alerts"]] == ["tcpdump --test", "ping --test"]
-    with pytest.raises(ValueError, match="timezone"):
+
+    invalid = json.loads(
         wrapper.invoke({"agent_id": "001", "timestamp": "2026-09-18T14:11:30"})
+    )
+    # A bad argument comes back as data the model can read and retry from,
+    # not a raised exception it has no way to recover from mid-conversation.
+    assert invalid["ok"] is False
+    assert invalid["error"]["code"] == "INVALID_TOOL_INPUT"
+    assert invalid["error"]["field"] == "timestamp"
+    assert "timezone" in invalid["error"]["message"]
+    assert invalid["error"]["retryable"] is True
 
 
 def test_compact_prompt_and_task_selection_preserve_read_only_boundary():

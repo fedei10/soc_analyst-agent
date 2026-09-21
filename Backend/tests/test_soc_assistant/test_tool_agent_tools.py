@@ -1,7 +1,9 @@
 """Checks for the tool-calling agent's tool wrappers, especially save_report."""
 
 import json
+from datetime import UTC, datetime
 
+import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.errors import GraphRecursionError
@@ -9,6 +11,9 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 
 from app.db.repositories.reports import InMemoryReportRepository
+from app.mape_k.llm import LLMInputLimitError
+from app.services.wazuh.exceptions import WazuhAPIError
+from app.services.wazuh.models import AlertEvidence, AlertSearchResult
 from app.soc_assistant.tool_agent import (
     SYSTEM_PROMPT,
     SOCToolAgent,
@@ -31,6 +36,14 @@ def _tools(report_repository, organization_id="user_1", created_by="user_1"):
             conversation_id="conv-1",
         )
     }
+
+
+def _run_tool_node(tool_node, message):
+    builder = StateGraph(MessagesState)
+    builder.add_node("tools", tool_node)
+    builder.add_edge(START, "tools")
+    builder.add_edge("tools", END)
+    return builder.compile().invoke({"messages": [message]})
 
 
 def test_save_report_persists_under_the_calling_context():
@@ -145,6 +158,364 @@ def test_answer_stops_cleanly_on_graph_recursion_limit(monkeypatch):
     assert "reasoning-step limit" in answer
 
 
+def test_recursion_limit_preserves_successful_tool_evidence(monkeypatch):
+    class Gateway:
+        def search_alerts(self, **_filters):
+            alert = AlertEvidence(
+                alert_id="verified-before-limit",
+                timestamp=datetime(2026, 9, 18, 14, 11, tzinfo=UTC),
+                agent_id="001",
+                agent_name="servervb",
+                rule_id="5712",
+                rule_level=10,
+                description="SSHD authentication failed.",
+            )
+            return AlertSearchResult(
+                total=1,
+                returned=1,
+                truncated=False,
+                alerts=[alert],
+            )
+
+    class FakeLLM:
+        def get_client(self):
+            return object()
+
+    def create_interrupted_agent(_model, tool_node, **_kwargs):
+        class FakeAgent:
+            def invoke(self, *_args, **_kwargs):
+                _run_tool_node(
+                    tool_node,
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "id": "search-1",
+                                "name": "search_alerts",
+                                "args": {"hours": 2},
+                            }
+                        ],
+                    ),
+                )
+                raise GraphRecursionError("recursion limit reached")
+
+        return FakeAgent()
+
+    monkeypatch.setattr(
+        "app.soc_assistant.tool_agent.create_react_agent",
+        create_interrupted_agent,
+    )
+    result = SOCToolAgent(
+        gateway=Gateway(),
+        llm=FakeLLM(),
+        report_repository=InMemoryReportRepository(),
+        investigations=object(),
+    ).answer(question="what happened on servervb?", history=[])
+
+    assert result.metrics["investigation_status"] == "incomplete"
+    assert result.metrics["interruption_reason"] == "recursion_limit"
+    assert result.retrieved_evidence_references == [
+        "wazuh:alert:verified-before-limit"
+    ]
+    assert result.metrics["evidence_ledger"][0][
+        "source_evidence_reference_count"
+    ] == 1
+    assert "verified-before-limit" in result.answer
+    assert "No additional model call was made" in result.answer
+
+
+def test_provider_failure_after_tool_preserves_ledger_without_recovery_call(monkeypatch):
+    from app.mape_k.llm import LLMErrorCode, LLMInvocationError
+
+    class Gateway:
+        def search_alerts(self, **_filters):
+            alert = AlertEvidence(
+                alert_id="verified-before-provider-failure",
+                timestamp=datetime(2026, 9, 18, 14, 12, tzinfo=UTC),
+                agent_id="001",
+                agent_name="servervb",
+                rule_id="5712",
+                rule_level=10,
+                description="SSHD authentication failed.",
+            )
+            return AlertSearchResult(
+                total=1,
+                returned=1,
+                truncated=False,
+                alerts=[alert],
+            )
+
+    class FakeLLM:
+        def get_client(self):
+            return object()
+
+    calls = []
+
+    def create_interrupted_agent(_model, tool_node, **_kwargs):
+        class FakeAgent:
+            def invoke(self, *_args, **_kwargs):
+                calls.append("invoke")
+                _run_tool_node(
+                    tool_node,
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "id": "search-1",
+                                "name": "search_alerts",
+                                "args": {"hours": 2},
+                            }
+                        ],
+                    ),
+                )
+                raise LLMInvocationError(
+                    LLMErrorCode.MODEL_PROVIDER_UNAVAILABLE,
+                    retryable=True,
+                    attempt=1,
+                    duration_ms=12,
+                )
+
+        return FakeAgent()
+
+    monkeypatch.setattr(
+        "app.soc_assistant.tool_agent.create_react_agent",
+        create_interrupted_agent,
+    )
+    result = SOCToolAgent(
+        gateway=Gateway(),
+        llm=FakeLLM(),
+        report_repository=InMemoryReportRepository(),
+        investigations=object(),
+    ).answer(question="what happened on servervb?", history=[])
+
+    assert calls == ["invoke"]
+    assert result.metrics["interruption_reason"] == "model_provider_unavailable"
+    assert result.metrics["interruption_category"] == "model_provider_outage"
+    assert result.metrics["investigation_status"] == "incomplete"
+    assert result.evidence_references == [
+        "wazuh:alert:verified-before-provider-failure"
+    ]
+    assert "verified-before-provider-failure" in result.answer
+
+
+def test_raw_provider_failure_before_tools_preserves_measured_latency(monkeypatch):
+    import time
+
+    from app.mape_k.llm import LLMErrorCode, LLMInvocationError
+
+    RawProviderTimeout = type(
+        "APITimeoutError",
+        (Exception,),
+        {"__module__": "openai"},
+    )
+
+    class FakeLLM:
+        def get_client(self):
+            return object()
+
+    class FakeAgent:
+        def invoke(self, *_args, **_kwargs):
+            time.sleep(0.01)
+            raise RawProviderTimeout("timed out")
+
+    monkeypatch.setattr(
+        "app.soc_assistant.tool_agent.create_react_agent",
+        lambda *_args, **_kwargs: FakeAgent(),
+    )
+    agent = SOCToolAgent(
+        gateway=object(),
+        llm=FakeLLM(),
+        report_repository=InMemoryReportRepository(),
+        investigations=object(),
+    )
+
+    with pytest.raises(LLMInvocationError) as failure:
+        agent.answer(question="what happened?", history=[])
+
+    assert failure.value.code == LLMErrorCode.MODEL_TIMEOUT
+    assert failure.value.duration_ms >= 5
+
+
+def test_raw_groq_failure_before_tools_is_classified(monkeypatch):
+    from app.mape_k.llm import LLMErrorCode, LLMInvocationError
+
+    RawGroqRateLimit = type(
+        "RateLimitError",
+        (Exception,),
+        {"__module__": "groq", "status_code": 429},
+    )
+
+    class FakeLLM:
+        def get_client(self):
+            return object()
+
+    class FakeAgent:
+        def invoke(self, *_args, **_kwargs):
+            raise RawGroqRateLimit("rate limited")
+
+    monkeypatch.setattr(
+        "app.soc_assistant.tool_agent.create_react_agent",
+        lambda *_args, **_kwargs: FakeAgent(),
+    )
+    agent = SOCToolAgent(
+        gateway=object(),
+        llm=FakeLLM(),
+        report_repository=InMemoryReportRepository(),
+        investigations=object(),
+    )
+
+    with pytest.raises(LLMInvocationError) as failure:
+        agent.answer(question="what happened?", history=[])
+
+    assert failure.value.code == LLMErrorCode.MODEL_RATE_LIMITED
+
+
+def test_interruption_reports_prior_budget_rejection(monkeypatch):
+    monkeypatch.setattr(
+        "app.soc_assistant.tool_agent.settings.SOC_ANALYST_MAX_TOOL_CALLS",
+        4,
+    )
+
+    class Gateway:
+        def search_alerts(self, **_filters):
+            return AlertSearchResult(total=0, returned=0, truncated=False, alerts=[])
+
+    class FakeLLM:
+        def get_client(self):
+            return object()
+
+    def create_interrupted_agent(_model, tool_node, **_kwargs):
+        class FakeAgent:
+            def invoke(self, *_args, **_kwargs):
+                _run_tool_node(
+                    tool_node,
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "id": f"search-{index}",
+                                "name": "search_alerts",
+                                "args": {"hours": index + 1},
+                            }
+                            for index in range(5)
+                        ],
+                    ),
+                )
+                raise LLMInputLimitError("context full")
+
+        return FakeAgent()
+
+    monkeypatch.setattr(
+        "app.soc_assistant.tool_agent.create_react_agent",
+        create_interrupted_agent,
+    )
+    result = SOCToolAgent(
+        gateway=Gateway(),
+        llm=FakeLLM(),
+        report_repository=InMemoryReportRepository(),
+        investigations=object(),
+    ).answer(question="search repeatedly", history=[])
+
+    assert result.metrics["tool_calls_rejected"] == 1
+    assert result.metrics["limit_reached"] is True
+    assert result.metrics["cited_query_coverage_status"] == "unknown"
+    assert "search_alerts" in result.failed_tools
+
+
+@pytest.mark.parametrize(
+    ("failure", "category", "code"),
+    [
+        pytest.param(
+            LLMInputLimitError("context full"),
+            "model_context_limit",
+            "model_context_limit",
+            id="context-limit",
+        ),
+        pytest.param(
+            WazuhAPIError("indexer unavailable"),
+            "source_failure",
+            "wazuh_source_failure",
+            id="wazuh-source",
+        ),
+        pytest.param(
+            RuntimeError("unexpected bug"),
+            "application_error",
+            "application_error",
+            id="application-error",
+        ),
+    ],
+)
+def test_interruption_after_evidence_keeps_facts_and_exact_failure_class(
+    monkeypatch,
+    failure,
+    category,
+    code,
+):
+    class Gateway:
+        def search_alerts(self, **_filters):
+            return AlertSearchResult(
+                total=1,
+                returned=1,
+                truncated=False,
+                alerts=[
+                    AlertEvidence(
+                        alert_id="retained-before-failure",
+                        timestamp=datetime(2026, 9, 18, 14, 12, tzinfo=UTC),
+                        agent_id="001",
+                        agent_name="servervb",
+                        rule_id="5712",
+                        rule_level=10,
+                        description="Delivered before interruption.",
+                    )
+                ],
+            )
+
+    class FakeLLM:
+        def get_client(self):
+            return object()
+
+    calls = []
+
+    def create_interrupted_agent(_model, tool_node, **_kwargs):
+        class FakeAgent:
+            def invoke(self, *_args, **_kwargs):
+                calls.append("invoke")
+                _run_tool_node(
+                    tool_node,
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "id": "search-1",
+                                "name": "search_alerts",
+                                "args": {"hours": 2},
+                            }
+                        ],
+                    ),
+                )
+                raise failure
+
+        return FakeAgent()
+
+    monkeypatch.setattr(
+        "app.soc_assistant.tool_agent.create_react_agent",
+        create_interrupted_agent,
+    )
+    result = SOCToolAgent(
+        gateway=Gateway(),
+        llm=FakeLLM(),
+        report_repository=InMemoryReportRepository(),
+        investigations=object(),
+    ).answer(question="what happened?", history=[])
+
+    assert calls == ["invoke"]
+    assert result.metrics["interruption_category"] == category
+    assert result.metrics["interruption_reason"] == code
+    assert result.metrics["investigation_status"] == "incomplete"
+    assert result.metrics["evidence_retrieved"] == 1
+    assert "retained-before-failure" in result.answer
+
+
 def test_answer_flags_a_failed_tool_the_model_narrated_as_success(monkeypatch):
     class FakeLLM:
         def get_client(self):
@@ -198,8 +569,16 @@ def test_answer_does_not_attach_every_tool_reference_as_a_footer(monkeypatch):
                         content=json.dumps(
                             {
                                 "alerts": [
-                                    {"alert_id": "alert-relevant"},
-                                    {"alert_id": "alert-unrelated"},
+                                    {
+                                        "alert_id": "alert-relevant",
+                                        "timestamp": "2026-09-20T10:00:00Z",
+                                        "description": "Relevant event",
+                                    },
+                                    {
+                                        "alert_id": "alert-unrelated",
+                                        "timestamp": "2026-09-20T10:01:00Z",
+                                        "description": "Unrelated event",
+                                    },
                                 ]
                             }
                         ),

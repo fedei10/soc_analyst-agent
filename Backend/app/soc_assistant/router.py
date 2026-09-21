@@ -148,10 +148,6 @@ class AssistantIntentRouter:
             if not positional:
                 raise ValueError("/ask requires a question.")
             options["question"] = " ".join(positional)
-        elif command.name == AssistantCommandName.EXPLAIN:
-            if not positional:
-                raise ValueError("/explain requires a command line.")
-            options["command"] = " ".join(positional)
         elif positional:
             raise ValueError(f"{command.slash} does not accept positional arguments.")
         return AssistantIntent(command=command.name, arguments=options)
@@ -232,14 +228,14 @@ class AssistantIntentRouter:
             return {"change_subject": subject, "change_mode": "new"}
         if asks_changed:
             return {"change_subject": subject, "change_mode": "changed"}
-        # A named time window ("in the last hour", "overnight") makes this a
-        # window question, which is exactly what "recent" means here.
-        if (
-            RECENT_PATTERN.search(lower)
-            or LIST_PATTERN.match(lower.strip())
-            or has_window
-        ):
-            return {"change_subject": subject, "change_mode": "recent"}
+        # A plain "recent"/window/listing question used to be answered here
+        # too, with a canned count that ignored any severity/agent filter in
+        # the phrasing ("show me critical alerts" -> "there are 601 alerts").
+        # "new" and "changed" still need this deterministic path - they name
+        # a session cursor the model has no access to - but "recent" is an
+        # ordinary time-windowed question the analyst model's own tools
+        # (search_alerts/aggregate_alerts) can answer directly, filters and
+        # all, so it no longer short-circuits here.
         return None
 
     @staticmethod
@@ -306,17 +302,6 @@ class AssistantIntentRouter:
             for phrase in ("this alert", "that alert", "previous alert")
         ):
             return AssistantIntent(command=AssistantCommandName.STATUS)
-        explain = re.search(
-            r"\b(?:explain(?:\s+this|\s+the)?\s+command|"
-            r"what\s+does\s+(?:this|the)\s+command\s+do)\s*[:\-]?\s*(.+)$",
-            message,
-            re.I,
-        )
-        if explain and explain.group(1).strip():
-            return AssistantIntent(
-                command=AssistantCommandName.EXPLAIN,
-                arguments={"command": explain.group(1).strip()},
-            )
         if any(
             phrase in normalized
             for phrase in (
@@ -364,14 +349,18 @@ class AssistantIntentRouter:
             for phrase in ("triage findings", "triage alerts", "show findings")
         ):
             return AssistantIntent(command=AssistantCommandName.TRIAGE)
-        # Only "what is new / recent / changed" and explicit listing requests
-        # are answered deterministically. Every other alert question - "which
-        # IP is responsible for these?", "is this a brute force?" - used to be
-        # captured here too and answered with a structured dump; it now falls
-        # through to the analyst model, which can actually investigate it.
+        # Only "what's new / changed since my last check" is answered here -
+        # that names a session cursor the analyst model has no access to.
+        # A plain/recent alert listing ("show me critical alerts") used to be
+        # captured here too and answered with a canned count that ignored
+        # any severity/time filter in the phrasing; it now falls through to
+        # CHAT, which has search_alerts/aggregate_alerts and can actually
+        # apply those filters.
         filters = self._alert_filters(message)
         change = self._change_query(lower, has_window="hours" in filters)
-        if change is not None:
+        if change is not None and alert_id is None:
+            # A named alert ID means this is about one specific alert, not a
+            # fleet-wide count - let the analyst model look it up instead.
             return AssistantIntent(
                 command=AssistantCommandName.ALERTS,
                 arguments={**filters, **change},

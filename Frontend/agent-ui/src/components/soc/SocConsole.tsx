@@ -8,7 +8,6 @@ import {
   Bot,
   CheckCircle2,
   ChevronRight,
-  ClipboardList,
   FileText,
   GitBranch,
   History,
@@ -24,6 +23,7 @@ import {
   Shield,
   ShieldAlert,
   Sparkles,
+  Square,
   TrendingDown,
   Terminal,
   Workflow,
@@ -38,19 +38,17 @@ import {
   useRef,
   useState
 } from 'react'
-import { toast } from 'sonner'
 
 import {
-  explainCommand,
   getAlertSummary,
   getAssistantCommands,
   getInvestigation,
   getLiveness,
   getReports,
-  getShiftHandoff,
   getSOCOverview,
   getSOCPlatform,
   getWazuhHealth,
+  stopAgentMessage,
   streamAgentMessage
 } from '@/api/soc'
 import type {
@@ -60,9 +58,7 @@ import type {
   AssistantCommand,
   ChatActivity,
   ChatMessage,
-  CommandExplanation,
   Investigation,
-  ShiftHandoff,
   SOCOverview,
   SOCPlatform,
   WorkspaceView,
@@ -265,10 +261,14 @@ function ResultDetails({ result }: { result: Record<string, unknown> }) {
 }
 
 const GROUNDING_MEANING: Record<string, string> = {
+  cited:
+    'The answer cites one or more references returned by a successful tool. Each citation supports only its nearby claim; uncited statements are not automatically verified.',
+  tool_verified:
+    'The interrupted run preserved factual output from a successful tool, but no delivered evidence reference was available to cite.',
   grounded:
-    'Every claim is backed by evidence references the analyst actually cited, over a query that returned all matching records.',
+    'Legacy status: evidence was cited, but claim-by-claim verification was not measured.',
   partial:
-    'Backed by real evidence, but the query sampled or truncated the matching records, or a tool failed - treat distributions and totals as indicative only.',
+    'Legacy status: some evidence was cited, with a separate coverage or execution limitation.',
   ungrounded:
     'No verified evidence reference was cited for this answer. Treat it as commentary, not a finding.'
 }
@@ -276,10 +276,8 @@ const GROUNDING_MEANING: Record<string, string> = {
 /**
  * Evidence coverage for one analyst turn.
  *
- * "Grounded" here deliberately does not mean "a tool ran". It means the answer
- * cited at least one evidence reference that the backend saw come back from a
- * tool, with no tool failures and no sampling or truncation in the underlying
- * query. Anything less is reported as partial, with the limit named.
+ * Citation, per-query search coverage, and investigation completion are shown
+ * separately. One valid citation never implies that every sentence is verified.
  */
 function ConversationEvidence({ result }: { result: AnalystResponsePayload }) {
   const metrics = result.analyst_metrics
@@ -296,11 +294,8 @@ function ConversationEvidence({ result }: { result: AnalystResponsePayload }) {
 
   const headline = [
     `${metrics?.tool_calls ?? 0} tool call${metrics?.tool_calls === 1 ? '' : 's'}`,
-    typeof metrics?.matched_records === 'number'
-      ? `${metrics.matched_records} matching record${metrics.matched_records === 1 ? '' : 's'}`
-      : null,
-    typeof metrics?.sampled_records === 'number'
-      ? `${metrics.sampled_records} sampled record${metrics.sampled_records === 1 ? '' : 's'}`
+    typeof metrics?.evidence_retrieved === 'number'
+      ? `${metrics.evidence_retrieved} retrieved reference${metrics.evidence_retrieved === 1 ? '' : 's'}`
       : null,
     `${references.length} verified evidence reference${references.length === 1 ? '' : 's'}`
   ]
@@ -313,7 +308,7 @@ function ConversationEvidence({ result }: { result: AnalystResponsePayload }) {
       <div className="trace-list">
         {status && (
           <div>
-            {status === 'grounded' ? (
+            {status === 'cited' || status === 'grounded' ? (
               <CheckCircle2 size={14} aria-hidden="true" />
             ) : (
               <AlertTriangle size={14} aria-hidden="true" />
@@ -338,12 +333,39 @@ function ConversationEvidence({ result }: { result: AnalystResponsePayload }) {
             </span>
           </div>
         )}
+        {metrics?.query_coverage_status && (
+          <div>
+            {metrics.query_coverage_status === 'complete' ? (
+              <CheckCircle2 size={14} aria-hidden="true" />
+            ) : (
+              <AlertTriangle size={14} aria-hidden="true" />
+            )}
+            <span>
+              Query coverage: {titleCase(metrics.query_coverage_status)}. See
+              each query entry for its own matched, source-returned, and
+              delivered counts.
+            </span>
+          </div>
+        )}
+        {metrics?.investigation_status && (
+          <div>
+            {metrics.investigation_status === 'complete' ? (
+              <CheckCircle2 size={14} aria-hidden="true" />
+            ) : (
+              <AlertTriangle size={14} aria-hidden="true" />
+            )}
+            <span>
+              Investigation: {titleCase(metrics.investigation_status)}
+            </span>
+          </div>
+        )}
         {metrics?.truncated && (
           <div>
             <AlertTriangle size={14} aria-hidden="true" />
             <span>
-              Results were truncated to fit the tool output budget, so counts
-              below the total are a sample, not the full population.
+              At least one query was sampled at the source or clipped for
+              delivery. The per-query search and delivery statuses identify
+              which.
             </span>
           </div>
         )}
@@ -542,13 +564,6 @@ export default function SocConsole() {
   const [alertSummary, setAlertSummary] = useState<AlertSummary | null>(null)
   const [environmentBusy, setEnvironmentBusy] = useState(false)
   const [environmentHydrated, setEnvironmentHydrated] = useState(false)
-  const [handoff, setHandoff] = useState<ShiftHandoff | null>(null)
-  const [handoffBusy, setHandoffBusy] = useState(false)
-  const [explainInput, setExplainInput] = useState('')
-  const [explanation, setExplanation] = useState<CommandExplanation | null>(
-    null
-  )
-  const [explainBusy, setExplainBusy] = useState(false)
   const [reports, setReports] = useState<AnalystReport[]>([])
   const [reportsBusy, setReportsBusy] = useState(false)
   const [openReport, setOpenReport] = useState<AnalystReport | null>(null)
@@ -833,6 +848,15 @@ export default function SocConsole() {
     await submitChatPrompt(chatInput)
   }
 
+  async function handleStopChat() {
+    if (!conversationId) return
+    try {
+      await stopAgentMessage(conversationId)
+    } catch {
+      // Best-effort: the request is a cancellation hint, not a hard command.
+    }
+  }
+
   function openAssistantPrompt(prompt: string) {
     setView('chat')
     if (prompt.endsWith(' ')) {
@@ -873,39 +897,6 @@ export default function SocConsole() {
     ) {
       event.preventDefault()
       void handleChatSubmit()
-    }
-  }
-
-  async function generateHandoff() {
-    setHandoffBusy(true)
-    try {
-      setHandoff(await getShiftHandoff())
-    } catch (error) {
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : 'Handoff notes could not be generated.'
-      )
-    } finally {
-      setHandoffBusy(false)
-    }
-  }
-
-  async function handleExplainCommand() {
-    const command = explainInput.trim()
-    if (!command || explainBusy) return
-    setExplainBusy(true)
-    setExplanation(null)
-    try {
-      setExplanation(await explainCommand(command))
-    } catch (error) {
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : 'The command could not be explained.'
-      )
-    } finally {
-      setExplainBusy(false)
     }
   }
 
@@ -1238,62 +1229,6 @@ export default function SocConsole() {
                 </div>
               </Panel>
             </div>
-
-            <Panel
-              title="Shift handoff"
-              icon={<ClipboardList size={17} />}
-              action={
-                <button
-                  className="button button-secondary"
-                  onClick={() => void generateHandoff()}
-                  disabled={handoffBusy}
-                >
-                  <RefreshCw size={14} className={handoffBusy ? 'spin' : ''} />
-                  {handoff ? 'Regenerate' : 'Generate notes'}
-                </button>
-              }
-            >
-              {handoff ? (
-                <div className="handoff-body">
-                  <p className="result-summary">{handoff.summary}</p>
-                  <div className="handoff-columns">
-                    {(
-                      [
-                        ['Highlights', handoff.highlights],
-                        ['Open items', handoff.open_items],
-                        ['Recommendations', handoff.recommendations]
-                      ] as const
-                    ).map(([label, items]) => (
-                      <div key={label} className="handoff-block">
-                        <h3>{label}</h3>
-                        {items.length > 0 ? (
-                          <ul>
-                            {items.map((item) => (
-                              <li key={item}>{item}</li>
-                            ))}
-                          </ul>
-                        ) : (
-                          <span>Nothing recorded</span>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                  <small className="handoff-meta">
-                    Last {handoff.window_hours}h · {handoff.finding_count}{' '}
-                    findings · {handoff.investigation_count} investigations ·
-                    generated{' '}
-                    {new Date(handoff.generated_at).toLocaleTimeString()}
-                  </small>
-                </div>
-              ) : (
-                <div className="panel-empty">
-                  <ClipboardList size={20} />
-                  <span>
-                    Generate plain-language notes for the incoming shift
-                  </span>
-                </div>
-              )}
-            </Panel>
           </div>
         ) : view === 'chat' ? (
           <div className="chat-workspace">
@@ -1444,15 +1379,27 @@ export default function SocConsole() {
                       </button>
                     )}
                   </div>
-                  <button
-                    className="send-button"
-                    type="submit"
-                    disabled={!chatInput.trim() || chatBusy}
-                    title="Send query"
-                  >
-                    <Send size={17} />
-                    Send
-                  </button>
+                  {chatBusy ? (
+                    <button
+                      type="button"
+                      className="send-button stop-button"
+                      onClick={handleStopChat}
+                      title="Stop this investigation"
+                    >
+                      <Square size={15} />
+                      Stop
+                    </button>
+                  ) : (
+                    <button
+                      className="send-button"
+                      type="submit"
+                      disabled={!chatInput.trim()}
+                      title="Send query"
+                    >
+                      <Send size={17} />
+                      Send
+                    </button>
+                  )}
                 </div>
               </form>
             </section>
@@ -1563,50 +1510,6 @@ export default function SocConsole() {
                       Ask the assistant to write up and save a report - it will
                       appear here
                     </span>
-                  </div>
-                )}
-              </Panel>
-
-              <Panel title="Command explainer" icon={<Terminal size={16} />}>
-                <div className="explainer-form">
-                  <textarea
-                    value={explainInput}
-                    onChange={(event) => setExplainInput(event.target.value)}
-                    placeholder="Paste a suspicious command line..."
-                    rows={2}
-                    disabled={explainBusy}
-                  />
-                  <button
-                    className="button button-secondary"
-                    onClick={() => void handleExplainCommand()}
-                    disabled={!explainInput.trim() || explainBusy}
-                  >
-                    {explainBusy ? (
-                      <RefreshCw size={14} className="spin" />
-                    ) : (
-                      <Terminal size={14} />
-                    )}
-                    Explain command
-                  </button>
-                </div>
-                {explanation && (
-                  <div className="result-details">
-                    <div className="explainer-risk">
-                      <StatusBadge value={explanation.risk} />
-                    </div>
-                    <p className="result-summary">
-                      {explanation.plain_english}
-                    </p>
-                    {explanation.indicators.length > 0 && (
-                      <p className="result-summary">
-                        Indicators: {explanation.indicators.join(' · ')}
-                      </p>
-                    )}
-                    {explanation.recommended_checks.length > 0 && (
-                      <p className="result-summary">
-                        Check next: {explanation.recommended_checks.join(' · ')}
-                      </p>
-                    )}
                   </div>
                 )}
               </Panel>

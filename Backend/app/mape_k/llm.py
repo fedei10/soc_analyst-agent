@@ -285,8 +285,9 @@ def estimated_tokens(payload: Any) -> int:
     return (len(json.dumps(payload, default=str)) + 3) // 4
 
 
-# These providers speak the OpenAI wire format, so one ChatOpenAI client with a
-# different base_url covers them; langchain-groq buys nothing here.
+# Non-Groq providers use the OpenAI-compatible wire format. Groq uses its
+# native LangChain integration so GROQ_API_KEY and Groq-specific behavior are
+# explicit rather than being hidden behind the generic OpenAI client.
 SUPPORTED_LLM_PROVIDERS = {"oxy", "mistral", "groq", "evomap"}
 
 
@@ -305,7 +306,10 @@ class LLMTier(StrEnum):
 
 
 def effective_llm_api_key() -> str:
-    if settings.LLM_PROVIDER.strip().lower() == "evomap":
+    provider = settings.LLM_PROVIDER.strip().lower()
+    if provider == "groq":
+        return settings.GROQ_API_KEY.get_secret_value().strip()
+    if provider == "evomap":
         token = settings.K_API_KEY.get_secret_value().strip()
         if not token:
             return ""
@@ -395,37 +399,58 @@ class LLMProvider:
         }
 
     def _build_client(self, endpoint: dict[str, Any], limiter: LLMRateLimiter):
-        from langchain_openai import ChatOpenAI
-
-        client = ChatOpenAI(
-            api_key=endpoint["api_key"],
-            base_url=endpoint["base_url"],
-            model=endpoint["model"],
-            temperature=0,
-            timeout=endpoint["timeout_seconds"],
-            max_retries=0,
-            tags=[
+        client_kwargs = {
+            "api_key": endpoint["api_key"],
+            "model": endpoint["model"],
+            "temperature": 0,
+            "timeout": endpoint["timeout_seconds"],
+            "max_retries": 0,
+            "tags": [
                 f"provider:{endpoint['provider']}",
                 f"tier:{self.tier.value}",
                 "workflow:mape-k",
             ],
-        )
+        }
+        if endpoint["provider"] == "groq":
+            from langchain_groq import ChatGroq
+
+            client = ChatGroq(**client_kwargs)
+        else:
+            from langchain_openai import ChatOpenAI
+
+            client = ChatOpenAI(
+                **client_kwargs,
+                base_url=endpoint["base_url"],
+            )
         # Gate every real call through the limiter, not just our own
         # invoke_structured() path. Instance-level patch (not a subclass) so
         # it survives .bind_tools()/.with_structured_output() - both still
         # call through to this same instance's .invoke. object.__setattr__
-        # bypasses ChatOpenAI's Pydantic __setattr__, which rejects assigning
+        # bypasses the clients' Pydantic __setattr__, which rejects assigning
         # to anything that isn't a model field.
         original_invoke = client.invoke
 
         def rate_limited_invoke(*args: Any, **kwargs: Any) -> Any:
             prompt = args[0] if args else kwargs.get("input")
+            # Bound tool schemas are sent on every tool-calling request and
+            # count toward Groq's TPM quota. Ignoring them undercharged the
+            # first analyst turn by several thousand tokens, so the follow-up
+            # after a successful tool call could receive an avoidable 429.
+            # Keep the estimate provider-neutral and include schemas only
+            # when the runnable binding actually supplied them.
+            metered_payload: Any = prompt
+            if kwargs.get("tools"):
+                metered_payload = {
+                    "messages": prompt,
+                    "tools": kwargs["tools"],
+                }
             # ponytail: charged up front from an estimate, never reconciled
             # against the reply's real token count. The reserve absorbs the
             # gap; if 429s appear anyway, raise LLM_OUTPUT_TOKEN_RESERVE
             # before reaching for post-call accounting.
             limiter.acquire(
-                estimated_tokens(prompt) + settings.LLM_OUTPUT_TOKEN_RESERVE
+                estimated_tokens(metered_payload)
+                + settings.LLM_OUTPUT_TOKEN_RESERVE
             )
             return original_invoke(*args, **kwargs)
 

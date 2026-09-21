@@ -13,12 +13,14 @@ import json
 import re
 import threading
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Literal
 
 import structlog
+from opensearchpy import exceptions as opensearch_exc
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_core.utils.function_calling import convert_to_openai_tool
@@ -30,16 +32,26 @@ from app.config import settings
 from app.core.observability.callbacks import observability_callbacks
 from app.db.repositories.findings import get_finding_repository
 from app.db.repositories.reports import ReportRepository, get_report_repository
-from app.mape_k.llm import LLMInputLimitError, LLMProvider, estimated_tokens, get_llm_provider
+from app.mape_k.llm import (
+    LLMConfigurationError,
+    LLMErrorCode,
+    LLMInputLimitError,
+    LLMInvocationError,
+    LLMProvider,
+    classify_llm_error,
+    estimated_tokens,
+    get_llm_provider,
+    is_rate_limit_error,
+)
 from app.orchestration.investigation_service import (
     InvestigationNotFoundError,
     InvestigationService,
     get_investigation_service,
 )
 from app.services.wazuh.gateway import WazuhGateway
+from app.services.wazuh.exceptions import WazuhError
 from app.services.wazuh.analyst_evidence import process_evidence
 from app.services.wazuh.models import AlertSearchResult
-from app.soc_assistant.adopted_tools import build_hunting_tools
 from app.services.wazuh.correlation import (
     authentication_activity,
     summarize_alert_activity,
@@ -50,32 +62,91 @@ from app.utils.helpers import gather
 MAX_TOOL_OUTPUT_CHARS = settings.SOC_ANALYST_MAX_TOOL_OUTPUT_CHARS
 logger = structlog.get_logger("tsage.soc_tool_agent")
 _REPORT_INTENT = re.compile(r"\b(report|write[- ]?up|document|save)\b")
+_CLIP_AUDIT: ContextVar[list[dict[str, Any]] | None] = ContextVar(
+    "soc_tool_clip_audit",
+    default=None,
+)
+
+
+def _request_token_budget() -> int:
+    """Total request budget schemas, history and current evidence all share."""
+    return max(
+        1,
+        min(
+            settings.MAPEK_MAX_INPUT_TOKENS,
+            settings.LLM_RATE_LIMIT_MAX_TOKENS - settings.LLM_OUTPUT_TOKEN_RESERVE,
+        ),
+    )
+
+
+def _schema_tokens(tools: list[Any]) -> int:
+    return estimated_tokens([convert_to_openai_tool(item) for item in tools])
+
+
+_TOOL_BUDGET_NOTICE = json.dumps({
+    "ok": True,
+    "truncated_for_budget": True,
+    "note": (
+        "Original tool result exceeded the analyst request budget for this "
+        "turn and was shortened. Ask a narrower question (smaller time "
+        "window, specific agent/rule) to see full detail."
+    ),
+})
+
+
+def _shrink_largest_tool_message(current: list[Any]) -> bool:
+    """Last-resort trim when even an empty history still overflows budget.
+
+    Only ever touches ToolMessage content (evidence), never the human's own
+    message or an AI turn, and always leaves an explicit truncation flag
+    instead of silently cutting text - same philosophy as _clip(). Shrinks
+    the single largest untouched result first, since that frees the most
+    budget per step. Returns False once nothing is left to shrink, so the
+    caller can still raise rather than loop forever.
+    """
+    candidates = [
+        (index, message)
+        for index, message in enumerate(current)
+        if isinstance(message, ToolMessage)
+        and "truncated_for_budget" not in str(message.content)
+    ]
+    if not candidates:
+        return False
+    index, message = max(candidates, key=lambda pair: len(str(pair[1].content)))
+    current[index] = message.model_copy(update={"content": _TOOL_BUDGET_NOTICE})
+    return True
 
 
 def _bounded_analyst_prompt(tools: list[Any]) -> Any:
     """Drop old conversation turns, never current tool-call/result pairs.
 
-    Include schemas in the estimated request budget. A context-limit failure
-    is explicit, not a provider outage or permission to guess unseen evidence.
+    Include schemas in the estimated request budget. If trimming history
+    still leaves the current turn's own evidence over budget - many tool
+    calls each near their own per-call cap can add up - shrink the largest
+    tool results in place (explicitly flagged, never silent) before giving
+    up. A context-limit failure is still raised once genuinely nothing more
+    can be shrunk, so it stays a visible error, not a guess at unseen
+    evidence.
     """
-    schema_tokens = estimated_tokens([convert_to_openai_tool(item) for item in tools])
+    schema_tokens = _schema_tokens(tools)
 
     def prompt(state: dict[str, Any]) -> list[Any]:
         messages = list(state["messages"])
         boundary = max((i for i, message in enumerate(messages) if message.type == "human"), default=0)
         history, current = messages[:boundary], messages[boundary:]
-        budget = max(1, min(settings.MAPEK_MAX_INPUT_TOKENS,
-                            settings.LLM_RATE_LIMIT_MAX_TOKENS - settings.LLM_OUTPUT_TOKEN_RESERVE))
+        budget = _request_token_budget()
         while True:
             result = [SystemMessage(content=SYSTEM_PROMPT), *history, *current]
             payload = [message.model_dump(exclude_none=True) for message in result]
             if estimated_tokens(payload) + schema_tokens <= budget:
                 return result
-            if not history:
-                raise LLMInputLimitError("Current evidence and tool schemas exceed the analyst request budget.")
-            history.pop(0)
-            while history and history[0].type != "human":
+            if history:
                 history.pop(0)
+                while history and history[0].type != "human":
+                    history.pop(0)
+                continue
+            if not _shrink_largest_tool_message(current):
+                raise LLMInputLimitError("Current evidence and tool schemas exceed the analyst request budget.")
 
     return prompt
 
@@ -88,15 +159,16 @@ class SOCToolAgentAnswer:
     tool_calls: list[str] = field(default_factory=list)
     active_alert_id: str | None = None
     failed_tools: list[str] = field(default_factory=list)
+    retrieved_evidence_references: list[str] = field(default_factory=list)
     evidence_references: list[str] = field(default_factory=list)
     context_references: dict[str, str] = field(default_factory=dict)
     metrics: dict[str, Any] = field(default_factory=dict)
 
     @property
     def grounded(self) -> bool:
-        # Not "a tool ran": the answer has to have cited evidence the backend
-        # saw come back, over a query that was complete.
-        return self.metrics.get("coverage_status") == "grounded"
+        # This means at least one verified reference was cited. It does not
+        # assert that every sentence in free-form model prose is verified.
+        return self.metrics.get("grounding_status") == "cited"
 
     def __iter__(self) -> Iterator[Any]:
         # Existing integrations unpack three values. Keep that contract while
@@ -106,9 +178,150 @@ class SOCToolAgentAnswer:
         yield self.active_alert_id
 
 
+def _exception_chain(exc: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    while current is not None and current not in chain:
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+_STOP_EVENTS: dict[str, threading.Event] = {}
+_STOP_LOCK = threading.Lock()
+
+
+def request_stop(conversation_id: str) -> bool:
+    """Signal the in-flight chat turn for this conversation to stop.
+
+    Returns False if no turn is currently running for that conversation
+    (nothing to stop, not an error).
+    """
+    with _STOP_LOCK:
+        event = _STOP_EVENTS.get(conversation_id)
+    if event is None:
+        return False
+    event.set()
+    return True
+
+
+def _stop_event_for(conversation_id: str | None) -> threading.Event | None:
+    if not conversation_id:
+        return None
+    with _STOP_LOCK:
+        event = _STOP_EVENTS.setdefault(conversation_id, threading.Event())
+    return event
+
+
+def _clear_stop_event(conversation_id: str | None) -> None:
+    if not conversation_id:
+        return
+    with _STOP_LOCK:
+        _STOP_EVENTS.pop(conversation_id, None)
+
+
+def classify_agent_interruption(exc: Exception) -> dict[str, Any]:
+    """Classify only errors with evidence of their originating boundary."""
+
+    chain = _exception_chain(exc)
+    if any(
+        isinstance(
+            item,
+            (
+                WazuhError,
+                opensearch_exc.ConnectionError,
+                opensearch_exc.ConnectionTimeout,
+            ),
+        )
+        for item in chain
+    ):
+        return {
+            "category": "source_failure",
+            "code": "wazuh_source_failure",
+            "reason": "a Wazuh evidence source failed",
+        }
+    if any(isinstance(item, LLMInputLimitError) for item in chain):
+        return {
+            "category": "model_context_limit",
+            "code": "model_context_limit",
+            "reason": "the model context limit was reached",
+        }
+    texts: list[str] = []
+    for item in chain:
+        try:
+            texts.append(str(item).lower())
+        except Exception:
+            texts.append(type(item).__name__.lower())
+    if any(getattr(item, "status_code", None) == 413 for item in chain) or any(
+        "context length" in text or "too many tokens" in text for text in texts
+    ):
+        return {
+            "category": "model_context_limit",
+            "code": "model_context_limit",
+            "reason": "the model context limit was reached",
+        }
+    if is_rate_limit_error(exc):
+        return {
+            "category": "model_rate_limit",
+            "code": "model_rate_limit",
+            "reason": "the model rate limit was reached",
+        }
+    invocation = next(
+        (item for item in chain if isinstance(item, LLMInvocationError)),
+        None,
+    )
+    if isinstance(invocation, LLMInvocationError):
+        code = invocation.code
+        categories = {
+            LLMErrorCode.MODEL_CONTEXT_LIMIT_EXCEEDED: "model_context_limit",
+            LLMErrorCode.MODEL_RATE_LIMITED: "model_rate_limit",
+            LLMErrorCode.MODEL_PROVIDER_UNAVAILABLE: "model_provider_outage",
+            LLMErrorCode.MODEL_TIMEOUT: "model_provider_outage",
+            LLMErrorCode.MODEL_AUTHENTICATION_FAILED: "model_provider_outage",
+            LLMErrorCode.MODEL_OUTPUT_INVALID: "model_response_failure",
+            LLMErrorCode.MODEL_REQUEST_FAILED: "model_request_failure",
+        }
+        category = categories[code]
+        return {
+            "category": category,
+            "code": code.value.lower(),
+            "reason": category.replace("_", " "),
+            "model": invocation.safe_metadata(),
+        }
+    if any(isinstance(item, LLMConfigurationError) for item in chain):
+        return {
+            "category": "model_configuration",
+            "code": "model_configuration",
+            "reason": "the model provider is not configured",
+        }
+
+    # Raw OpenAI client exceptions can surface from the LangGraph loop before
+    # LLMProvider has a chance to normalize them. Module provenance prevents a
+    # database/network/programming error from being mislabeled as a model error.
+    provider_error = next(
+        (
+            item
+            for item in chain
+            if type(item).__module__.split(".", 1)[0] == "openai"
+        ),
+        None,
+    )
+    if isinstance(provider_error, Exception):
+        classified = classify_llm_error(provider_error, attempt=1, duration_ms=0)
+        return classify_agent_interruption(classified)
+    return {
+        "category": "application_error",
+        "code": "application_error",
+        "reason": "an unexpected application error interrupted the investigation",
+        "error_type": type(exc).__name__,
+    }
+
+
 def _recursion_limit() -> int:
     # A tool round consumes roughly two graph steps plus the final answer.
-    return max(4, int(settings.SOC_ANALYST_MAX_TOOL_CALLS) * 2 + 2)
+    # Keep one additional round for correcting a recoverable validation error;
+    # operational executions remain capped independently by _ToolCallBudget.
+    return max(6, int(settings.SOC_ANALYST_MAX_TOOL_CALLS) * 2 + 4)
 
 
 # Default-deny. A tool is assumed to change state unless it is listed here,
@@ -119,6 +332,7 @@ UNVERIFIED_INTENT_SOURCES = frozenset({"fallback", "router_error"})
 
 READ_ONLY_TOOLS = frozenset(
     {
+        "specialized_capability",
         "search_alerts",
         "aggregate_alerts",
         "alert_summary",
@@ -150,119 +364,401 @@ READ_ONLY_TOOLS = frozenset(
 )
 
 
+# General-purpose investigation toolkit: kept first when trimming for the
+# request budget, so it survives regardless of what the question asked.
+_CORE_TOOL_PRIORITY: tuple[str, ...] = (
+    "specialized_capability",
+    "search_alerts",
+    "aggregate_alerts",
+    "summarize_alert_activity",
+    "get_alert",
+    "agent_status",
+    "threat_hunt",
+    "correlated_alerts",
+    "hunt_ioc",
+    "telemetry_health",
+    "wazuh_health_summary",
+    "list_findings",
+    "get_investigation_status",
+    "get_agent_context",
+)
+
+# Specialized evidence capabilities: bound alongside the core set whenever
+# the measured schema budget allows, in this fixed order. A question whose
+# wording matches one of the hints below only reorders it ahead of its
+# unmatched peers within this tier - it never adds or removes a tool that
+# the budget would otherwise decide.
+_SPECIALIZED_TOOL_PRIORITY: tuple[str, ...] = (
+    "mitre_technique_context",
+    "vulnerability_overview",
+    "get_agent_inventory",
+    "investigate_authentication",
+    "get_agent_detection_evidence",
+    "compare_alert_windows",
+    "alert_timeline",
+    "mitre_attack_coverage",
+    "rule_mitre_context",
+    "mitre_search",
+    "sca_policy_summary",
+    "sca_failed_checks",
+    "mitre_metadata",
+    "alert_summary",
+)
+
+_SPECIALIZED_RELEVANCE_HINTS: dict[str, tuple[str, ...]] = {
+    "vulnerability_overview": ("vulnerab", "cve", "patch"),
+    "get_agent_inventory": ("inventory", "package", "installed", "vulnerab", "cve"),
+    "investigate_authentication": (
+        "ssh", "login", "log in", "authentication", "password", "brute force", "spray",
+    ),
+    "get_agent_detection_evidence": ("detection", "evidence"),
+    "compare_alert_windows": ("baseline", "spike", "surge", "unusual", "compare"),
+    "alert_timeline": ("timeline", "burst"),
+    "mitre_attack_coverage": ("coverage", "tactic", "rank", "dominant"),
+    "rule_mitre_context": ("attack type", "what does rule"),
+    "mitre_search": ("mitre", "att&ck", "technique", "tactic"),
+    "mitre_technique_context": ("mitre", "att&ck", "technique"),
+    "sca_policy_summary": ("sca", "harden", "compliance", "configuration", "cis benchmark"),
+    "sca_failed_checks": ("sca", "harden", "compliance", "configuration", "cis benchmark"),
+    "mitre_metadata": ("mitre metadata", "dataset version"),
+    "alert_summary": ("summary", "overview", "how many", "count"),
+}
+_TECHNIQUE_ID_PATTERN = re.compile(r"\bt\d{4}(?:\.\d{3})?\b")
+
+_SOURCE_FAILURE_CODES = frozenset(
+    {
+        "WAZUH_AUTH_FAILED",
+        "WAZUH_FORBIDDEN",
+        "WAZUH_TIMEOUT",
+        "WAZUH_UNAVAILABLE",
+        "WAZUH_API_ERROR",
+        "WAZUH_TOOL_ERROR",
+        "TOOL_EXECUTION_FAILED",
+    }
+)
+_VALIDATION_ERROR_CODES = frozenset(
+    {"INVALID_ARGUMENT", "INVALID_TOOL_INPUT", "TOOL_VALIDATION_ERROR"}
+)
+
+
+def _decoded_tool_payload(raw_content: Any) -> dict[str, Any] | None:
+    if not isinstance(raw_content, str):
+        return None
+    try:
+        payload = json.loads(raw_content)
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _tool_result_outcome(raw_content: Any, *, status: str | None = None) -> str:
+    """Classify a tool result from its envelope, not HTTP/message success.
+
+    ToolNode can successfully execute a Python function whose JSON result is
+    still ``ok: false``. That is not evidence and must not be cached or counted
+    as a successful retrieval.
+    """
+
+    payload = _decoded_tool_payload(raw_content)
+    error = payload.get("error") if payload else None
+    error = error if isinstance(error, dict) else {}
+    code = str(error.get("code") or "").upper()
+    retryable = bool(error.get("retryable"))
+    if payload and payload.get("ok") is False:
+        if code in _VALIDATION_ERROR_CODES or (retryable and "INPUT" in code):
+            return "recoverable_validation_error"
+        if code in _SOURCE_FAILURE_CODES or code.startswith("WAZUH_"):
+            return "source_failure"
+        return "tool_error"
+    if status == "error":
+        if code in _VALIDATION_ERROR_CODES:
+            return "recoverable_validation_error"
+        if code in _SOURCE_FAILURE_CODES or code.startswith("WAZUH_"):
+            return "source_failure"
+        return "tool_error"
+    return "success"
+
+
+def _tool_output_summary(raw_content: Any) -> dict[str, Any]:
+    """Bounded, non-duplicative output facts for the analyst trace."""
+
+    payload = _decoded_tool_payload(raw_content)
+    if payload is None:
+        return {"content_type": type(raw_content).__name__}
+    error = payload.get("error")
+    if payload.get("ok") is False and isinstance(error, dict):
+        return {
+            "ok": False,
+            "error_code": error.get("code"),
+            "retryable": bool(error.get("retryable")),
+        }
+    coverage = payload.get("coverage")
+    source = coverage if isinstance(coverage, dict) else payload
+    summary: dict[str, Any] = {
+        "ok": payload.get("ok", True),
+        "fields": sorted(str(key) for key in payload.keys())[:20],
+        "evidence_references": len(_delivered_evidence_references(payload)),
+    }
+    delivery = _evidence_delivery(payload)
+    summary.update(
+        {
+            "evidence_delivery_kinds": delivery["kinds"],
+            "reference_only_references": len(
+                delivery["reference_only_references"]
+            ),
+            "event_detail_references": len(delivery["event_detail_references"]),
+            "summary_or_aggregate": delivery["summary_or_aggregate"],
+        }
+    )
+    for target, keys in {
+        "matched": ("matched", "total", "total_alerts"),
+        "returned": ("returned",),
+    }.items():
+        for key in keys:
+            value = source.get(key)
+            if isinstance(value, (int, float)):
+                summary[target] = int(value)
+                break
+    summary["truncated"] = bool(
+        source.get("truncated")
+        or source.get("output_truncated")
+        or payload.get("truncated")
+    )
+    return summary
+
+
+def _compact_tool_contract(item: Any) -> dict[str, Any]:
+    """Small discovery contract for a specialized read-only tool."""
+
+    rendered = convert_to_openai_tool(item).get("function", {})
+    parameters = rendered.get("parameters", {})
+    properties = parameters.get("properties", {})
+    inputs: dict[str, Any] = {}
+    for name, schema in properties.items():
+        if not isinstance(schema, dict):
+            continue
+        inputs[name] = {
+            key: schema[key]
+            for key in ("type", "enum", "default")
+            if key in schema
+        }
+    return {
+        "name": item.name,
+        "summary": str(rendered.get("description") or "").split("\n", 1)[0][:180],
+        "inputs": inputs,
+        "required": list(parameters.get("required") or []),
+    }
+
+
+class _AdaptiveSpecializedAccess:
+    """Compact catalog/dispatcher for trimmed specialized read-only tools.
+
+    The same ReAct analyst can discover a capability after a lead appears and
+    invoke it without binding every large schema up front. The dispatcher is
+    strictly backed by the existing read-only specialized allowlist.
+    """
+
+    def __init__(self, tools: list[Any]) -> None:
+        self._tools = {
+            item.name: item
+            for item in tools
+            if item.name in _SPECIALIZED_TOOL_PRIORITY and item.name in READ_ONLY_TOOLS
+        }
+        self.events: list[dict[str, Any]] = []
+        self.tool = self._build_tool()
+
+    def _build_tool(self) -> Any:
+        owner = self
+
+        @tool("specialized_capability")
+        def specialized_capability(
+            action: Literal["discover", "invoke"],
+            query: str | None = None,
+            capability: str | None = None,
+            arguments: dict[str, Any] | None = None,
+        ) -> str:
+            """Discover or invoke a specialized read-only SOC capability.
+
+            Use action=discover with a short description of the new lead. The
+            result returns compact names and input contracts. Then use
+            action=invoke with an exact capability name and arguments. This
+            gateway exposes no response, execution, approval, or other
+            state-changing action.
+            """
+
+            started = time.monotonic()
+            event: dict[str, Any] = {
+                "action": action,
+                "query": (query or "")[:200] or None,
+                "capability": capability,
+            }
+            try:
+                if action == "discover":
+                    terms = {
+                        term
+                        for term in re.findall(r"[a-z0-9_]+", (query or "").lower())
+                        if len(term) > 2
+                    }
+                    ranked: list[tuple[int, str, Any]] = []
+                    for name, item in owner._tools.items():
+                        haystack = f"{name} {item.description}".lower()
+                        score = sum(1 for term in terms if term in haystack)
+                        ranked.append((-score, name, item))
+                    ranked.sort(key=lambda entry: (entry[0], entry[1]))
+                    matches = [
+                        _compact_tool_contract(item)
+                        for score, _name, item in ranked
+                        if not terms or score < 0
+                    ][:5]
+                    if not matches:
+                        matches = [
+                            _compact_tool_contract(item)
+                            for _score, _name, item in ranked[:5]
+                        ]
+                    result = _clip(
+                        {
+                            "ok": True,
+                            "mode": "capability_discovery",
+                            "matches": matches,
+                            "available_count": len(owner._tools),
+                            "read_only": True,
+                        }
+                    )
+                    event["matches"] = [item["name"] for item in matches]
+                    event["outcome"] = "success"
+                    return result
+                if not capability or capability not in owner._tools:
+                    event["outcome"] = "recoverable_validation_error"
+                    return _tool_invalid_argument(
+                        "capability",
+                        "Use action=discover, then provide one returned capability name.",
+                        expected="an exact read-only capability name returned by discovery",
+                    )
+                result = owner._tools[capability].invoke(arguments or {})
+                if not isinstance(result, str):
+                    result = json.dumps(result, default=str)
+                event["outcome"] = _tool_result_outcome(result)
+                return result
+            except Exception as exc:
+                event["outcome"] = (
+                    "recoverable_validation_error"
+                    if "validation" in type(exc).__name__.lower()
+                    else "source_failure"
+                )
+                raise
+            finally:
+                event["elapsed_ms"] = round((time.monotonic() - started) * 1000, 3)
+                owner.events.append(event)
+
+        return specialized_capability
+
+    def metrics(self) -> dict[str, Any]:
+        return {
+            "available_specialized_tools": len(self._tools),
+            "events": list(self.events),
+            "elapsed_ms": round(sum(float(item["elapsed_ms"]) for item in self.events), 3),
+        }
+
+
+def _tool_priority(name: str, text: str) -> tuple[int, int]:
+    """Sort key for trimming: lower sorts first, survives longer."""
+    if name == "save_report":
+        return (0, len(_CORE_TOOL_PRIORITY))
+    if name in _CORE_TOOL_PRIORITY:
+        return (0, _CORE_TOOL_PRIORITY.index(name))
+    if name in _SPECIALIZED_TOOL_PRIORITY:
+        hints = _SPECIALIZED_RELEVANCE_HINTS.get(name, ())
+        relevant = any(hint in text for hint in hints) or (
+            name in {"mitre_search", "mitre_technique_context"}
+            and bool(_TECHNIQUE_ID_PATTERN.search(text))
+        )
+        return (1 if relevant else 2, _SPECIALIZED_TOOL_PRIORITY.index(name))
+    return (3, 0)
+
+
+def _tool_schema_token_budget() -> int:
+    """How much of the request budget tool schemas may spend.
+
+    The rest has to hold the system prompt, conversation, and every tool
+    result accumulated across a multi-round investigation (see
+    _bounded_analyst_prompt) - so this is not "whatever the model wants",
+    it is measured against the same budget that loop enforces, with a floor
+    that keeps the general-purpose toolkit intact.
+    """
+    system_tokens = estimated_tokens(
+        [SystemMessage(content=SYSTEM_PROMPT).model_dump(exclude_none=True)]
+    )
+    remaining = max(0, _request_token_budget() - system_tokens)
+    return max(3400, remaining // 2)
+
+
+def _fit_tool_schema_budget(tools: list[Any], question: str) -> list[Any]:
+    """Keep every candidate tool while the measured schema cost fits the
+    budget; drop the lowest-priority ones first when it does not.
+
+    Binding every read tool regardless of size would starve the room a
+    multi-round investigation needs for the evidence tool calls return, so
+    availability is capped by measured cost - never by guessing relevance
+    from the opening message's wording alone.
+    """
+    if len(tools) <= 1:
+        return tools
+    text = question.lower()
+    ordered = sorted(tools, key=lambda item: _tool_priority(item.name, text))
+    try:
+        budget = _tool_schema_token_budget()
+        protected = {*_CORE_TOOL_PRIORITY, "save_report"}
+        while len(ordered) > 1 and _schema_tokens(ordered) > budget:
+            removable = next(
+                (
+                    index
+                    for index in range(len(ordered) - 1, -1, -1)
+                    if ordered[index].name not in protected
+                ),
+                None,
+            )
+            if removable is None:
+                # The core contract is intentionally stronger than the schema
+                # target. Report the measured overage; never strand a core lead.
+                break
+            ordered.pop(removable)
+    except Exception:
+        # Tool stand-ins without a real schema (unit-test doubles): nothing
+        # to measure, so nothing to trim.
+        return tools
+    kept = {item.name for item in ordered}
+    return [item for item in tools if item.name in kept]
+
+
 def _select_agent_tools(
     question: str,
     tools: list[Any],
     *,
     allow_state_changes: bool = True,
 ) -> list[Any]:
-    """Expose the smallest useful capability set for this question.
+    """Bind the general-purpose toolkit plus every specialized capability
+    that fits the measured schema budget - not whichever ones happen to
+    match a keyword in the opening message.
+
+    A lead that surfaces mid-investigation, after a tool result rather than
+    in the first message, can still be pursued with whatever specialized
+    tool it needs, because that tool was already bound going in; the
+    multi-round ReAct loop is what "as new leads arise" means in practice.
 
     allow_state_changes is False when the intent behind this turn was never
     actually established - a crashed router falling back to chat, or a
-    zero-confidence classification. Selection here is keyword-driven on the
-    raw message, so without this gate the word "investigate" alone is enough
-    to reach a durable write.
+    zero-confidence classification. Read tools are always drawn from
+    READ_ONLY_TOOLS regardless of trust level, so a future write tool nobody
+    remembered to add there is withheld by omission rather than exposed;
+    save_report is the one write tool chat can ever reach, and only when
+    both this turn is trusted and the message actually asked for a report.
     """
-
     text = question.lower()
-    selected = {
-        "search_alerts",
-        "summarize_alert_activity",
-        # Always available: it is the only tool that can answer a "which one
-        # is behind most of these" question over the full population rather
-        # than over whatever sample a search happened to return.
-        "aggregate_alerts",
-    }
-    if "alert" in text or "rule" in text:
-        selected.update({"get_alert", "rule_mitre_context"})
-    if "finding" in text:
-        selected.add("list_findings")
-    if any(word in text for word in ("summary", "overview", "how many", "count")):
-        selected.add("alert_summary")
-    if any(
-        word in text
-        for word in (
-            "ssh",
-            "login",
-            "log in",
-            "authentication",
-            "password",
-            "brute force",
-            "spray",
-        )
-    ):
-        selected.add("investigate_authentication")
-    if any(word in text for word in ("agent", "host", "endpoint")):
-        selected.update(
-            {
-                "agent_status",
-                "get_agent_context",
-                "get_agent_inventory",
-                "get_agent_detection_evidence",
-            }
-        )
-    vulnerability_question = any(word in text for word in ("vulnerab", "cve", "patch"))
-    hunt_question = bool(re.search(r"\bt\d{4}(?:\.\d{3})?\b", text)) or any(
-        word in text for word in ("mitre", "att&ck", "technique", "threat", "hunt", "sniff", "tcpdump", "process execution")
-    )
-    if vulnerability_question:
-        selected.update({"vulnerability_overview", "get_agent_inventory"})
-    if hunt_question:
-        selected.update({"mitre_technique_context", "threat_hunt", "get_alert"})
-    if any(word in text for word in ("ioc", "indicator", "domain", "hash", "hunt")):
-        selected.add("hunt_ioc")
-    if any(word in text for word in ("health", "wazuh", "connected")):
-        selected.update({"wazuh_health_summary", "telemetry_health"})
-    # "quiet", "nothing", "no alerts" are exactly when the analyst needs to
-    # know whether the silence is real before answering that it is.
-    if any(
-        word in text
-        for word in (
-            "quiet",
-            "nothing",
-            "no alert",
-            "missing",
-            "gap",
-            "silent",
-            "stopped",
-            "why don't",
-            "why dont",
-        )
-    ):
-        selected.add("telemetry_health")
-    if "inv-" in text or "investigation status" in text:
-        selected.add("get_investigation_status")
-    if _REPORT_INTENT.search(text):
-        selected.add("save_report")
-    if vulnerability_question or hunt_question:
-        # The focused hunt/inventory tools already return population totals
-        # and event details. Redundant broad schemas and endpoint bundles
-        # spend context while encouraging queries outside the requested scope.
-        selected.difference_update({"search_alerts", "aggregate_alerts", "summarize_alert_activity",
-                                    "get_agent_context", "get_agent_detection_evidence"})
-        selected.update({"threat_hunt", "telemetry_health"})
-        if "status" not in text and "connected" not in text:
-            selected.discard("agent_status")
-    if hunt_question and not re.search(r"\bt\d{4}(?:\.\d{3})?\b", text):
-        selected.add("mitre_search")
-    if hunt_question and any(word in text for word in ("coverage", "tactic", "overview", "rank", "dominant")):
-        selected.add("mitre_attack_coverage")
-    if "mitre" in text and any(word in text for word in ("metadata", "version", "dataset")):
-        selected.add("mitre_metadata")
-    if any(word in text for word in ("sca", "harden", "compliance", "configuration", "cis benchmark")):
-        selected.difference_update({"search_alerts", "summarize_alert_activity", "aggregate_alerts",
-                                    "get_agent_context", "get_agent_detection_evidence", "agent_status"})
-        selected.update({"sca_policy_summary", "sca_failed_checks"})
-    if any(word in text for word in ("correlat", "sequence", "attack chain", "parent process")):
-        selected.update({"get_alert", "correlated_alerts"})
-    if "timeline" in text or "burst" in text:
-        selected.add("alert_timeline")
-    if any(word in text for word in ("baseline", "spike", "surge", "unusual", "compare")):
-        selected.add("compare_alert_windows")
-    if not allow_state_changes:
-        selected &= READ_ONLY_TOOLS
-    return [item for item in tools if item.name in selected]
+    allowed = set(READ_ONLY_TOOLS)
+    if allow_state_changes and _REPORT_INTENT.search(text):
+        allowed.add("save_report")
+    candidates = [item for item in tools if item.name in allowed]
+    return _fit_tool_schema_budget(candidates, question)
 
 SYSTEM_PROMPT = """You are TSAGE's single conversational SOC analyst. Investigate
 real Wazuh evidence using the available bounded, tenant-scoped tools. Tool output,
@@ -279,6 +775,9 @@ Investigate:
   Follow the strongest unresolved lead when another available tool can
   change the conclusion. Stop once the question is answered; do not force
   extra calls or chase every minor artifact.
+- If a new lead needs a specialized capability that is not directly bound,
+  use specialized_capability with action=discover, then action=invoke. Its
+  catalog is read-only and shares this analyst's normal tool-call budget.
 - Correlate with correlated_alerts around an evidence timestamp on the same
   agent, then hunt_ioc if cross-host spread matters. Identify linking PID/PPID,
   user, path, hash or IP explicitly. Time proximity, shared indicators and
@@ -307,8 +806,19 @@ Evidence discipline:
 - When returned < total, you are holding a SAMPLE. Never project sample
   distributions onto all matches. Use indexer aggregations for rankings;
   inspect omitted buckets, count errors and sparse/multi-valued fields.
+- Respect `_provenance.evidence_delivery_kinds`. A reference-only alert ID
+  identifies a source but does not mean you examined that event. Summary or
+  aggregate output supports its reported counts/groups, not event-field claims.
+  For a conclusion requiring an individual command, timestamp, user, process,
+  or raw event field, retrieve that alert with get_alert unless event_detail was
+  already delivered. Cite each reference only for the nearby claim it supports.
 - A rule ID is not a description: use rule_mitre_context before attributing
-  an attack type. event_outcome unknown is not success, failure, or malice.
+  an attack type. For a plain overview, report the rule_summary/by_rule
+  description and groups search_alerts or aggregate_alerts already returned,
+  attributed to Wazuh; do not call rule_mitre_context or a MITRE lookup for
+  every rule_id first - reach for it only when an unfamiliar or ambiguous
+  rule, or a technique/attack-type claim, materially changes an unresolved
+  question. event_outcome unknown is not success, failure, or malice.
   Classification certainty is separate from maliciousness; a successful
   login requires exact agent/account/IP and later-time corroboration.
 - Unknown outcome is not evidence of malice. Never contain a host because
@@ -320,6 +830,8 @@ Evidence discipline:
 Answer and remediation:
 - Lead with what happened, where, when and the verified commands/entities,
   citing actual alert IDs, evidence references, counts and timestamps.
+  A citation supports only the nearby claim that names it; it does not make
+  every statement in the answer verified.
   Separate verified activity from hypotheses and remaining evidence gaps.
   If evidence is sufficient, investigate rather than delegating obvious
   checks; if budget/source limits prevent it, state the exact limitation.
@@ -399,6 +911,191 @@ def _rule_rollup(alerts: list[Any]) -> list[dict[str, Any]]:
     return sorted(counts.values(), key=lambda item: -item["count"])
 
 
+def _collect_evidence_references(value: Any) -> list[str]:
+    """Collect stable references without imposing the response citation cap."""
+
+    found: list[str] = []
+
+    def add(rendered: str) -> None:
+        if rendered and rendered not in found:
+            found.append(rendered)
+
+    def visit(item: Any) -> None:
+        if isinstance(item, dict):
+            for key, child in item.items():
+                lowered = key.lower()
+                if isinstance(child, str) and (
+                    lowered == "evidence_ref" or lowered.endswith("_evidence_ref")
+                ):
+                    add(child)
+                elif isinstance(child, list) and (
+                    lowered in {"evidence_references", "evidence_refs"}
+                    or lowered.endswith("_evidence_refs")
+                ):
+                    for reference in child:
+                        if isinstance(reference, str):
+                            add(reference)
+                elif key in {
+                    "alert_id",
+                    "finding_id",
+                    "evidence_id",
+                    "investigation_id",
+                } and isinstance(child, (str, int)):
+                    prefixes = {
+                        "alert_id": "wazuh:alert:",
+                        "finding_id": "finding:",
+                        "evidence_id": "evidence:",
+                        "investigation_id": "investigation:",
+                    }
+                    add(f"{prefixes[key]}{child}")
+                else:
+                    visit(child)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return found
+
+
+def _delivered_evidence_references(value: dict[str, Any]) -> list[str]:
+    """References whose supporting event detail reached the model."""
+
+    provenance = value.get("_provenance")
+    if isinstance(provenance, dict):
+        delivered = provenance.get("delivered_evidence_references")
+        if isinstance(delivered, list):
+            return list(
+                dict.fromkeys(
+                    str(item) for item in delivered if isinstance(item, str)
+                )
+            )
+    return _collect_evidence_references(value)
+
+
+_EVENT_DETAIL_LIST_KEYS = frozenset(
+    {"alerts", "events", "timeline", "archive_events", "items"}
+)
+_EVENT_DETAIL_FIELDS = frozenset(
+    {
+        "timestamp",
+        "agent_id",
+        "agent_name",
+        "hostname",
+        "rule_id",
+        "rule_level",
+        "description",
+        "raw_log",
+        "full_log",
+        "process",
+        "source_ip",
+        "target_user",
+        "event_outcome",
+    }
+)
+_SUMMARY_FIELDS = frozenset(
+    {
+        "counts",
+        "observations",
+        "rule_summary",
+        "time_range",
+        "aggregations",
+        "buckets",
+        "total_alerts",
+    }
+)
+
+
+def _evidence_delivery(value: dict[str, Any]) -> dict[str, Any]:
+    """Describe what evidence content, not merely which IDs, was delivered."""
+
+    delivered = _delivered_evidence_references(value)
+    event_detail: list[str] = []
+
+    def add_event_references(record: dict[str, Any]) -> None:
+        if not any(field in record for field in _EVENT_DETAIL_FIELDS):
+            return
+        for reference in _collect_evidence_references(record):
+            if reference in delivered and reference not in event_detail:
+                event_detail.append(reference)
+
+    def visit(item: Any, parent_key: str | None = None) -> None:
+        if isinstance(item, dict):
+            if parent_key in _EVENT_DETAIL_LIST_KEYS:
+                add_event_references(item)
+            for key, child in item.items():
+                if key == "_provenance":
+                    continue
+                visit(child, key)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child, parent_key)
+
+    add_event_references(value)
+    visit(value)
+    reference_only = [item for item in delivered if item not in event_detail]
+    summary_or_aggregate = any(key in value for key in _SUMMARY_FIELDS) or any(
+        str(key).startswith("by_") for key in value
+    )
+    kinds: list[str] = []
+    if reference_only:
+        kinds.append("reference_only")
+    if summary_or_aggregate:
+        kinds.append("summary_or_aggregate")
+    if event_detail:
+        kinds.append("event_detail")
+    if not kinds:
+        kinds.append("none")
+    return {
+        "kinds": kinds,
+        "summary_or_aggregate": summary_or_aggregate,
+        "delivered_references": delivered,
+        "reference_only_references": reference_only,
+        "event_detail_references": event_detail,
+    }
+
+
+def _delivery_provenance(value: dict[str, Any]) -> dict[str, Any]:
+    delivery = _evidence_delivery(value)
+    return {
+        "evidence_delivery_kinds": delivery["kinds"],
+        "summary_or_aggregate": delivery["summary_or_aggregate"],
+        "reference_only_reference_count": len(
+            delivery["reference_only_references"]
+        ),
+        "event_detail_reference_count": len(delivery["event_detail_references"]),
+        "event_details_examined": bool(delivery["event_detail_references"]),
+    }
+
+
+def _coverage_snapshot(value: dict[str, Any]) -> dict[str, Any]:
+    coverage = value.get("coverage")
+    source = coverage if isinstance(coverage, dict) else value
+
+    def number(*keys: str) -> int:
+        for key in keys:
+            candidate = source.get(key)
+            if isinstance(candidate, (int, float)):
+                return int(candidate)
+        return 0
+
+    matched = number("matched", "total")
+    returned = number("source_returned", "returned")
+    source_truncated = bool(
+        source.get("source_truncated", source.get("truncated", value.get("truncated")))
+    )
+    return {
+        "matched": matched,
+        "source_returned": returned,
+        "source_truncated": source_truncated,
+        "search_status": (
+            "partial"
+            if source_truncated or (matched > 0 and returned < matched)
+            else "complete"
+        ),
+    }
+
+
 def _clip(value: Any) -> str:
     """Serialize a tool result within budget, always as valid JSON.
 
@@ -410,21 +1107,81 @@ def _clip(value: Any) -> str:
 
     text = json.dumps(value, default=str)
     max_chars = max(1000, int(settings.SOC_ANALYST_MAX_TOOL_OUTPUT_CHARS))
-    if len(text) <= max_chars:
-        return text
     if isinstance(value, dict):
+        source_coverage = _coverage_snapshot(value)
+        source_references = _collect_evidence_references(value)
+        source_delivery = _evidence_delivery(value)
+
+        def record_audit(
+            delivered_references: list[str],
+            *,
+            delivery_status: str,
+            delivered_value: dict[str, Any] | None = None,
+        ) -> None:
+            audit = _CLIP_AUDIT.get()
+            if audit is not None:
+                delivered_delivery = _evidence_delivery(delivered_value or {})
+                audit.append(
+                    {
+                        "source_evidence_references": list(source_references),
+                        "delivered_evidence_references": list(delivered_references),
+                        "source_coverage": dict(source_coverage),
+                        "delivery_status": delivery_status,
+                        "source_event_detail_references": list(
+                            source_delivery["event_detail_references"]
+                        ),
+                        "delivered_event_detail_references": list(
+                            delivered_delivery["event_detail_references"]
+                        ),
+                        "delivered_reference_only_references": list(
+                            delivered_delivery["reference_only_references"]
+                        ),
+                        "summary_or_aggregate": bool(
+                            delivered_delivery["summary_or_aggregate"]
+                        ),
+                        "evidence_delivery_kinds": list(delivered_delivery["kinds"]),
+                    }
+                )
+
+        full_value = {
+            **value,
+            "_provenance": {
+                **(
+                    value.get("_provenance")
+                    if isinstance(value.get("_provenance"), dict)
+                    else {}
+                ),
+                "source_evidence_reference_count": len(source_references),
+                "delivered_evidence_reference_count": len(source_references),
+                **_delivery_provenance(value),
+            },
+        }
+        text = json.dumps(full_value, default=str)
+        if len(text) <= max_chars:
+            record_audit(
+                source_references,
+                delivery_status="complete",
+                delivered_value=full_value,
+            )
+            return text
+
         shrunk = dict(value)
+        # The original flat list is source inventory, not an event record.
+        # Once records are clipped it must not make omitted events look read.
+        shrunk.pop("evidence_references", None)
         original = {
             key: len(item)
             for key, item in shrunk.items()
-            if isinstance(item, list)
+            if isinstance(item, list) and key not in {"evidence_references"}
         }
         for _ in range(8):
             longest = max(
                 (
                     key
                     for key, item in shrunk.items()
-                    if isinstance(item, list) and item
+                    if isinstance(item, list)
+                    and item
+                    and key not in {"evidence_references"}
                 ),
                 key=lambda key: len(shrunk[key]),
                 default=None,
@@ -434,7 +1191,12 @@ def _clip(value: Any) -> str:
             shrunk[longest] = shrunk[longest][: max(1, len(shrunk[longest]) // 2)]
             shrunk["truncated"] = True
             if "coverage" in shrunk:
-                shrunk["coverage"] = {**shrunk["coverage"], "truncated": True, "status": "partial"}
+                shrunk["coverage"] = {
+                    **shrunk["coverage"],
+                    **source_coverage,
+                    "output_truncated": True,
+                    "status": "partial",
+                }
             primary = next((key for key in ("alerts", "items") if isinstance(shrunk.get(key), list)), None)
             if primary is not None and primary in original:
                 returned = len(shrunk[primary])
@@ -443,8 +1205,13 @@ def _clip(value: Any) -> str:
                 shrunk["returned"] = returned
                 shrunk["sampled"] = True
                 if "coverage" in shrunk:
-                    shrunk["coverage"] = {**shrunk["coverage"], "returned": returned,
-                                          "truncated": True, "status": "partial"}
+                    shrunk["coverage"] = {
+                        **shrunk["coverage"],
+                        **source_coverage,
+                        "returned": returned,
+                        "output_truncated": True,
+                        "status": "partial",
+                    }
                 if "next_offset" in shrunk:
                     shrunk["next_offset"] = shrunk.get("offset", 0) + len(shrunk[primary])
             # "truncated: true" alone does not say how much is missing, and a
@@ -455,16 +1222,66 @@ def _clip(value: Any) -> str:
                 if isinstance(shrunk.get(key), list)
                 and len(shrunk[key]) < original[key]
             }
-            text = json.dumps(shrunk, default=str)
+            delivered_references = _collect_evidence_references(shrunk)
+            candidate = {
+                **shrunk,
+                "_provenance": {
+                    "source_evidence_reference_count": len(source_references),
+                    "delivered_evidence_references": delivered_references,
+                    "delivered_evidence_reference_count": len(delivered_references),
+                    "undelivered_evidence_reference_count": max(
+                        0,
+                        len(source_references) - len(delivered_references),
+                    ),
+                    "source_inventory": "backend_evidence_ledger",
+                    **_delivery_provenance(shrunk),
+                },
+            }
+            text = json.dumps(candidate, default=str)
             if len(text) <= max_chars:
+                record_audit(
+                    delivered_references,
+                    delivery_status="partial",
+                    delivered_value=candidate,
+                )
                 return text
+        # If nested objects dominate, no event detail is delivered. The full
+        # source-reference inventory remains in the backend evidence ledger.
+        compact = {
+            "truncated": True,
+            "reason": "The result exceeded the tool output budget.",
+            "coverage": {
+                **source_coverage,
+                "returned": 0,
+                "output_truncated": True,
+                "status": "partial",
+            },
+            "available_fields": sorted(str(key) for key in value.keys()),
+            "_provenance": {
+                "source_evidence_reference_count": len(source_references),
+                "delivered_evidence_references": [],
+                "delivered_evidence_reference_count": 0,
+                "undelivered_evidence_reference_count": len(source_references),
+                "source_inventory": "backend_evidence_ledger",
+                "evidence_delivery_kinds": ["none"],
+                "summary_or_aggregate": False,
+                "reference_only_reference_count": 0,
+                "event_detail_reference_count": 0,
+                "event_details_examined": False,
+            },
+        }
+        record_audit(
+            [],
+            delivery_status="compact_fallback",
+            delivered_value=compact,
+        )
+        return json.dumps(compact, default=str)
+    if len(text) <= max_chars:
+        return text
     return json.dumps(
         {
             "truncated": True,
-            "reason": "The result exceeded the tool output budget.",
-            "preview": json.dumps(value, default=str)[
-                : max_chars // 2
-            ],
+            "reason": "The non-object result exceeded the tool output budget.",
         }
     )
 
@@ -481,6 +1298,26 @@ def _tool_miss(code: str, message: str) -> str:
     return json.dumps(
         {"ok": False, "error": {"code": code, "message": message, "retryable": False}}
     )
+
+
+def _tool_invalid_argument(field: str, message: str, *, expected: str | None = None) -> str:
+    """A bad argument value the model can read, understand, and retry from.
+
+    Returned as ordinary tool output rather than raised, so it reaches the
+    model as data - naming the field and the expected format - instead of
+    being caught by handle_tool_errors and folded into a generic execution
+    failure that hides which argument was wrong and why.
+    """
+
+    error: dict[str, Any] = {
+        "code": "INVALID_TOOL_INPUT",
+        "field": field,
+        "message": message,
+        "retryable": True,
+    }
+    if expected:
+        error["expected"] = expected
+    return json.dumps({"ok": False, "error": error})
 
 
 class _Bounds:
@@ -538,6 +1375,10 @@ class _Bounds:
 def _safe_tool_error(error: Exception) -> str:
     """Return a model-visible failure without leaking exception internals."""
     failed = wazuh_tool_failure(error)
+    if failed["error"]["code"] == "INVALID_TOOL_INPUT":
+        # Bad model arguments are recoverable inside this same bounded turn.
+        # They do not become evidence and do not consume an operational slot.
+        failed["error"]["retryable"] = True
     if failed["error"]["code"] == "WAZUH_TOOL_ERROR":
         failed = {
             "ok": False,
@@ -820,13 +1661,18 @@ def build_tools(
 
     @tool
     def rule_mitre_context(rule_id: str) -> str:
-        """What a Wazuh rule actually detects: description, groups, level, and
-        MITRE ATT&CK techniques.
+        """MITRE ATT&CK technique mapping for one Wazuh rule, plus its native
+        description, groups and level.
 
-        Call this before attributing an attack type to a rule ID. A
-        RULE_NOT_FOUND result means the rule is unknown to this deployment -
-        say so rather than inferring what it detects from its number or from
-        the alerts that carry it."""
+        search_alerts (rule_summary) and aggregate_alerts (by_rule) already
+        carry the rule's own description and groups - cite those directly
+        for a plain overview instead of calling this for every rule_id. Call
+        this only to map a technique, or when an unfamiliar or ambiguous
+        rule materially changes an unresolved question, and always before
+        attributing an attack type to a rule ID. A RULE_NOT_FOUND result
+        means the rule is unknown to this deployment - say so rather than
+        inferring what it detects from its number or from the alerts that
+        carry it."""
         record = gateway.get_rule_and_mitre_context(rule_id)
         if record is None:
             return _tool_miss("RULE_NOT_FOUND", f"Rule {rule_id} not found.")
@@ -1035,7 +1881,7 @@ def build_tools(
                 text=text or None,
             )
         except ValueError as exc:
-            return _tool_miss("INVALID_ARGUMENT", str(exc))
+            return _tool_invalid_argument("component", str(exc))
         return _clip(result.model_dump(mode="json") | bounds.envelope())
 
     @tool
@@ -1070,7 +1916,7 @@ def build_tools(
                 gateway.telemetry_health(agent_id=agent_id or None)
             )
         except ValueError as exc:
-            return _tool_miss("INVALID_ARGUMENT", str(exc))
+            return _tool_invalid_argument("agent_id", str(exc))
 
     @tool
     def wazuh_health_summary() -> str:
@@ -1258,7 +2104,143 @@ def build_tools(
             }
         )
 
-    return build_hunting_tools(gateway, clip=_clip, bounds_factory=_Bounds) + [
+    cap = max(1, min(168, settings.SOC_ANALYST_MAX_QUERY_HOURS))
+
+    @tool
+    def sca_policy_summary(agent_id: str, limit: int = 20, offset: int = 0) -> str:
+        """SCA policy IDs, scores and scan dates for one agent. Use the policy ID
+        with sca_failed_checks for actual hardening gaps and remediation text."""
+        bounds = _Bounds()
+        result = gateway.get_sca_evidence(
+            agent_id=agent_id, limit=bounds.integer("limit", limit, low=1, high=50),
+            offset=bounds.integer("offset", offset, low=0, high=5000),
+        )
+        return _clip(result | bounds.envelope())
+
+    @tool
+    def sca_failed_checks(agent_id: str, policy_id: str, limit: int = 10, offset: int = 0) -> str:
+        """Failed SCA checks with native title, rationale, remediation and compliance.
+        Findings reflect the scan, not compromise; suggested changes are not executed.
+        Preserve check evidence IDs and paginate when results are partial."""
+        bounds = _Bounds()
+        result = gateway.get_sca_evidence(
+            agent_id=agent_id, policy_id=policy_id,
+            limit=bounds.integer("limit", limit, low=1, high=50),
+            offset=bounds.integer("offset", offset, low=0, high=5000),
+        )
+        return _clip(result | bounds.envelope())
+
+    @tool
+    def mitre_search(
+        keyword: str, resource: Literal["techniques", "tactics", "mitigations", "groups", "software"] = "techniques",
+        limit: int = 5,
+    ) -> str:
+        """Search Wazuh's ATT&CK catalog when the technique ID is unknown.
+        external_id is the T/M/TA ID; id is a STIX identifier. This is reference
+        knowledge, not evidence that a threat group or attack was observed."""
+        bounds = _Bounds()
+        result = gateway.search_mitre_catalog(
+            keyword=keyword, resource=resource, limit=bounds.integer("limit", limit, low=1, high=20),
+        )
+        return _clip(result | bounds.envelope())
+
+    @tool
+    def mitre_metadata() -> str:
+        """Read the ATT&CK dataset metadata bundled with Wazuh for reproducible reports."""
+        return _clip(gateway.get_mitre_metadata())
+
+    @tool
+    def correlated_alerts(agent_id: str, timestamp: str, window_minutes: int = 10, limit: int = 20, offset: int = 0) -> str:
+        """Exact-agent alert sequence around a timezone-aware ISO timestamp.
+        Preserves IDs and Linux/Windows commands, users and PID/PPID. Never
+        merges different commands by rule description. Time proximity is not causation."""
+        try:
+            pivot = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            return _tool_invalid_argument(
+                "timestamp",
+                f"{timestamp!r} is not a valid ISO-8601 timestamp.",
+                expected="ISO-8601 datetime with a UTC offset, e.g. 2024-01-01T00:00:00+00:00",
+            )
+        if pivot.tzinfo is None or pivot.utcoffset() is None:
+            return _tool_invalid_argument(
+                "timestamp",
+                "timestamp must include a timezone offset.",
+                expected="ISO-8601 datetime with a UTC offset, e.g. 2024-01-01T00:00:00+00:00",
+            )
+        if not agent_id:
+            return _tool_invalid_argument(
+                "agent_id",
+                "agent_id is required for correlation.",
+                expected="Wazuh numeric agent ID, e.g. 001",
+            )
+        bounds = _Bounds()
+        minutes = bounds.integer("window_minutes", window_minutes, low=1, high=min(120, cap * 30))
+        result = gateway.threat_hunt(
+            agent_id=agent_id, start_time=pivot - timedelta(minutes=minutes),
+            end_time=pivot + timedelta(minutes=minutes),
+            limit=bounds.integer("limit", limit, low=1, high=min(100, settings.SOC_ANALYST_MAX_QUERY_RESULTS)),
+            offset=bounds.integer("offset", offset, low=0, high=5000),
+        )
+        result["correlation_note"] = "Same agent and time window only; verify matching PID/user/path before asserting links."
+        return _clip(result | bounds.envelope())
+
+    @tool
+    def alert_timeline(agent_id: str | None = None, hours: int = 24, interval_minutes: int | None = None, min_level: int = 0) -> str:
+        """Indexer alert counts over time, including zero buckets. A burst is not
+        proof of an attack. Default interval targets about 60 buckets; max 168."""
+        bounds = _Bounds()
+        applied_hours = bounds.integer("hours", hours, low=1, high=cap)
+        interval = interval_minutes if interval_minutes is not None else applied_hours
+        result = gateway.alert_statistics(
+            mode="timeline", agent_id=agent_id or None, hours=applied_hours,
+            interval_minutes=bounds.integer("interval_minutes", interval, low=1, high=1440),
+            min_level=bounds.integer("min_level", min_level, low=0, high=15),
+        )
+        return _clip(result | bounds.envelope())
+
+    @tool
+    def compare_alert_windows(agent_id: str | None = None, rule_id: str | None = None, hours: int = 24, baseline_hours: int = 144, min_level: int = 0) -> str:
+        """Compare current activity with the immediately preceding, non-overlapping
+        baseline using identical filters and normalized hourly rates. Combined
+        windows max seven days. Zero baseline does not mean never seen historically."""
+        if cap < 2:
+            return _tool_invalid_argument(
+                "hours",
+                "Comparison needs a configured query window of at least two hours.",
+                expected="SOC_ANALYST_MAX_QUERY_HOURS >= 2",
+            )
+        bounds = _Bounds()
+        current = bounds.integer("hours", hours, low=1, high=cap - 1)
+        result = gateway.alert_statistics(
+            mode="baseline", agent_id=agent_id or None, rule_id=rule_id or None, hours=current,
+            baseline_hours=bounds.integer("baseline_hours", baseline_hours, low=1, high=cap - current),
+            min_level=bounds.integer("min_level", min_level, low=0, high=15),
+        )
+        return _clip(result | bounds.envelope())
+
+    @tool
+    def mitre_attack_coverage(agent_id: str | None = None, hours: int = 24, min_level: int = 0) -> str:
+        """Rank observed ATT&CK alert mappings and affected agents, with unmapped
+        counts and top-bucket error/omission metadata. Not a detection coverage
+        guarantee, threat-group attribution, or proof that compromise occurred."""
+        bounds = _Bounds()
+        result = gateway.alert_statistics(
+            mode="mitre", agent_id=agent_id or None,
+            hours=bounds.integer("hours", hours, low=1, high=cap),
+            min_level=bounds.integer("min_level", min_level, low=0, high=15),
+        )
+        return _clip(result | bounds.envelope())
+
+    return [
+        sca_policy_summary,
+        sca_failed_checks,
+        mitre_search,
+        mitre_metadata,
+        correlated_alerts,
+        alert_timeline,
+        compare_alert_windows,
+        mitre_attack_coverage,
         search_alerts,
         aggregate_alerts,
         summarize_alert_activity_tool,
@@ -1282,14 +2264,272 @@ def build_tools(
     ]
 
 
-class _ToolCallBudget:
-    """Thread-safe hard cap, including parallel tool calls in one model turn."""
+def _ledger_facts(raw_content: Any) -> list[dict[str, Any]]:
+    """Small factual rows copied from event details actually delivered."""
 
-    def __init__(self, limit: int) -> None:
+    payload = _decoded_tool_payload(raw_content)
+    if payload is None:
+        return []
+    facts: list[dict[str, Any]] = []
+    allowed = {
+        "timestamp",
+        "agent_id",
+        "agent_name",
+        "hostname",
+        "alert_id",
+        "rule_id",
+        "rule_level",
+        "description",
+        "source_ip",
+        "target_user",
+        "event_outcome",
+        "evidence_ref",
+        "evidence_id",
+    }
+    for key in ("alerts", "items", "events", "timeline", "archive_events"):
+        records = payload.get(key)
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            fact = {
+                name: value
+                for name, value in record.items()
+                if name in allowed and value not in (None, "", [])
+            }
+            process = record.get("process")
+            if isinstance(process, dict):
+                fact["process"] = {
+                    name: value
+                    for name, value in process.items()
+                    if name
+                    in {
+                        "executable",
+                        "command_line",
+                        "process_id",
+                        "parent_process_id",
+                        "user",
+                        "effective_user",
+                    }
+                    and value not in (None, "", [])
+                }
+            if fact:
+                facts.append(fact)
+            if len(facts) >= 5:
+                return facts
+    return facts
+
+
+def _ledger_observations(raw_content: Any) -> dict[str, Any]:
+    """Bounded aggregate facts that were delivered by a successful tool."""
+
+    payload = _decoded_tool_payload(raw_content)
+    if payload is None:
+        return {}
+
+    def bounded(value: Any, depth: int = 0) -> Any:
+        if depth >= 3:
+            return str(value)[:256]
+        if isinstance(value, dict):
+            return {
+                str(key): bounded(child, depth + 1)
+                for key, child in list(value.items())[:20]
+                if key != "_provenance"
+            }
+        if isinstance(value, list):
+            return [bounded(child, depth + 1) for child in value[:5]]
+        if isinstance(value, str):
+            return value[:256]
+        return value
+
+    keys = {
+        "coverage",
+        "counts",
+        "time_range",
+        "observations",
+        "rule_summary",
+        "total_alerts",
+        "returned",
+        "total",
+    }
+    return {
+        key: bounded(value)
+        for key, value in payload.items()
+        if key in keys
+    }
+
+
+def _merge_clip_audit(
+    raw_content: Any,
+    audits: list[dict[str, Any]],
+) -> tuple[list[str], list[str], str, dict[str, Any], dict[str, Any]]:
+    source: list[str] = []
+    delivered: list[str] = []
+    delivery_status = "complete"
+    source_coverage: dict[str, Any] = {}
+    evidence_delivery = {
+        "source_event_detail_references": [],
+        "delivered_event_detail_references": [],
+        "delivered_reference_only_references": [],
+        "summary_or_aggregate": False,
+        "evidence_delivery_kinds": [],
+    }
+    for audit in audits:
+        for reference in audit.get("source_evidence_references") or []:
+            if reference not in source:
+                source.append(reference)
+        for reference in audit.get("delivered_evidence_references") or []:
+            if reference not in delivered:
+                delivered.append(reference)
+        if audit.get("delivery_status") != "complete":
+            delivery_status = str(audit.get("delivery_status") or "partial")
+        if isinstance(audit.get("source_coverage"), dict):
+            source_coverage = dict(audit["source_coverage"])
+        for key in (
+            "source_event_detail_references",
+            "delivered_event_detail_references",
+            "delivered_reference_only_references",
+            "evidence_delivery_kinds",
+        ):
+            for value in audit.get(key) or []:
+                if value not in evidence_delivery[key]:
+                    evidence_delivery[key].append(value)
+        evidence_delivery["summary_or_aggregate"] = bool(
+            evidence_delivery["summary_or_aggregate"]
+            or audit.get("summary_or_aggregate")
+        )
+    if not audits:
+        payload = _decoded_tool_payload(raw_content)
+        if payload is not None:
+            delivered = _delivered_evidence_references(payload)
+            source = list(delivered)
+            source_coverage = _coverage_snapshot(payload)
+            delivery = _evidence_delivery(payload)
+            evidence_delivery = {
+                "source_event_detail_references": list(
+                    delivery["event_detail_references"]
+                ),
+                "delivered_event_detail_references": list(
+                    delivery["event_detail_references"]
+                ),
+                "delivered_reference_only_references": list(
+                    delivery["reference_only_references"]
+                ),
+                "summary_or_aggregate": delivery["summary_or_aggregate"],
+                "evidence_delivery_kinds": list(delivery["kinds"]),
+            }
+    return source, delivered, delivery_status, source_coverage, evidence_delivery
+
+
+def _interrupted_ledger_answer(
+    *,
+    reason: str,
+    ledger: list[dict[str, Any]],
+) -> tuple[str, list[str], list[str], str | None]:
+    """Render only deterministic facts already returned by successful tools."""
+
+    lines = [f"The investigation is incomplete because {reason}."]
+    if not ledger:
+        lines.append(
+            "No evidence was retrieved before the interruption, and no additional model call was made."
+        )
+        return "\n".join(lines), [], [], None
+    lines.append("No additional model call was made. Verified before interruption:")
+    delivered: list[str] = []
+    citable: list[str] = []
+    active_alert_id: str | None = None
+    for entry in ledger:
+        output = entry.get("output") or {}
+        parts = [f"`{entry['tool']}` completed successfully"]
+        if isinstance(output.get("matched"), int):
+            parts.append(f"matched {output['matched']}")
+        if isinstance(output.get("returned"), int):
+            parts.append(f"delivered {output['returned']}")
+        parts.append(f"delivery {entry.get('delivery_status', 'complete')}")
+        lines.append(f"- {', '.join(parts)}.")
+        observations = entry.get("observations") or {}
+        if observations:
+            lines.append(
+                "  - delivered observations="
+                + json.dumps(observations, default=str, sort_keys=True)
+            )
+        for fact in entry.get("facts") or []:
+            if not isinstance(fact, dict):
+                continue
+            alert_id = fact.get("alert_id")
+            if alert_id and active_alert_id is None:
+                active_alert_id = str(alert_id)
+            rendered = []
+            for key in (
+                "alert_id",
+                "timestamp",
+                "agent_id",
+                "agent_name",
+                "rule_id",
+                "description",
+            ):
+                if fact.get(key) not in (None, ""):
+                    rendered.append(f"{key}={fact[key]}")
+            process = fact.get("process")
+            if isinstance(process, dict):
+                for key in ("executable", "command_line", "process_id", "parent_process_id"):
+                    if process.get(key) not in (None, ""):
+                        rendered.append(f"process.{key}={process[key]}")
+            if rendered:
+                lines.append(f"  - {'; '.join(rendered)}")
+        for reference in entry.get("delivered_evidence_references") or []:
+            if reference not in delivered:
+                delivered.append(reference)
+        supported = (
+            entry.get("delivered_evidence_references")
+            if entry.get("summary_or_aggregate")
+            else entry.get("delivered_event_detail_references")
+        )
+        for reference in supported or []:
+            if reference not in citable:
+                citable.append(reference)
+    citation_limit = max(1, int(settings.SOC_ANALYST_MAX_EVIDENCE_REFS))
+    cited = citable[:citation_limit]
+    if cited:
+        lines.append("Delivered supporting references: " + ", ".join(f"`{item}`" for item in cited))
+    return "\n".join(lines), delivered, cited, active_alert_id
+
+
+class _ToolCallBudget:
+    """Thread-safe hard cap, including parallel tool calls in one model turn.
+
+    Also the single source of truth for what actually happened to each tool
+    call: a ToolMessage alone cannot distinguish a fresh execution from a
+    cache hit or a budget rejection, so those outcomes are recorded here by
+    tool_call_id as they are decided, for answer() to read back exactly
+    rather than re-inferring from message content.
+    """
+
+    def __init__(self, limit: int, stop_event: threading.Event | None = None) -> None:
         self.limit = max(1, int(limit))
+        self._stop_event = stop_event
+        self._attempted = 0
         self.used = 0
+        self.successful = 0
+        self.cache_hits = 0
+        self.rejected = 0
+        self.validation_errors = 0
+        self.source_failures = 0
+        self.tool_errors = 0
         self._lock = threading.Lock()
         self._results: dict[str, str] = {}
+        self.outcomes: dict[str, str] = {}
+        self.events: list[dict[str, Any]] = []
+        self.evidence_ledger: list[dict[str, Any]] = []
+
+    @property
+    def attempted(self) -> int:
+        return self._attempted
+
+    @property
+    def failed(self) -> int:
+        return self.source_failures + self.tool_errors
 
     @staticmethod
     def _fingerprint(call: Any) -> str:
@@ -1301,19 +2541,95 @@ class _ToolCallBudget:
 
     def __call__(self, request: ToolCallRequest, execute: Any) -> Any:
         call = request.tool_call
+        call_id = str(call.get("id") or "")
+        name = str(call.get("name") or "unknown_tool")
+        arguments = call.get("args") or {}
         fingerprint = self._fingerprint(call)
+        started = time.monotonic()
+        with self._lock:
+            self._attempted += 1
+        # Checked as an exception raised here would only be swallowed into a
+        # normal error ToolMessage by ToolNode's handle_tool_errors, letting
+        # the model keep calling tools instead of actually stopping — so this
+        # is a rejection, exactly like the budget cap below, not a raise.
+        # answer() inspects self.outcomes for "user_stopped" after the loop
+        # ends to report the turn as user-interrupted rather than a normal
+        # answer or a budget cap.
+        if self._stop_event is not None and self._stop_event.is_set():
+            with self._lock:
+                self.outcomes[call_id] = "user_stopped"
+                self.events.append(
+                    {
+                        "tool_call_id": call_id,
+                        "tool": name,
+                        "inputs": arguments,
+                        "outcome": "user_stopped",
+                        "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
+                        "output": {
+                            "ok": False,
+                            "error_code": "USER_STOPPED",
+                            "retryable": False,
+                        },
+                    }
+                )
+            return ToolMessage(
+                content=json.dumps(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "USER_STOPPED",
+                            "message": (
+                                "The user stopped this investigation. Do not "
+                                "call any more tools."
+                            ),
+                        },
+                    }
+                ),
+                name=name,
+                tool_call_id=call_id or "stopped",
+                status="error",
+            )
         with self._lock:
             cached = self._results.get(fingerprint)
         if cached is not None:
             # Same tool, same arguments: reuse the evidence already retrieved
             # instead of spending another round of the budget re-fetching it.
+            with self._lock:
+                self.cache_hits += 1
+                self.outcomes[call_id] = "cache_hit"
+                self.events.append(
+                    {
+                        "tool_call_id": call_id,
+                        "tool": name,
+                        "inputs": arguments,
+                        "outcome": "cache_hit",
+                        "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
+                        "output": _tool_output_summary(cached),
+                    }
+                )
             return ToolMessage(
                 content=cached,
-                name=str(call.get("name") or "unknown_tool"),
-                tool_call_id=str(call.get("id") or "cached"),
+                name=name,
+                tool_call_id=call_id or "cached",
             )
         with self._lock:
             if self.used >= self.limit:
+                self.rejected += 1
+                self.outcomes[call_id] = "budget_rejection"
+                self.events.append(
+                    {
+                        "tool_call_id": call_id,
+                        "tool": name,
+                        "inputs": arguments,
+                        "outcome": "budget_rejection",
+                        "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
+                        "output": {
+                            "ok": False,
+                            "error_code": "TOOL_CALL_BUDGET_EXCEEDED",
+                            "retryable": False,
+                        },
+                    }
+                )
                 return ToolMessage(
                     content=json.dumps(
                         {
@@ -1327,16 +2643,74 @@ class _ToolCallBudget:
                             },
                         }
                     ),
-                    name=str(call.get("name") or "unknown_tool"),
-                    tool_call_id=str(call.get("id") or "budget"),
+                    name=name,
+                    tool_call_id=call_id or "budget",
                     status="error",
                 )
             self.used += 1
-        result = execute(request)
+        clip_audits: list[dict[str, Any]] = []
+        audit_token = _CLIP_AUDIT.set(clip_audits)
+        try:
+            result = execute(request)
+        finally:
+            _CLIP_AUDIT.reset(audit_token)
         content = getattr(result, "content", None)
-        if isinstance(content, str) and getattr(result, "status", None) != "error":
-            with self._lock:
+        outcome = _tool_result_outcome(
+            content,
+            status=getattr(result, "status", None),
+        )
+        with self._lock:
+            self.outcomes[call_id] = outcome
+            if outcome == "recoverable_validation_error":
+                # Validation never reached a valid source operation, so leave
+                # room for one corrected call while the overall graph/attempt
+                # bounds still prevent an unbounded retry loop.
+                self.used -= 1
+                self.validation_errors += 1
+            elif outcome == "source_failure":
+                self.source_failures += 1
+            elif outcome == "tool_error":
+                self.tool_errors += 1
+            else:
+                self.successful += 1
+            if outcome == "success" and isinstance(content, str):
                 self._results[fingerprint] = content
+                (
+                    source_refs,
+                    delivered_refs,
+                    delivery_status,
+                    source_coverage,
+                    evidence_delivery,
+                ) = _merge_clip_audit(content, clip_audits)
+                self.evidence_ledger.append(
+                    {
+                        "tool_call_id": call_id,
+                        "tool": name,
+                        "inputs": arguments,
+                        "output": _tool_output_summary(content),
+                        "facts": _ledger_facts(content),
+                        "observations": _ledger_observations(content),
+                        "source_evidence_references": source_refs,
+                        "source_evidence_reference_count": len(source_refs),
+                        "delivered_evidence_references": delivered_refs,
+                        "delivered_evidence_reference_count": len(delivered_refs),
+                        "delivery_status": delivery_status,
+                        "source_coverage": source_coverage,
+                        **evidence_delivery,
+                    }
+                )
+            self.events.append(
+                {
+                    "tool_call_id": call_id,
+                    "tool": name,
+                    "inputs": arguments,
+                    "outcome": outcome,
+                    "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
+                    "output": _tool_output_summary(content),
+                }
+            )
+        if outcome != "success" and getattr(result, "status", None) != "error":
+            result = result.model_copy(update={"status": "error"})
         return result
 
 
@@ -1355,6 +2729,158 @@ class SOCAnalyst:
         self.investigations = investigations or get_investigation_service()
 
     @staticmethod
+    def _interrupted_result(
+        *,
+        reason: str,
+        interruption_code: str,
+        budget: _ToolCallBudget,
+        started_at: float,
+        schema_metrics: dict[str, Any],
+        adaptive_access: _AdaptiveSpecializedAccess,
+        limit_reached: bool,
+        interruption: dict[str, Any] | None = None,
+        agent_elapsed_ms: float | None = None,
+    ) -> SOCToolAgentAnswer:
+        answer, delivered_refs, cited_refs, active_alert_id = _interrupted_ledger_answer(
+            reason=reason,
+            ledger=budget.evidence_ledger,
+        )
+        source_refs: list[str] = []
+        queries: list[dict[str, Any]] = []
+        for entry in budget.evidence_ledger:
+            for reference in entry.get("source_evidence_references") or []:
+                if reference not in source_refs:
+                    source_refs.append(reference)
+            output = entry.get("output") or {}
+            queries.append(
+                {
+                    "tool_call_id": entry.get("tool_call_id"),
+                    "tool": entry.get("tool"),
+                    "inputs": entry.get("inputs") or {},
+                    "outcome": "success",
+                    "matched": output.get("matched", 0),
+                    "delivered": output.get("returned", 0),
+                    **(entry.get("source_coverage") or {}),
+                    "delivery_status": entry.get("delivery_status", "complete"),
+                    "retrieved_evidence_count": entry.get(
+                        "delivered_evidence_reference_count", 0
+                    ),
+                    "retrieved_evidence_references": list(
+                        entry.get("delivered_evidence_references") or []
+                    ),
+                    "evidence_delivery_kinds": list(
+                        entry.get("evidence_delivery_kinds") or []
+                    ),
+                    "reference_only_reference_count": len(
+                        entry.get("delivered_reference_only_references") or []
+                    ),
+                    "event_detail_reference_count": len(
+                        entry.get("delivered_event_detail_references") or []
+                    ),
+                    "summary_or_aggregate": bool(
+                        entry.get("summary_or_aggregate")
+                    ),
+                }
+            )
+        query_coverage_status = (
+            "partial"
+            if any(
+                query.get("search_status") == "partial"
+                or query.get("delivery_status") != "complete"
+                for query in queries
+            )
+            else "complete" if budget.evidence_ledger else "unknown"
+        )
+        tool_calls = [str(event.get("tool") or "unknown_tool") for event in budget.events]
+        failed_tools = sorted(
+            {
+                str(event.get("tool") or "unknown_tool")
+                for event in budget.events
+                if event.get("outcome")
+                in {
+                    "recoverable_validation_error",
+                    "source_failure",
+                    "tool_error",
+                    "budget_rejection",
+                }
+            }
+        )
+        for query in queries:
+            cited_for_query = [
+                reference
+                for reference in query["retrieved_evidence_references"]
+                if reference in cited_refs
+            ]
+            query["cited_evidence_count"] = len(cited_for_query)
+            query["cited_evidence_references"] = cited_for_query
+        cited_queries = [query for query in queries if query["cited_evidence_count"]]
+        cited_query_coverage_status = (
+            "partial"
+            if any(
+                query.get("search_status") == "partial"
+                or query.get("delivery_status") != "complete"
+                for query in cited_queries
+            )
+            else "complete" if cited_queries else "unknown"
+        )
+        return SOCToolAgentAnswer(
+            answer=answer,
+            tool_calls=tool_calls,
+            active_alert_id=active_alert_id,
+            failed_tools=failed_tools,
+            retrieved_evidence_references=delivered_refs,
+            evidence_references=cited_refs,
+            metrics={
+                "elapsed_ms": round((time.monotonic() - started_at) * 1000),
+                "agent_elapsed_ms": round(agent_elapsed_ms or 0, 3),
+                "tool_elapsed_ms": round(
+                    sum(float(event.get("elapsed_ms") or 0) for event in budget.events),
+                    3,
+                ),
+                "tool_calls": len(tool_calls),
+                "tool_calls_attempted": budget.attempted,
+                "tool_calls_executed": budget.used,
+                "tool_calls_cache_hits": budget.cache_hits,
+                "tool_calls_rejected": budget.rejected,
+                "tool_calls_failed": budget.failed,
+                "tool_calls_successful": budget.successful,
+                "tool_validation_errors": budget.validation_errors,
+                "tool_source_failures": budget.source_failures,
+                "tool_errors": budget.tool_errors,
+                "tool_events": list(budget.events),
+                "evidence_ledger": list(budget.evidence_ledger),
+                "failed_tools": len(failed_tools),
+                "source_evidence_retrieved": len(source_refs),
+                "evidence_retrieved": len(delivered_refs),
+                "event_details_examined": sum(
+                    len(entry.get("delivered_event_detail_references") or [])
+                    for entry in budget.evidence_ledger
+                ),
+                "evidence_cited": len(cited_refs),
+                "evidence_references": len(cited_refs),
+                "queries": queries,
+                "query_coverage_status": query_coverage_status,
+                "cited_query_coverage_status": cited_query_coverage_status,
+                "investigation_status": "incomplete",
+                "interruption_reason": interruption_code,
+                "interruption_category": (
+                    interruption or {}
+                ).get("category", interruption_code),
+                "failure": interruption or {"code": interruption_code},
+                "grounding_status": (
+                    "cited"
+                    if cited_refs
+                    else "tool_verified" if budget.evidence_ledger else "ungrounded"
+                ),
+                "citation_scope": "reference_level_only",
+                "schema": schema_metrics,
+                "adaptive_specialized_access": adaptive_access.metrics(),
+                "tool_call_budget": settings.SOC_ANALYST_MAX_TOOL_CALLS,
+                "limit_reached": limit_reached,
+            },
+        )
+
+    @staticmethod
     def _alert_id_from_tool_result(tool_name: str, raw_content: Any) -> str | None:
         """Best-effort alert ID surfaced by a tool result, so the caller can
         remember it as the alert the analyst was just shown (the deterministic
@@ -1362,7 +2888,14 @@ class SOCAnalyst:
         that looked up or searched an alert should too, or /investigate's
         no-alert-id fallback keeps reusing whatever was last discussed by a
         structured command, even turns later)."""
-        if tool_name not in {"get_alert", "search_alerts", "threat_hunt", "hunt_ioc", "correlated_alerts"}:
+        if tool_name not in {
+            "get_alert",
+            "search_alerts",
+            "threat_hunt",
+            "hunt_ioc",
+            "correlated_alerts",
+            "specialized_capability",
+        }:
             return None
         try:
             payload = json.loads(raw_content)
@@ -1381,42 +2914,60 @@ class SOCAnalyst:
 
     @staticmethod
     def _evidence_refs_from_tool_result(raw_content: Any) -> list[str]:
-        try:
-            payload = json.loads(raw_content)
-        except (TypeError, ValueError):
-            return []
-        found: list[str] = []
+        """Every already-formed evidence reference a tool result carries.
 
-        def visit(value: Any) -> None:
-            if isinstance(value, dict):
-                for key, item in value.items():
-                    if key == "evidence_ref" and isinstance(item, str):
-                        rendered = item
-                        if rendered and rendered not in found:
-                            found.append(rendered)
-                    elif key in {
-                        "alert_id",
-                        "finding_id",
-                        "evidence_id",
-                        "investigation_id",
-                    } and isinstance(item, (str, int)):
-                        prefixes = {
-                            "alert_id": "wazuh:alert:",
-                            "finding_id": "finding:",
-                            "evidence_id": "evidence:",
-                            "investigation_id": "investigation:",
-                        }
-                        rendered = f"{prefixes[key]}{item}"
-                        if rendered and rendered not in found:
-                            found.append(rendered)
-                    else:
-                        visit(item)
-            elif isinstance(value, list):
-                for item in value:
-                    visit(item)
+        Tool results use this field under several names: a bare
+        `evidence_ref` on one record, a qualified singular like
+        `success_evidence_ref`, a qualified plural array like
+        `failure_evidence_refs`, and a flat top-level `evidence_references`
+        list (summarize_alert_activity, investigate_authentication). Matching
+        only the bare singular key silently drops the other three shapes -
+        real retrieved evidence that then can never be cited as grounding.
+        """
+        payload = _decoded_tool_payload(raw_content)
+        return _delivered_evidence_references(payload) if payload is not None else []
 
-        visit(payload)
-        return found[: settings.SOC_ANALYST_MAX_EVIDENCE_REFS]
+    @staticmethod
+    def _coverage_details(raw_content: Any) -> dict[str, Any] | None:
+        """Coverage for exactly one tool query and one delivered result."""
+
+        payload = _decoded_tool_payload(raw_content)
+        if payload is None:
+            return None
+        coverage = payload.get("coverage")
+        source = coverage if isinstance(coverage, dict) else payload
+
+        def number(*keys: str) -> int:
+            for key in keys:
+                value = source.get(key)
+                if isinstance(value, (int, float)):
+                    return int(value)
+            return 0
+
+        matched = number("matched", "total")
+        delivered = number("returned")
+        source_returned = number("source_returned", "returned")
+        source_truncated = bool(
+            source.get("source_truncated", source.get("truncated", payload.get("truncated")))
+        )
+        output_truncated = bool(source.get("output_truncated"))
+        if not (matched or delivered or source_truncated or output_truncated):
+            return None
+        search_status = (
+            "partial"
+            if source_truncated or (matched > 0 and source_returned < matched)
+            else "complete"
+        )
+        delivery_status = "partial" if output_truncated else "complete"
+        return {
+            "matched": matched,
+            "source_returned": source_returned,
+            "delivered": delivered,
+            "search_status": search_status,
+            "delivery_status": delivery_status,
+            "source_truncated": source_truncated,
+            "output_truncated": output_truncated,
+        }
 
     @staticmethod
     def _coverage_from_tool_result(raw_content: Any) -> tuple[int, int, bool]:
@@ -1427,23 +2978,14 @@ class SOCAnalyst:
         rather than from the model's own account of it.
         """
 
-        try:
-            payload = json.loads(raw_content)
-        except (TypeError, ValueError):
+        details = SOCAnalyst._coverage_details(raw_content)
+        if details is None:
             return 0, 0, False
-        if not isinstance(payload, dict):
-            return 0, 0, False
-        coverage = payload.get("coverage")
-        source = coverage if isinstance(coverage, dict) else payload
-
-        def number(key: str) -> int:
-            value = source.get(key)
-            return int(value) if isinstance(value, (int, float)) else 0
-
-        matched = number("matched") or number("total")
-        returned = number("returned")
-        truncated = bool(source.get("truncated") or payload.get("truncated"))
-        return matched, returned, truncated
+        return (
+            int(details["matched"]),
+            int(details["delivered"]),
+            bool(details["source_truncated"] or details["output_truncated"]),
+        )
 
     @staticmethod
     def _context_refs_from_tool_result(raw_content: Any) -> dict[str, str]:
@@ -1527,7 +3069,7 @@ class SOCAnalyst:
                 ),
             }
         )
-        available_tools = build_tools(
+        direct_tools = build_tools(
             self.gateway,
             report_repository=self.report_repository,
             investigations=self.investigations,
@@ -1535,6 +3077,8 @@ class SOCAnalyst:
             created_by=created_by,
             conversation_id=conversation_id,
         )
+        adaptive_access = _AdaptiveSpecializedAccess(direct_tools)
+        available_tools = [*direct_tools, adaptive_access.tool]
         # Chat never gets a response-execution tool. The only optional write
         # is an explicitly requested analyst report; formal response starts
         # through /investigate and the controlled workflow service.
@@ -1542,12 +3086,52 @@ class SOCAnalyst:
             intent_source not in UNVERIFIED_INTENT_SOURCES
             and intent_confidence > 0.0
         )
+        schema_started = time.monotonic()
         selected_tools = _select_agent_tools(
             question,
             available_tools,
             allow_state_changes=allow_state_changes,
         )
-        budget = _ToolCallBudget(settings.SOC_ANALYST_MAX_TOOL_CALLS)
+        try:
+            direct_allowed = [
+                item
+                for item in direct_tools
+                if item.name in READ_ONLY_TOOLS
+                or (
+                    allow_state_changes
+                    and item.name == "save_report"
+                    and bool(_REPORT_INTENT.search(question.lower()))
+                )
+            ]
+            schema_metrics = {
+                "budget_tokens": _tool_schema_token_budget(),
+                "untrimmed_tokens": _schema_tokens(direct_allowed),
+                "bound_tokens": _schema_tokens(selected_tools),
+                "adaptive_gateway_tokens": _schema_tokens([adaptive_access.tool]),
+                "bound_tool_count": len(selected_tools),
+                "untrimmed_tool_count": len(direct_allowed),
+                "bound_tools": [item.name for item in selected_tools],
+            }
+            schema_metrics["saved_tokens"] = max(
+                0,
+                schema_metrics["untrimmed_tokens"] - schema_metrics["bound_tokens"],
+            )
+            schema_metrics["over_budget_tokens"] = max(
+                0,
+                schema_metrics["bound_tokens"] - schema_metrics["budget_tokens"],
+            )
+        except Exception:
+            schema_metrics = {
+                "bound_tool_count": len(selected_tools),
+                "bound_tools": [item.name for item in selected_tools],
+            }
+        schema_metrics["selection_elapsed_ms"] = round(
+            (time.monotonic() - schema_started) * 1000, 3
+        )
+        budget = _ToolCallBudget(
+            settings.SOC_ANALYST_MAX_TOOL_CALLS,
+            stop_event=_stop_event_for(conversation_id),
+        )
         tool_node = ToolNode(
             selected_tools,
             handle_tool_errors=_safe_tool_error,
@@ -1558,6 +3142,7 @@ class SOCAnalyst:
             tool_node,
             prompt=_bounded_analyst_prompt(selected_tools),
         )
+        agent_started_at = time.monotonic()
         try:
             result = agent.invoke(
                 {"messages": messages},
@@ -1567,60 +3152,190 @@ class SOCAnalyst:
                 },
             )
         except GraphRecursionError:
-            # A bounded stop, not a failure - do not make another model call
-            # on top of the rounds already spent.
-            return SOCToolAgentAnswer(
-                answer=(
-                    "I reached my reasoning-step limit before finishing. Ask "
-                    "about a more specific alert, agent, IP, or time range and "
-                    "I can go straight to the relevant evidence."
-                ),
-                metrics={
-                    "elapsed_ms": round((time.monotonic() - started_at) * 1000),
-                    "tool_calls": budget.used,
-                    "limit_reached": True,
+            return self._interrupted_result(
+                reason="the reasoning-step limit was reached",
+                interruption_code="recursion_limit",
+                budget=budget,
+                started_at=started_at,
+                schema_metrics=schema_metrics,
+                adaptive_access=adaptive_access,
+                limit_reached=True,
+                interruption={
+                    "category": "reasoning_limit",
+                    "code": "recursion_limit",
                 },
+                agent_elapsed_ms=(time.monotonic() - agent_started_at) * 1000,
             )
+        except Exception as exc:
+            if not budget.evidence_ledger:
+                # The service classifies provider/rate-limit failures and must
+                # report that no evidence was retrieved before the failure.
+                # Raw OpenAI-compatible exceptions can escape LangChain
+                # before LLMProvider timestamps them. Normalize those here so
+                # the service receives both the correct category and the
+                # measured provider-path latency.
+                provider_error = next(
+                    (
+                        item
+                        for item in _exception_chain(exc)
+                        if type(item).__module__.split(".", 1)[0]
+                        in {"openai", "groq"}
+                    ),
+                    None,
+                )
+                if isinstance(provider_error, Exception):
+                    raise classify_llm_error(
+                        provider_error,
+                        attempt=1,
+                        duration_ms=round(
+                            (time.monotonic() - agent_started_at) * 1000
+                        ),
+                    ) from exc
+                raise
+            interruption = classify_agent_interruption(exc)
+            log_fields = {
+                "interruption_category": interruption["category"],
+                "interruption_code": interruption["code"],
+                "error_type": type(exc).__name__,
+                "successful_tools": budget.successful,
+                "delivered_evidence": sum(
+                    int(item.get("delivered_evidence_reference_count") or 0)
+                    for item in budget.evidence_ledger
+                ),
+            }
+            if interruption["category"] == "application_error":
+                logger.exception(
+                    "soc_tool_agent_application_interrupted_after_evidence",
+                    **log_fields,
+                )
+            else:
+                logger.warning(
+                    "soc_tool_agent_interrupted_after_evidence",
+                    **log_fields,
+                )
+            return self._interrupted_result(
+                reason=str(interruption["reason"]),
+                interruption_code=str(interruption["code"]),
+                budget=budget,
+                started_at=started_at,
+                schema_metrics=schema_metrics,
+                adaptive_access=adaptive_access,
+                limit_reached=(
+                    budget.rejected > 0
+                    or interruption["category"] == "model_context_limit"
+                ),
+                interruption=interruption,
+                agent_elapsed_ms=(time.monotonic() - agent_started_at) * 1000,
+            )
+        finally:
+            _clear_stop_event(conversation_id)
+        if "user_stopped" in budget.outcomes.values():
+            return self._interrupted_result(
+                reason="the investigation was stopped by the user",
+                interruption_code="user_stopped",
+                budget=budget,
+                started_at=started_at,
+                schema_metrics=schema_metrics,
+                adaptive_access=adaptive_access,
+                limit_reached=True,
+                interruption={"category": "user_stopped", "code": "user_stopped"},
+                agent_elapsed_ms=(time.monotonic() - agent_started_at) * 1000,
+            )
+        agent_elapsed_ms = (time.monotonic() - agent_started_at) * 1000
         tool_calls: list[str] = []
         failed_tools: list[str] = []
         active_alert_id: str | None = None
         evidence_refs: list[str] = []
+        evidence_support: dict[str, str] = {}
         context_refs: dict[str, str] = {}
+        queries: list[dict[str, Any]] = []
         matched_records = 0
         sampled_records = 0
         truncated = False
         input_tokens = 0
         output_tokens = 0
         answer = ""
+        last_outcome_by_tool: dict[str, str] = {}
+        event_by_id = {
+            str(item.get("tool_call_id") or ""): item for item in budget.events
+        }
         for message in result["messages"]:
             if isinstance(message, ToolMessage):
-                tool_calls.append(str(message.name))
-                # Some tools may deliberately return an error ToolMessage.
-                # Runtime exceptions escape agent.invoke and are handled by
-                # the assistant service; record explicit error messages here
-                # so the model cannot narrate success over them either.
-                if getattr(message, "status", None) == "error":
-                    failed_tools.append(str(message.name))
+                tool_name = str(message.name)
+                tool_call_id = str(message.tool_call_id)
+                tool_calls.append(tool_name)
+                outcome = budget.outcomes.get(tool_call_id)
+                if outcome is None:
+                    outcome = _tool_result_outcome(
+                        message.content,
+                        status=getattr(message, "status", None),
+                    )
+                last_outcome_by_tool[tool_name] = outcome
+                if outcome in {"source_failure", "tool_error", "budget_rejection"}:
+                    failed_tools.append(tool_name)
+                # Error envelopes, including ok:false returned through a
+                # nominally successful ToolMessage, are never evidence.
+                if outcome not in {"success", "cache_hit"}:
+                    continue
                 found = self._alert_id_from_tool_result(
-                    str(message.name), message.content
+                    tool_name, message.content
                 )
                 if found:
                     active_alert_id = found
-                for reference in self._evidence_refs_from_tool_result(
-                    message.content
-                ):
+                message_refs = self._evidence_refs_from_tool_result(message.content)
+                payload = _decoded_tool_payload(message.content)
+                delivery = _evidence_delivery(payload) if payload is not None else None
+                for reference in message_refs:
                     if reference not in evidence_refs:
                         evidence_refs.append(reference)
+                    if delivery is None:
+                        continue
+                    if reference in delivery["event_detail_references"]:
+                        evidence_support[reference] = "event_detail"
+                    elif delivery["summary_or_aggregate"]:
+                        evidence_support.setdefault(reference, "summary_or_aggregate")
+                    else:
+                        evidence_support.setdefault(reference, "reference_only")
                 for key, value in self._context_refs_from_tool_result(
                     message.content
                 ).items():
                     context_refs.setdefault(key, value)
-                matched, returned, was_cut = self._coverage_from_tool_result(
-                    message.content
-                )
-                matched_records += matched
-                sampled_records += returned
-                truncated = truncated or was_cut
+                coverage = self._coverage_details(message.content)
+                if coverage is not None:
+                    event = event_by_id.get(tool_call_id, {})
+                    query = {
+                        "tool_call_id": tool_call_id,
+                        "tool": tool_name,
+                        "inputs": event.get("inputs", {}),
+                        "outcome": outcome,
+                        **coverage,
+                        "retrieved_evidence_count": len(message_refs),
+                        "retrieved_evidence_references": message_refs,
+                        "evidence_delivery_kinds": (
+                            list(delivery["kinds"]) if delivery is not None else []
+                        ),
+                        "reference_only_reference_count": (
+                            len(delivery["reference_only_references"])
+                            if delivery is not None
+                            else 0
+                        ),
+                        "event_detail_reference_count": (
+                            len(delivery["event_detail_references"])
+                            if delivery is not None
+                            else 0
+                        ),
+                        "summary_or_aggregate": bool(
+                            delivery and delivery["summary_or_aggregate"]
+                        ),
+                    }
+                    queries.append(query)
+                    # Backward-compatible aggregate counters only. Coverage
+                    # decisions below use each query independently.
+                    matched_records += int(coverage["matched"])
+                    sampled_records += int(coverage["delivered"])
+                    truncated = truncated or bool(
+                        coverage["source_truncated"] or coverage["output_truncated"]
+                    )
             elif isinstance(message, AIMessage) and message.content:
                 usage = getattr(message, "usage_metadata", None) or {}
                 input_tokens += int(usage.get("input_tokens") or 0)
@@ -1632,24 +3347,61 @@ class SOCAnalyst:
                 )
         if not answer:
             raise RuntimeError("The tool agent returned no answer.")
-        cited_evidence_refs = []
+        unresolved_validation_tools = sorted(
+            name
+            for name, outcome in last_outcome_by_tool.items()
+            if outcome == "recoverable_validation_error"
+        )
+        failed_tools.extend(unresolved_validation_tools)
+        cited_evidence_refs: list[str] = []
         for reference in evidence_refs:
             raw_id = reference.rsplit(":", 1)[-1]
-            if reference in answer or raw_id in answer:
+            if (
+                evidence_support.get(reference) != "reference_only"
+                and (reference in answer or raw_id in answer)
+            ):
                 cited_evidence_refs.append(reference)
-        # "Grounded" has to mean the answer cited evidence the backend saw a
-        # tool return, over a query that was not sampled or cut short. A tool
-        # merely having run proves nothing about the sentence in front of the
-        # analyst.
-        sampled = bool(
-            truncated or (matched_records and sampled_records < matched_records)
+        for query in queries:
+            cited_for_query = [
+                reference
+                for reference in query["retrieved_evidence_references"]
+                if reference in cited_evidence_refs
+            ]
+            query["cited_evidence_count"] = len(cited_for_query)
+            query["cited_evidence_references"] = cited_for_query
+        cited_evidence = [
+            {
+                "reference": reference,
+                "support": evidence_support.get(reference, "reference_only"),
+            }
+            for reference in cited_evidence_refs
+        ]
+
+        grounding_status = "cited" if cited_evidence_refs else "ungrounded"
+        query_coverage_status = (
+            "partial"
+            if any(
+                item["search_status"] == "partial"
+                or item["delivery_status"] == "partial"
+                for item in queries
+            )
+            else "complete" if queries else "unknown"
         )
-        if not cited_evidence_refs:
-            coverage_status = "ungrounded"
-        elif failed_tools or sampled:
-            coverage_status = "partial"
-        else:
-            coverage_status = "grounded"
+        cited_queries = [item for item in queries if item["cited_evidence_count"]]
+        cited_query_coverage_status = (
+            "partial"
+            if any(
+                item["search_status"] == "partial"
+                or item["delivery_status"] == "partial"
+                for item in cited_queries
+            )
+            else "complete" if cited_queries else "unknown"
+        )
+        investigation_status = (
+            "incomplete"
+            if failed_tools or budget.rejected
+            else "complete"
+        )
         if failed_tools:
             rendered = ", ".join(
                 f"`{name}`" for name in dict.fromkeys(failed_tools)
@@ -1659,12 +3411,28 @@ class SOCAnalyst:
                 "Anything above that depended on it - including any claim "
                 "that a report was saved - is unverified."
             )
+        citation_limit = max(1, int(settings.SOC_ANALYST_MAX_EVIDENCE_REFS))
+        exposed_citations = cited_evidence_refs[:citation_limit]
+        source_evidence_refs: list[str] = []
+        for entry in budget.evidence_ledger:
+            for reference in entry.get("source_evidence_references") or []:
+                if reference not in source_evidence_refs:
+                    source_evidence_refs.append(reference)
         logger.info(
             "soc_tool_agent_completed",
-            tool_calls=len(tool_calls),
+            tool_calls_attempted=budget.attempted,
+            tool_calls_executed=budget.used,
+            tool_calls_cache_hits=budget.cache_hits,
+            tool_calls_rejected=budget.rejected,
+            tool_calls_failed=budget.failed,
+            tool_calls_successful=budget.successful,
+            tool_validation_errors=budget.validation_errors,
+            tool_source_failures=budget.source_failures,
+            tool_errors=budget.tool_errors,
             unique_tools=sorted(set(tool_calls)),
             failed_tools=sorted(set(failed_tools)),
-            evidence_references=len(evidence_refs),
+            evidence_retrieved=len(evidence_refs),
+            evidence_cited=len(cited_evidence_refs),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
         )
@@ -1673,22 +3441,63 @@ class SOCAnalyst:
             tool_calls=tool_calls,
             active_alert_id=active_alert_id,
             failed_tools=sorted(set(failed_tools)),
-            evidence_references=cited_evidence_refs,
+            retrieved_evidence_references=evidence_refs,
+            evidence_references=exposed_citations,
             context_references=context_refs,
             metrics={
                 "elapsed_ms": round((time.monotonic() - started_at) * 1000),
+                "agent_elapsed_ms": round(agent_elapsed_ms, 3),
+                "tool_elapsed_ms": round(
+                    sum(float(event.get("elapsed_ms") or 0) for event in budget.events),
+                    3,
+                ),
+                # Kept for existing consumers: every ToolMessage observed,
+                # regardless of outcome. The breakdown below is what
+                # distinguishes an execution from a cache hit or a rejection.
                 "tool_calls": len(tool_calls),
+                "tool_calls_attempted": budget.attempted,
+                "tool_calls_executed": budget.used,
+                "tool_calls_cache_hits": budget.cache_hits,
+                "tool_calls_rejected": budget.rejected,
+                "tool_calls_failed": budget.failed,
+                "tool_calls_successful": budget.successful,
+                "tool_validation_errors": budget.validation_errors,
+                "tool_source_failures": budget.source_failures,
+                "tool_errors": budget.tool_errors,
+                "tool_events": list(budget.events),
+                "evidence_ledger": list(budget.evidence_ledger),
                 "unique_tools": sorted(set(tool_calls)),
                 "failed_tools": len(set(failed_tools)),
-                "evidence_references": len(cited_evidence_refs),
+                "source_evidence_retrieved": len(source_evidence_refs),
+                "evidence_retrieved": len(evidence_refs),
+                "evidence_cited": len(cited_evidence_refs),
+                "evidence_references": len(exposed_citations),
+                "cited_evidence": cited_evidence[:citation_limit],
+                "event_details_examined": len(
+                    {
+                        reference
+                        for reference, support in evidence_support.items()
+                        if support == "event_detail"
+                    }
+                ),
+                "queries": queries,
                 "matched_records": matched_records,
                 "sampled_records": sampled_records,
                 "truncated": truncated,
-                "coverage_status": coverage_status,
+                "query_coverage_status": query_coverage_status,
+                "cited_query_coverage_status": cited_query_coverage_status,
+                "investigation_status": investigation_status,
+                "grounding_status": grounding_status,
+                "citation_scope": "reference_level_only",
+                # Compatibility field: describes query coverage only. It is
+                # no longer overloaded as a claim-grounding verdict.
+                "coverage_status": query_coverage_status,
+                "schema": schema_metrics,
+                "adaptive_specialized_access": adaptive_access.metrics(),
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "tool_call_budget": settings.SOC_ANALYST_MAX_TOOL_CALLS,
-                "limit_reached": budget.used >= budget.limit,
+                "limit_reached": budget.rejected > 0,
             },
         )
 

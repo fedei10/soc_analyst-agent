@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     # Single MAPE-K reasoning provider. Only Analyze and Plan may use it.
     LLM_PROVIDER: str = "oxy"
     LLM_API_KEY: SecretStr = SecretStr("")
+    GROQ_API_KEY: SecretStr = SecretStr("")
     # EvoMap's raw token is supplied separately; never reuse another provider's key.
     K_API_KEY: SecretStr = SecretStr("")
     LLM_BASE_URL: str = "https://api.oxyy.ai/v1"
@@ -212,6 +213,13 @@ class Settings(BaseSettings):
     WAZUH_INGESTION_LEASE_TTL_SECONDS: int = 300
     WAZUH_CONNECTION_PROFILE_ID: str = "default"
     WAZUH_INGESTION_ORGANIZATION_ID: str = "system"
+
+    # Scheduled auto-triage: a standalone worker (app.workers.scheduled_triage)
+    # periodically asks the SOC assistant to triage the last N hours of
+    # alerts, unattended. Off by default.
+    SCHEDULED_TRIAGE_ENABLED: bool = False
+    SCHEDULED_TRIAGE_INTERVAL_HOURS: int = 8
+    SCHEDULED_TRIAGE_WINDOW_HOURS: int = 24
     # Rule and MITRE definitions are reference data; they change on rule
     # deploys, not between two questions about the same alert.
     WAZUH_RULE_CONTEXT_TTL_SECONDS: int = 900

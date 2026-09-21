@@ -19,6 +19,7 @@ pytest
 pytest-asyncio
 langchain
 langchain-core
+langchain-groq>=1.1,<2
 langchain-openai>=1.1,<2
 langsmith
 requests

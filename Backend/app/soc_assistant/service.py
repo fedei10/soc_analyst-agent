@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import uuid
 from collections.abc import Callable
@@ -13,7 +14,6 @@ from langsmith import traceable
 from opensearchpy import exceptions as opensearch_exc
 
 from app.config import settings
-from app.mape_k.llm import LLMErrorCode, LLMInputLimitError, classify_llm_error, is_rate_limit_error
 from app.orchestration.investigation_service import (
     InvestigationNotFoundError,
     InvestigationService,
@@ -37,8 +37,11 @@ from app.services.wazuh.normalization.serializers import (
 )
 from app.services.wazuh.triage.service import run_triage
 from app.soc_assistant.catalog import public_catalog
-from app.soc_assistant.command_explainer import MAX_COMMAND_LENGTH, explain_command
-from app.soc_assistant.tool_agent import SOCAnalyst, SOCToolAgent
+from app.soc_assistant.tool_agent import (
+    SOCAnalyst,
+    SOCToolAgent,
+    classify_agent_interruption,
+)
 from app.soc_assistant.router import AssistantIntentRouter
 from app.soc_assistant.references import (
     InvestigationReferenceError,
@@ -52,6 +55,7 @@ from app.soc_assistant.schemas import (
 )
 
 
+logger = logging.getLogger("tsage.soc_assistant")
 INDICATOR_TYPES = {"ip", "domain", "hash", "process", "user", "path", "other"}
 RUNNING_ACTIVITY = {
     AssistantCommandName.CHAT: (
@@ -97,10 +101,6 @@ RUNNING_ACTIVITY = {
     AssistantCommandName.HEALTH: (
         "wazuh_health",
         "Checking Wazuh manager and indexer connectivity",
-    ),
-    AssistantCommandName.EXPLAIN: (
-        "explain_command",
-        "Analyzing the command line as untrusted data",
     ),
     AssistantCommandName.HELP: (
         None,
@@ -260,14 +260,6 @@ def _duration_hours(value: Any, *, default: int = 24) -> int:
             "--since must use a duration such as 15m, 6h, or 2d."
         )
     return max(1, min(168, int(hours) + int(hours % 1 > 0)))
-
-
-def _as_datetime(value: Any) -> datetime:
-    if isinstance(value, datetime):
-        parsed = value
-    else:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 class SOCAssistant:
@@ -611,68 +603,64 @@ class SOCAssistant:
             else checked_at - timedelta(hours=window_hours)
         )
 
-        records = get_finding_repository().list(
-            organization_id=settings.WAZUH_INGESTION_ORGANIZATION_ID,
-            limit=tool_inputs["limit"],
-            severity=severity or None,
-            status="open" if arguments.get("open_only") else None,
-        )
+        repository = get_finding_repository()
+        finding_ids: set[str] | None = None
         if tool_inputs["agent_id"]:
-            finding_ids = memory.finding_ids_for_agent(tool_inputs["agent_id"])
-            records = [
-                record
-                for record in records
-                if record["finding_id"] in finding_ids
-            ]
-        text_filter = str(tool_inputs["text"] or "").strip().lower()
-        if text_filter:
-            records = [
-                record
-                for record in records
-                if text_filter
-                in " ".join(
-                    (
-                        str(record["finding"].get("title") or ""),
-                        str(record["finding"].get("summary") or ""),
-                        str(record.get("event_type") or ""),
-                    )
-                ).lower()
-            ]
-
-        new_records = [
-            record
-            for record in records
-            if _as_datetime(record["created_at"]) > reference
-        ]
-        updated_records = [
-            record
-            for record in records
-            if _as_datetime(record["created_at"]) <= reference
-            and _as_datetime(record["updated_at"]) > reference
-        ]
-        # "New analysis" is a verdict that was written or rewritten, which is
-        # not the same as a finding merely being touched.
-        reanalyzed = [
-            record
-            for record in updated_records
-            if (record.get("verdict") or {}).get("verdict")
-        ]
-        changed_ids = {
-            record["finding_id"] for record in [*new_records, *updated_records]
+            finding_ids = set(memory.finding_ids_for_agent(tool_inputs["agent_id"]))
+        finding_filters: dict[str, Any] = {
+            "organization_id": organization_id,
+            "severity": severity or None,
+            "status": "open" if arguments.get("open_only") else None,
+            "finding_ids": finding_ids,
+            "text": str(tool_inputs["text"] or "").strip() or None,
         }
+        # Counts are independent database queries over the same tenant and
+        # filters as the displayed page. A failure here exits before the cursor
+        # is advanced, so the next successful check sees the same interval.
+        total_findings = repository.count(**finding_filters)
+        new_finding_count = repository.count(
+            **finding_filters,
+            created_after=reference,
+        )
+        updated_finding_count = repository.count(
+            **finding_filters,
+            updated_after=reference,
+            created_on_or_before=reference,
+        )
+        analysis_count: int | None = None
+        analysis_count_status = "available"
+        analysis_count_error: str | None = None
+        try:
+            analysis_count = self.investigations.completed_analysis_count(
+                organization_id=organization_id,
+                occurred_after=reference,
+                occurred_on_or_before=checked_at,
+            )
+        except Exception as exc:
+            # The audit store is the only authoritative source for completed
+            # diagnoses. Finding timestamps/verdicts are not a fallback.
+            analysis_count_status = "unavailable"
+            analysis_count_error = type(exc).__name__
+            logger.warning(
+                "soc_completed_analysis_count_unavailable error_type=%s",
+                analysis_count_error,
+            )
+        visible_filters = dict(finding_filters)
         if mode == "new" and not baseline_only:
-            visible = new_records
-        elif arguments.get("all_results") or arguments.get("open_only") or mode == "recent":
-            visible = records
-        else:
-            visible = [
-                record
-                for record in records
-                if record["finding_id"] in changed_ids
-            ]
+            visible_filters["created_after"] = reference
+        elif not (
+            arguments.get("all_results")
+            or arguments.get("open_only")
+            or mode == "recent"
+        ):
+            visible_filters["changed_after"] = reference
+        records = repository.list(
+            **visible_filters,
+            limit=tool_inputs["limit"],
+        )
 
         findings = []
-        for record in visible:
+        for record in records:
             finding = dict(record["finding"])
             finding.update(
                 {
@@ -702,14 +690,29 @@ class SOCAssistant:
             "recent_alerts": alert_count,
             "finding_count": len(findings),
             "findings": findings,
-            "total_findings": len(records),
+            "total_findings": total_findings,
             # None, not 0: before a baseline exists there is no such quantity,
             # and reporting the window's whole history as "new" was the bug.
             "new_alerts": alert_count if comparable else None,
-            "new_findings": len(new_records) if comparable else None,
-            "updated_findings": len(updated_records) if comparable else None,
-            "reanalyzed_findings": len(reanalyzed) if comparable else None,
-            "unchanged_findings": len(records) - len(changed_ids),
+            "new_findings": new_finding_count if comparable else None,
+            "updated_findings": updated_finding_count if comparable else None,
+            # Compatibility name retained for existing clients. This is now
+            # the count of completed MAPE-K analysis audit events, not a count
+            # inferred from finding updates.
+            "reanalyzed_findings": analysis_count if comparable else None,
+            "completed_analyses": analysis_count if comparable else None,
+            "analysis_count": {
+                "status": analysis_count_status,
+                "count": analysis_count if comparable else None,
+                "source": "soc_audit_events",
+                "event": "analysis_completed",
+                "stage": "analyze",
+                "error_type": analysis_count_error,
+            },
+            "unchanged_findings": max(
+                0,
+                total_findings - new_finding_count - updated_finding_count,
+            ),
             "since": reference.isoformat(),
             "checked_at": checked_at.isoformat(),
             "new_since_last_check": (
@@ -720,9 +723,40 @@ class SOCAssistant:
             "cursor_status": "durable",
             "cursor_advanced": False,
             "source": "postgresql",
+            "count_filters": {
+                "raw_alerts": {
+                    "source": "soc_wazuh_alerts",
+                    "organization_id": organization_id,
+                    "agent_id": tool_inputs["agent_id"],
+                    "min_rule_level": tool_inputs["min_level"],
+                    "observed_after": reference.isoformat(),
+                },
+                "findings": {
+                    "source": "soc_findings",
+                    "organization_id": organization_id,
+                    "agent_id": tool_inputs["agent_id"],
+                    "severity": severity or None,
+                    "status": "open" if arguments.get("open_only") else None,
+                    "text": str(tool_inputs["text"] or "").strip() or None,
+                    "change_reference": reference.isoformat(),
+                },
+                "completed_analyses": {
+                    "source": "soc_audit_events",
+                    "organization_id": organization_id,
+                    "event": "analysis_completed",
+                    "stage": "analyze",
+                    "occurred_after": reference.isoformat(),
+                    "occurred_on_or_before": checked_at.isoformat(),
+                },
+                "same_filters": False,
+            },
         }
 
-        if mode in {"new", "changed"} and not historical:
+        if (
+            mode in {"new", "changed"}
+            and not historical
+            and analysis_count_status == "available"
+        ):
             memory.advance_user_cursor(
                 cursor_key,
                 checked_at,
@@ -742,10 +776,11 @@ class SOCAssistant:
                 checked_at=checked_at,
                 window_hours=window_hours,
                 alert_count=alert_count,
-                total_findings=len(records),
-                new_findings=len(new_records),
-                updated_findings=len(updated_records),
-                reanalyzed=len(reanalyzed),
+                total_findings=total_findings,
+                new_findings=new_finding_count,
+                updated_findings=updated_finding_count,
+                reanalyzed=analysis_count,
+                analysis_count_status=analysis_count_status,
             ),
             payload,
             ["query_alert_memory"],
@@ -825,18 +860,33 @@ class SOCAssistant:
         total_findings: int,
         new_findings: int,
         updated_findings: int,
-        reanalyzed: int,
+        reanalyzed: int | None,
+        analysis_count_status: str,
     ) -> str:
         """Plain-language answer built from the numbers actually retrieved."""
 
         def plural(count: int, noun: str) -> str:
             return f"{count} {noun}{'' if count == 1 else 's'}"
 
+        if subject == "analysis" and analysis_count_status != "available":
+            return (
+                "Completed-analysis activity is unavailable because the "
+                "MAPE-K audit source could not be counted. I did not estimate "
+                "it from finding updates or verdict fields, and I did not "
+                "advance your change cursor."
+            )
+
         if baseline_only:
+            baseline_note = (
+                "I could not set the change baseline because the completed-analysis "
+                "audit count is unavailable."
+                if analysis_count_status != "available"
+                else f"I have set your baseline at {self._clock(checked_at)}."
+            )
             return (
                 "This is the first check I have on record for you, so I "
-                "cannot yet say what is new relative to an earlier one. I have "
-                f"set your baseline at {self._clock(checked_at)}. As of now "
+                "cannot yet say what is new relative to an earlier one. "
+                f"{baseline_note} As of now "
                 f"there {'is' if alert_count == 1 else 'are'} "
                 f"{plural(alert_count, 'alert')} in the last {window_hours} "
                 f"hours and {plural(total_findings, 'finding')} on record — "
@@ -865,14 +915,13 @@ class SOCAssistant:
             if reanalyzed == 0:
                 return (
                     f"No new analysis since your previous check at {stamp} "
-                    f"({ago}). {plural(total_findings, 'finding')} "
-                    f"{'is' if total_findings == 1 else 'are'} on record and "
-                    "no verdict has been written or revised in that interval."
+                    f"({ago}). The authoritative MAPE-K audit contains no "
+                    "completed Analyze-stage diagnosis in that interval."
                 )
             return (
-                f"{plural(reanalyzed, 'finding')} had its verdict written or "
-                f"revised since your previous check at {stamp} ({ago}), out of "
-                f"{plural(total_findings, 'finding')} on record."
+                f"{plural(int(reanalyzed or 0), 'MAPE-K analysis')} completed "
+                f"since your previous check at {stamp} ({ago}). This count "
+                "comes from Analyze-stage audit events, not finding updates."
             )
 
         if alert_count == 0 and new_findings == 0 and updated_findings == 0:
@@ -966,6 +1015,9 @@ class SOCAssistant:
                 evidence_references = list(
                     getattr(agent_result, "evidence_references", []) or []
                 )
+                retrieved_evidence_references = list(
+                    getattr(agent_result, "retrieved_evidence_references", []) or []
+                )
                 metrics = dict(getattr(agent_result, "metrics", {}) or {})
                 context_references = dict(
                     getattr(agent_result, "context_references", {}) or {}
@@ -977,19 +1029,20 @@ class SOCAssistant:
                         "answer_type": (
                             "soc_analyst_partial"
                             if failed_tools
+                            or metrics.get("investigation_status") == "incomplete"
                             else "soc_analyst"
                         ),
-                        # Coverage, not "a tool ran". The analyst reports
-                        # ungrounded when it cited no evidence reference and
-                        # partial when the query sampled, truncated, or failed.
+                        # Citation presence, query coverage, and investigation
+                        # completion are intentionally separate dimensions.
                         "grounding_status": (
                             grounding_status := str(
-                                metrics.get("coverage_status") or "ungrounded"
+                                metrics.get("grounding_status") or "ungrounded"
                             )
                         ),
-                        "grounded": grounding_status == "grounded",
+                        "grounded": grounding_status == "cited",
                         "failed_tools": failed_tools,
                         "evidence_references": evidence_references,
+                        "retrieved_evidence_references": retrieved_evidence_references,
                         "tools_called": tool_calls,
                         "analyst_metrics": metrics,
                         "context_references": context_references,
@@ -1002,43 +1055,64 @@ class SOCAssistant:
                     ),
                 )
             except Exception as exc:
-                if _is_wazuh_runtime_error(exc):
-                    # Live-source failures are not model/payload failures.
+                interruption = classify_agent_interruption(exc)
+                category = str(interruption["category"])
+                if category in {"source_failure", "application_error"}:
+                    # Preserve Wazuh's normalized API failure and let an
+                    # unexpected programming error reach the application error
+                    # handler. Neither is a model outage.
                     raise
-                classified = classify_llm_error(exc, attempt=1, duration_ms=0)
-                if isinstance(exc, LLMInputLimitError) or classified.code == LLMErrorCode.MODEL_CONTEXT_LIMIT_EXCEEDED:
-                    return (
-                        "The analyst request exceeded the model's context or payload limit. "
-                        "Please narrow the agent, technique/CVE, or time range. This is not a Wazuh alert-not-found result.",
-                        {"display_mode": "conversation", "answer_type": "context_limit_exceeded", "grounded": False},
-                        [], {},
-                    )
-                if is_rate_limit_error(exc):
-                    # A second model call would just spend another request
-                    # against the same exhausted limit.
-                    return (
-                        (
-                            "The AI provider's rate limit was reached. Please "
-                            "wait a moment and try again."
-                        ),
-                        {
-                            "display_mode": "conversation",
-                            "answer_type": "rate_limited",
-                        },
-                        [],
-                        {},
-                    )
-                return (
-                    (
-                        "I could not generate the evidence-backed SOC answer "
-                        "because the analyst model is unavailable. "
-                        "Deterministic commands such as `/alerts`, "
-                        "`/status`, and `/health` are still available."
+                messages = {
+                    "model_rate_limit": (
+                        "The AI provider's rate limit was reached. Please wait "
+                        "a moment and try again."
                     ),
+                    "model_context_limit": (
+                        "The analyst request exceeded the model context limit. "
+                        "Narrow the agent, technique/CVE, or time range."
+                    ),
+                    "model_configuration": (
+                        "The analyst model is not configured. Deterministic "
+                        "commands such as `/alerts`, `/status`, and `/health` "
+                        "are still available."
+                    ),
+                    "model_provider_outage": (
+                        "The analyst model provider is unavailable. "
+                        "Deterministic commands remain available."
+                    ),
+                    "model_response_failure": (
+                        "The analyst model returned an unusable response."
+                    ),
+                    "model_request_failure": (
+                        "The analyst model request failed before evidence was retrieved."
+                    ),
+                }
+                answer_types = {
+                    "model_rate_limit": "rate_limited",
+                    "model_context_limit": "context_limit_exceeded",
+                    "model_configuration": "model_unavailable",
+                    "model_provider_outage": "model_unavailable",
+                    "model_response_failure": "model_response_failure",
+                    "model_request_failure": "model_request_failure",
+                }
+                return (
+                    messages[category],
                     {
                         "display_mode": "conversation",
-                        "answer_type": "model_unavailable",
+                        "answer_type": answer_types[category],
                         "grounded": False,
+                        "grounding_status": "ungrounded",
+                        "evidence_references": [],
+                        "retrieved_evidence_references": [],
+                        "analyst_metrics": {
+                            "evidence_retrieved": 0,
+                            "evidence_cited": 0,
+                            "event_details_examined": 0,
+                            "investigation_status": "incomplete",
+                            "interruption_reason": interruption["code"],
+                            "interruption_category": category,
+                            "failure": interruption,
+                        },
                     },
                     [],
                     {},
@@ -1050,32 +1124,6 @@ class SOCAssistant:
                 "Choose a capability below or type `/` to search commands.",
                 {"commands": catalog},
                 [],
-                {},
-            )
-
-        if command == AssistantCommandName.EXPLAIN:
-            command_line = str(arguments.get("command") or "").strip()
-            if not command_line:
-                return (
-                    "Provide a command line, for example `/explain whoami`.",
-                    {"required": ["command"]},
-                    [],
-                    {},
-                )
-            explanation, explanation_usage = explain_command(
-                command_line[:MAX_COMMAND_LENGTH]
-            )
-            payload = explanation.model_dump(mode="json")
-            payload.update(
-                {
-                    "display_mode": "command_explanation",
-                    "model_usage": explanation_usage,
-                }
-            )
-            return (
-                explanation.plain_english,
-                payload,
-                ["explain_command"],
                 {},
             )
 
@@ -1657,14 +1705,47 @@ class SOCAssistant:
                 intent_source=intent.source,
                 intent_confidence=intent.confidence,
             )
-            for tool_name in payload.get("tools_called") or []:
-                activities.append(
-                    self._activity(
-                        len(activities) + 1,
-                        f"Queried {tool_name}",
-                        tool=tool_name,
+            tool_events = (
+                payload.get("analyst_metrics", {}).get("tool_events") or []
+            )
+            if tool_events:
+                for event in tool_events:
+                    tool_name = str(event.get("tool") or "unknown_tool")
+                    outcome = str(event.get("outcome") or "success")
+                    failed = outcome in {
+                        "recoverable_validation_error",
+                        "source_failure",
+                        "tool_error",
+                        "budget_rejection",
+                    }
+                    labels = {
+                        "cache_hit": f"Used cached {tool_name}",
+                        "recoverable_validation_error": (
+                            f"Validation failed for {tool_name}"
+                        ),
+                        "source_failure": f"Source failed for {tool_name}",
+                        "tool_error": f"Tool failed: {tool_name}",
+                        "budget_rejection": (
+                            f"Rejected {tool_name}: tool-call budget reached"
+                        ),
+                    }
+                    activities.append(
+                        self._activity(
+                            len(activities) + 1,
+                            labels.get(outcome, f"Queried {tool_name}"),
+                            tool=tool_name,
+                            status="failed" if failed else "completed",
+                        )
                     )
-                )
+            else:
+                for tool_name in payload.get("tools_called") or []:
+                    activities.append(
+                        self._activity(
+                            len(activities) + 1,
+                            f"Queried {tool_name}",
+                            tool=tool_name,
+                        )
+                    )
             activities.append(
                 self._activity(
                     len(activities) + 1,

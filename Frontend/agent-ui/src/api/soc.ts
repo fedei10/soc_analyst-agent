@@ -6,12 +6,10 @@ import type {
   ApprovalInput,
   AssistantCommandCatalog,
   ChatActivity,
-  CommandExplanation,
   Investigation,
   InvestigationStartInput,
   PrioritizedVulnerabilityList,
   ServicesHealth,
-  ShiftHandoff,
   SOCOverview,
   SOCPlatform,
   StorageHealth,
@@ -237,6 +235,15 @@ export function sendAgentMessage(
   })
 }
 
+export function stopAgentMessage(
+  conversationId: string
+): Promise<{ stopped: boolean }> {
+  return request('/api/v1/soc/orchestrator/chat/stop', {
+    method: 'POST',
+    body: JSON.stringify({ conversation_id: conversationId })
+  })
+}
+
 export function queueInvestigation(
   input: InvestigationStartInput
 ): Promise<Investigation> {
@@ -279,17 +286,6 @@ export function submitApproval(
       body: JSON.stringify(input)
     }
   )
-}
-
-export function getShiftHandoff(hours = 8): Promise<ShiftHandoff> {
-  return request(`/api/v1/soc/handoff?hours=${hours}`)
-}
-
-export function explainCommand(command: string): Promise<CommandExplanation> {
-  return request('/api/v1/soc/explain-command', {
-    method: 'POST',
-    body: JSON.stringify({ command })
-  })
 }
 
 export function getPrioritizedVulnerabilities(): Promise<PrioritizedVulnerabilityList> {

